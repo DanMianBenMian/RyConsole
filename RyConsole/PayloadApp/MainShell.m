@@ -377,7 +377,15 @@ static void ryScrollToBottom(UITextView *tv) {
         ? [NSString stringWithFormat:@"监听中 :%d", [port intValue]]
         : @"未启动";
     self.statusLabel.textColor = running ? RY_GREEN : RY_MUTED;
-    self.ipLabel.text = [NSString stringWithFormat:@"http://%@:%d", ip, running ? [port intValue] : 8899];
+    // 只在**真正监听中**才显示可用地址；否则给明确提示。
+    // （曾经无条件显示 http://ip:8899，导致用户复制到一个"还没生效"的地址去连 → 端口拒绝）
+    if (running) {
+        self.ipLabel.text = [NSString stringWithFormat:@"http://%@:%d", ip, [port intValue]];
+        self.ipLabel.textColor = RY_ACCENT;
+    } else {
+        self.ipLabel.text = @"未监听 · 点「启动监听」后地址才可用";
+        self.ipLabel.textColor = RY_AMBER;
+    }
     [self.toggleBtn setTitle:(running ? @"停止监听" : @"启动监听") forState:UIControlStateNormal];
 
     NSString *peer = RYAutorunPeer();
@@ -455,10 +463,18 @@ static void ryScrollToBottom(UITextView *tv) {
     id o = [NSJSONSerialization JSONObjectWithData:[RYAutorunStatus() dataUsingEncoding:NSUTF8StringEncoding]
                                           options:0 error:NULL];
     if ([o isKindOfClass:[NSDictionary class]]) sd = (NSDictionary *)o;
+    if (![sd[@"running"] boolValue]) {
+        // 没在监听就不给地址：否则用户会拿一个连不上的 URL 到处试
+        self.ipLabel.text = @"还没启动监听，地址不可用";
+        self.ipLabel.textColor = RY_AMBER;
+        return;
+    }
     NSInteger port = [sd[@"port"] integerValue];
     if (port <= 0) port = 8899;
     NSString *url = [NSString stringWithFormat:@"http://%@:%d", sd[@"lanIP"] ?: @"?", (int)port];
     [UIPasteboard generalPasteboard].string = url;
+    self.ipLabel.text = [@"已复制 " stringByAppendingString:url];
+    self.ipLabel.textColor = RY_GREEN;
 }
 
 @end
