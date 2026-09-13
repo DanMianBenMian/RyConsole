@@ -28,6 +28,7 @@
 #define RY_AMBER   [UIColor colorWithRed:0.824f green:0.600f blue:0.133f alpha:1.0f]  // #d29922
 
 static const CGFloat kSidebarW = 168.0f;
+static const CGFloat kSidebarCompactW = 58.0f;   // iPhone/紧凑宽度（<500pt）：纯图标侧栏
 static const CGFloat kPad      = 12.0f;
 
 #pragma mark - 小工具
@@ -329,15 +330,24 @@ static void ryScrollToBottom(UITextView *tv) {
     [super layoutSubviews];
     CGFloat w = self.bounds.size.width;
     CGFloat h = self.bounds.size.height;
+    BOOL compact = (w < 500.0f);   // iPhone 竖屏 / 紧凑宽度
 
     UIView *strip = [self viewWithTag:9100];
     strip.frame = CGRectMake(kPad, 10.0f, w - kPad * 2, 56.0f);
     CGFloat sw = strip.bounds.size.width;
     [self.dot setFrame:CGRectMake(12.0f, 8.0f, 14.0f, 18.0f)];
-    [self.statusLabel setFrame:CGRectMake(28.0f, 9.0f, 150.0f, 18.0f)];
     [self.pill setFrame:CGRectMake(sw - 12.0f - 78.0f, 8.0f, 78.0f, 19.0f)];
-    [self.ipLabel setFrame:CGRectMake(192.0f, 10.0f, sw - 192.0f - 96.0f, 16.0f)];
-    [self.peerLabel setFrame:CGRectMake(12.0f, 31.0f, sw - 24.0f, 15.0f)];
+    if (compact) {
+        // 紧凑：状态 + 地址分两行；隐藏来源行；右侧信息标签放不下就藏
+        [self.statusLabel setFrame:CGRectMake(28.0f, 9.0f, sw - 28.0f - 90.0f, 18.0f)];
+        [self.ipLabel setFrame:CGRectMake(12.0f, 31.0f, sw - 24.0f, 15.0f)];
+        [self.peerLabel setHidden:YES];
+    } else {
+        [self.statusLabel setFrame:CGRectMake(28.0f, 9.0f, 150.0f, 18.0f)];
+        [self.ipLabel setFrame:CGRectMake(192.0f, 10.0f, sw - 192.0f - 96.0f, 16.0f)];
+        [self.peerLabel setHidden:NO];
+        [self.peerLabel setFrame:CGRectMake(12.0f, 31.0f, sw - 24.0f, 15.0f)];
+    }
 
     CGFloat ty = 10.0f + 56.0f + 8.0f;
     [self.toggleBtn setFrame:CGRectMake(kPad, ty, 96.0f, 30.0f)];
@@ -350,14 +360,26 @@ static void ryScrollToBottom(UITextView *tv) {
     UIView *codePanel = [self viewWithTag:9120];
     codePanel.frame = CGRectMake(kPad, cy, w - kPad * 2, codeH);
     [[codePanel viewWithTag:9121] setFrame:CGRectMake(10.0f, 5.0f, 120.0f, 14.0f)];
-    [[codePanel viewWithTag:9122] setFrame:CGRectMake(codePanel.bounds.size.width - 250.0f, 5.0f, 240.0f, 14.0f)];
+    UIView *cpPath = [codePanel viewWithTag:9122];
+    if (compact) {
+        [cpPath setHidden:YES];
+    } else {
+        [cpPath setHidden:NO];
+        [cpPath setFrame:CGRectMake(codePanel.bounds.size.width - 250.0f, 5.0f, 240.0f, 14.0f)];
+    }
     [[codePanel viewWithTag:9123] setFrame:CGRectMake(8.0f, 22.0f, codePanel.bounds.size.width - 16.0f, codePanel.bounds.size.height - 30.0f)];
 
     CGFloat oy = cy + codeH + 10.0f;
     UIView *outPanel = [self viewWithTag:9130];
     outPanel.frame = CGRectMake(kPad, oy, w - kPad * 2, h - oy - kPad);
     [[outPanel viewWithTag:9131] setFrame:CGRectMake(10.0f, 5.0f, 140.0f, 14.0f)];
-    [[outPanel viewWithTag:9132] setFrame:CGRectMake(outPanel.bounds.size.width - 250.0f, 5.0f, 240.0f, 14.0f)];
+    UIView *outPath = [outPanel viewWithTag:9132];
+    if (compact) {
+        [outPath setHidden:YES];
+    } else {
+        [outPath setHidden:NO];
+        [outPath setFrame:CGRectMake(outPanel.bounds.size.width - 250.0f, 5.0f, 240.0f, 14.0f)];
+    }
     [[outPanel viewWithTag:9133] setFrame:CGRectMake(8.0f, 22.0f, outPanel.bounds.size.width - 16.0f, outPanel.bounds.size.height - 30.0f)];
 }
 
@@ -667,12 +689,15 @@ static void ryScrollToBottom(UITextView *tv) {
 @property (nonatomic, strong) RYSettingsPane *settingsPane;
 @property (nonatomic, assign) NSInteger current;
 @property (nonatomic, strong) UILabel *sideStatus;
+@property (nonatomic, assign) BOOL compact;              // iPhone/紧凑宽度模式
+@property (nonatomic, strong) NSArray *navTitles;        // 侧栏按钮文字（compact 切换时恢复用）
 // 全部先声明（select: 之前正是因为这个缺失导致 ARC 报错）
 - (void)onNav:(UIButton *)sender;
 - (void)select:(NSInteger)idx;
 - (void)layoutIndicator;
 - (void)refreshSideStatus;
 - (void)firstLaunchDisclaimer;
+- (void)applyCompact:(BOOL)compact;
 @end
 
 @implementation RYShellVC
@@ -691,16 +716,19 @@ static void ryScrollToBottom(UITextView *tv) {
 
     UILabel *title = ryLabel(@"RyConsole", 15.0f, RY_TEXT, NO);
     title.font = ryUI(15.0f, UIFontWeightMedium);
+    title.tag = 8090;
     title.frame = CGRectMake(16.0f, 22.0f, kSidebarW - 32.0f, 18.0f);
     [self.sidebar addSubview:title];
 
     UILabel *sub = ryLabel(@"v1.1 · 研究控制台", 10.5f, RY_MUTED, YES);
+    sub.tag = 8091;
     sub.frame = CGRectMake(16.0f, 42.0f, kSidebarW - 32.0f, 14.0f);
     [self.sidebar addSubview:sub];
 
     NSArray *items = @[@[@"terminal", @"终端"],
                        @[@"antenna.radiowaves.left.and.right", @"Autorun"],
                        @[@"gearshape", @"设置"]];
+    self.navTitles = @[@"终端", @"Autorun", @"设置"];
     for (NSInteger i = 0; i < (NSInteger)items.count; i++) {
         CGFloat y = 76.0f + i * 48.0f;
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -762,13 +790,51 @@ static void ryScrollToBottom(UITextView *tv) {
     [super viewDidLayoutSubviews];
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
-    self.sidebar.frame = CGRectMake(0.0f, 0.0f, kSidebarW, h);
+
+    // iPhone / 窄屏：侧栏收缩为纯图标栏，内容区避开安全区（刘海/小黑条）
+    BOOL compact = (w < 500.0f);
+    if (compact != self.compact) {
+        self.compact = compact;
+        [self applyCompact:compact];
+    }
+    CGFloat sw = compact ? kSidebarCompactW : kSidebarW;
+
+    self.sidebar.frame = CGRectMake(0.0f, 0.0f, sw, h);
     [self.sideStatus setFrame:CGRectMake(16.0f, h - 56.0f, kSidebarW - 32.0f, 40.0f)];
-    self.content.frame = CGRectMake(kSidebarW, 0.0f, w - kSidebarW, h);
+    if (compact) {
+        UIEdgeInsets sa = self.view.safeAreaInsets;
+        CGFloat top = fmaxf(sa.top, 20.0f);
+        CGFloat bot = fmaxf(sa.bottom, 8.0f);
+        self.content.frame = CGRectMake(sw, top, w - sw, h - top - bot);
+    } else {
+        self.content.frame = CGRectMake(sw, 0.0f, w - sw, h);
+    }
     for (UIView *p in @[self.terminalPane, self.autorunPane, self.settingsPane]) {
         p.frame = self.content.bounds;
     }
     [self layoutIndicator];
+}
+
+// 紧凑/常规侧栏切换：标题、按钮形态、底部状态
+- (void)applyCompact:(BOOL)compact {
+    CGFloat sw = compact ? kSidebarCompactW : kSidebarW;
+    [[self.sidebar viewWithTag:8090] setHidden:compact];
+    [[self.sidebar viewWithTag:8091] setHidden:compact];
+    [self.sideStatus setHidden:compact];
+
+    for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++) {
+        UIButton *b = self.navButtons[i];
+        b.frame = CGRectMake(0.0f, 76.0f + i * 48.0f, sw, 44.0f);
+        if (compact) {
+            [b setTitle:nil forState:UIControlStateNormal];
+            b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+            b.contentEdgeInsets = UIEdgeInsetsZero;
+        } else {
+            [b setTitle:[@"  " stringByAppendingString:self.navTitles[i]] forState:UIControlStateNormal];
+            b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+            b.contentEdgeInsets = UIEdgeInsetsMake(0.0f, 16.0f, 0.0f, 0.0f);
+        }
+    }
 }
 
 - (void)layoutIndicator {
@@ -816,15 +882,20 @@ static void ryScrollToBottom(UITextView *tv) {
     CGRect inSelf = [self.view convertRect:end fromView:nil];
     CGFloat overlap = self.view.bounds.size.height - inSelf.origin.y;
     if (overlap < 0.0f) overlap = 0.0f;
-    self.content.frame = CGRectMake(kSidebarW, 0.0f,
-                                    self.view.bounds.size.width - kSidebarW,
-                                    self.view.bounds.size.height - overlap);
+    CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
+    CGFloat top = self.compact ? fmaxf(self.view.safeAreaInsets.top, 20.0f) : 0.0f;
+    self.content.frame = CGRectMake(sw, top,
+                                    self.view.bounds.size.width - sw,
+                                    self.view.bounds.size.height - overlap - top);
 }
 
 - (void)onKeyboardHide:(NSNotification *)n {
-    self.content.frame = CGRectMake(kSidebarW, 0.0f,
-                                    self.view.bounds.size.width - kSidebarW,
-                                    self.view.bounds.size.height);
+    CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
+    CGFloat top = self.compact ? fmaxf(self.view.safeAreaInsets.top, 20.0f) : 0.0f;
+    CGFloat bot = self.compact ? fmaxf(self.view.safeAreaInsets.bottom, 8.0f) : 0.0f;
+    self.content.frame = CGRectMake(sw, top,
+                                    self.view.bounds.size.width - sw,
+                                    self.view.bounds.size.height - top - bot);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
