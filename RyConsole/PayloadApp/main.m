@@ -675,7 +675,6 @@ static NSString *xpcCloseNative(long h) {
     xpc_connection_t c = xpcConnGet(h);
     if (!c) return @"NOT_FOUND";
     xpc_connection_cancel(c);
-    xpc_release(c);
     [g_xpcConns removeObjectForKey:@(h)];
     return @"ok";
 }
@@ -690,7 +689,6 @@ static id xpcSendMsgNative(long h, NSDictionary *msg, double timeoutSec) {
     for (NSString *k in msg) xpc_dictionary_set_value(m, [k UTF8String], xpcFromObj(msg[k]));
     if (timeoutSec <= 0) {
         xpc_connection_send_message(c, m);
-        xpc_release(m);
         return @"SENT";
     }
     __block id reply = nil;
@@ -699,7 +697,7 @@ static id xpcSendMsgNative(long h, NSDictionary *msg, double timeoutSec) {
         reply = xpcToObj(r, 0);
         dispatch_semaphore_signal(sem);
     });
-    xpc_release(m);
+    // ARC: 新 SDK 中 xpc 对象已桥接为 ObjC 对象, 禁止 xpc_release(等价 [release])，生命周期由 ARC 管理
     dispatch_time_t t = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutSec * NSEC_PER_SEC));
     if (dispatch_semaphore_wait(sem, t) != 0) return @{@"err": @"timeout"};
     return reply;
@@ -741,11 +739,11 @@ static NSDictionary *sandboxCheckNative(NSString *op) {
 // 钥匙串探针: SecItemCopyMatching 只查不取(不弹框不触发用户交互)，status 原样回传
 // 0=存在且可访问, -25300=errSecItemNotFound, -34018=errSecMissingEntitlement, -25291=交互被禁
 static NSDictionary *keychainProbeNative(NSString *cls, NSString *svc, NSString *acct) {
-    NSDictionary *clsMap = @{@"genp": @(__bridge id)kSecClassGenericPassword,
-                             @"inet": @(__bridge id)kSecClassInternetPassword,
-                             @"cert": @(__bridge id)kSecClassCertificate,
-                             @"keys": @(__bridge id)kSecClassKey,
-                             @"idnt": @(__bridge id)kSecClassIdentity};
+    NSDictionary *clsMap = @{@"genp": @((__bridge id)kSecClassGenericPassword),
+                             @"inet": @((__bridge id)kSecClassInternetPassword),
+                             @"cert": @((__bridge id)kSecClassCertificate),
+                             @"keys": @((__bridge id)kSecClassKey),
+                             @"idnt": @((__bridge id)kSecClassIdentity)};
     id secClass = clsMap[cls ?: @"genp"];
     if (!secClass) return @{@"err": @"bad-class", @"known": @[@"genp", @"inet", @"cert", @"keys", @"idnt"]};
     NSMutableDictionary *q = [NSMutableDictionary dictionary];
