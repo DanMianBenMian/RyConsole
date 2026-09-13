@@ -107,6 +107,9 @@ static void ryScrollToBottom(UITextView *tv) {
 @property (nonatomic, strong) UITextView *codeView;
 @property (nonatomic, strong) UITextView *outView;
 @property (nonatomic, strong) UILabel *stateLabel;
+// 先声明再调用：ObjC 未先声明时 clang 会把参数当 id，
+// ARC 下传 NSInteger/BOOL 等标量会直接 error（本文件已因此失败过一次）
+- (void)append:(NSString *)line;
 @end
 
 @implementation RYTerminalPane
@@ -234,6 +237,7 @@ static void ryScrollToBottom(UITextView *tv) {
 @property (nonatomic, strong) UITextView *codeView;
 @property (nonatomic, strong) UITextView *outView;
 @property (nonatomic, strong) UIButton *toggleBtn;
+- (void)refresh;
 @end
 
 @implementation RYAutorunPane
@@ -464,6 +468,7 @@ static void ryScrollToBottom(UITextView *tv) {
 @interface RYSettingsPane : UIView <UITextFieldDelegate>
 @property (nonatomic, strong) UITextField *portField;
 @property (nonatomic, strong) UITextField *timeoutField;
+- (UIViewController *)ry_topVC;
 @end
 
 @implementation RYSettingsPane
@@ -646,6 +651,12 @@ static void ryScrollToBottom(UITextView *tv) {
 @property (nonatomic, strong) RYSettingsPane *settingsPane;
 @property (nonatomic, assign) NSInteger current;
 @property (nonatomic, strong) UILabel *sideStatus;
+// 全部先声明（select: 之前正是因为这个缺失导致 ARC 报错）
+- (void)onNav:(UIButton *)sender;
+- (void)select:(NSInteger)idx;
+- (void)layoutIndicator;
+- (void)refreshSideStatus;
+- (void)firstLaunchDisclaimer;
 @end
 
 @implementation RYShellVC
