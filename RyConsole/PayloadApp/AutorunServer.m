@@ -119,7 +119,15 @@ static void rySendAll(int fd, NSData *data) {
 @property (nonatomic, strong) NSMutableDictionary *lastResult;
 @property (nonatomic, copy)   NSString *peer;
 @property (nonatomic, strong) NSMutableArray *observers;   // 支持多个观察者（面板 + 侧栏）
+// 全部先声明：未先声明时 clang 会把参数当 id，ARC 下传标量(int)会直接报错
 - (void)notify;
+- (void)logLine:(NSString *)s;
+- (NSString *)jsonFrom:(NSDictionary *)d;
+- (NSDictionary *)executeCode:(NSString *)code timeoutMs:(int)timeoutMs;
+- (void)acceptLoop;
+- (void)handleConnection:(int)cfd fromIP:(NSString *)ip;
+- (BOOL)bufferComplete:(NSData *)buf;
+- (NSString *)statusJSON;
 @end
 
 @implementation RYAutorunServer
