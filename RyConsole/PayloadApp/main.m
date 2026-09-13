@@ -17,6 +17,8 @@
 #import <sys/sysctl.h>
 #import <mach/mach_time.h>
 #import <dlfcn.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 #import <spawn.h>
 #import <sys/wait.h>
 #import <unistd.h>
@@ -775,6 +777,104 @@ static id procListPidsNative(void) {
 
 // posix_spawn: 沙盒内多被拒(spawn 错误码原样回传)；成功则 waitpid 轮询到退出/超时
 // 超时不 reap(留僵尸，进程表可见——本身就是信号)。timeoutMs 上限 30s
+// ============================================================
+//  V2.1 ObjC runtime 桥（2026-09-13）: objc_getClass / sel_registerName / objc_msgSend
+//  设计: 一切对象以 0x 十六进制句柄在 JS 与原生间流动
+//        (Class/SEL 永生无需句柄表; 普通对象由 ARC/autorelease 池持有)
+//  args 规则: 字符串→自动包 NSString | 数字→uint64 位槽(BOOL/int/long 都按位传)
+//             true/false→BOOL | {hex:"0x.."}→原始指针 | null/undefined→nil
+//  限制: 只覆盖整型/指针寄存器返回(id/BOOL/long); float/struct 返回的方法不适用
+//        (arm64 无 stret 顾虑, 但 x0 读出来的位当指针回传会错)
+//  已知取舍: 经 msgSend 调 alloc/new/copy 族会泄漏 +1(ARC 视 msgSend 返回为 +0), 探针别滥创建
+// ============================================================
+static NSString *objcHexFromPtr(uintptr_t p) {
+    return [NSString stringWithFormat:@"0x%016llx", (unsigned long long)p];
+}
+static uintptr_t objcHexToPtr(id v) {
+    if ([v isKindOfClass:[NSString class]]) {
+        unsigned long long r = 0;
+        NSScanner *s = [NSScanner scannerWithString:v];
+        [s scanHexLongLong:&r];
+        return (uintptr_t)r;
+    }
+    if ([v isKindOfClass:[NSNumber class]]) return (uintptr_t)[v unsignedLongLongValue];
+    return 0;
+}
+
+static NSString *objcGetClassNative(NSString *name) {
+    if (![name isKindOfClass:[NSString class]] || !name.length) return @"0x0000000000000000";
+    return objcHexFromPtr((uintptr_t)objc_getClass([name UTF8String]));
+}
+
+static NSString *objcSelNative(NSString *name) {
+    if (![name isKindOfClass:[NSString class]] || !name.length) return @"0x0000000000000000";
+    return objcHexFromPtr((uintptr_t)sel_registerName([name UTF8String]));
+}
+
+// 句柄 → description/原文: 回读 msgSend 结果的唯一手段(NSString 原文, 其他对象 description)
+static NSString *objcDescNative(NSString *hex) {
+    uintptr_t p = objcHexToPtr(hex);
+    if (!p) return @"(nil)";
+    @try {
+        id o = (__bridge id)(void *)p;
+        if (!o) return @"(nil)";
+        if ([o isKindOfClass:[NSString class]]) return [NSString stringWithString:o];
+        return [NSString stringWithFormat:@"%@", o];
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"[objcDesc exception] %@", e.reason];
+    }
+}
+
+static NSString *objcMsgSendNative(id recvArg, NSString *selName, NSArray *args) {
+    uintptr_t rp = objcHexToPtr(recvArg);
+    if (!rp) return @"0x0000000000000000"; // nil recv → nil
+    id recv = (__bridge id)(void *)rp;
+    if (![selName isKindOfClass:[NSString class]] || !selName.length)
+        return @"[objc_msgSend error] bad selector";
+    SEL sel = [selName hasPrefix:@"0x"] ? (SEL)objcHexToPtr(selName)
+                                        : sel_registerName([selName UTF8String]);
+    if (!sel) return @"[objc_msgSend error] null selector";
+
+    id objs[8] = {nil};
+    unsigned long long nums[8] = {0};
+    void *slots[8] = {0};
+    int n = 0;
+    for (id v in (args ?: @[])) {
+        if (n >= 8) break;
+        if (v == nil || [v isKindOfClass:[NSNull class]]) { slots[n] = NULL; }
+        else if ([v isKindOfClass:[NSNumber class]]) {
+            if (strcmp([v objCType], "c") == 0 || strcmp([v objCType], "B") == 0)
+                nums[n] = (unsigned long long)([v boolValue] ? 1 : 0);
+            else
+                nums[n] = [v unsignedLongLongValue];
+            slots[n] = (void *)nums[n]; // 位槽: 调用方按声明宽度读低位, 恰好正确
+        }
+        else if ([v isKindOfClass:[NSDictionary class]] && v[@"hex"]) {
+            slots[n] = (void *)objcHexToPtr(v[@"hex"]);
+        }
+        else if ([v isKindOfClass:[NSString class]]) { objs[n] = v; slots[n] = (__bridge void *)objs[n]; }
+        else { slots[n] = NULL; }
+        n++;
+    }
+    @try {
+        // 显式 arity 分发: 每档独立签名 cast, 不多传垃圾实参
+        id ret = nil;
+        switch (n) {
+            case 0: ret = ((id(*)(id, SEL))objc_msgSend)(recv, sel); break;
+            case 1: ret = ((id(*)(id, SEL, void *))objc_msgSend)(recv, sel, slots[0]); break;
+            case 2: ret = ((id(*)(id, SEL, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1]); break;
+            case 3: ret = ((id(*)(id, SEL, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2]); break;
+            case 4: ret = ((id(*)(id, SEL, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3]); break;
+            case 5: ret = ((id(*)(id, SEL, void *, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3], slots[4]); break;
+            case 6: ret = ((id(*)(id, SEL, void *, void *, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3], slots[4], slots[5]); break;
+            default: ret = ((id(*)(id, SEL, void *, void *, void *, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6]); break;
+        }
+        return objcHexFromPtr((uintptr_t)ret);
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"[objc_msgSend exception] %@", e.reason];
+    }
+}
+
 static NSDictionary *posixSpawnNative(NSString *path, NSArray *argvArr, double timeoutSec) {
     if (timeoutSec <= 0 || timeoutSec > 30) timeoutSec = 5;
     int cap = (int)(argvArr.count ?: 0) + 2;
@@ -1114,6 +1214,12 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"keychainProbe"]=^(NSString *cls, NSString *svc, NSString *acct){ return keychainProbeNative(cls, svc, acct); };
             ctx[@"procListPids"]=^{ return procListPidsNative(); };
             ctx[@"posixSpawn"]=^(NSString *path, NSArray *argvArr, NSNumber *timeoutMs){ return posixSpawnNative(path, argvArr, [timeoutMs doubleValue]/1000.0); };
+
+            // ---- V2.1 ObjC runtime 桥（2026-09-13）: 万用钥匙, 私有类直接驱动 ----
+            ctx[@"objc_getClass"]=^(NSString *n){ return objcGetClassNative(n); };
+            ctx[@"sel_registerName"]=^(NSString *n){ return objcSelNative(n); };
+            ctx[@"objc_msgSend"]=^(id recv, NSString *sel, NSArray *args){ return objcMsgSendNative(recv, sel, args); };
+            ctx[@"objcDesc"]=^(id hex){ return objcDescNative(hex); };
 
             // ---- AI / Autorun 辅助原语（探针迭代常用；每次执行都是全新 ctx，跨轮状态请落盘）----
             // 限速/间隔：JavaScriptCore 没有 setTimeout，用阻塞 sleep 代替（上限 120s 防呆）
