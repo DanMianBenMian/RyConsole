@@ -662,13 +662,13 @@ static NSDictionary *xpcConnNative(NSString *svc) {
     xpc_connection_set_event_handler(c, ^(xpc_object_t ev) {});
     xpc_connection_resume(c);
     long h = g_xpcNextHandle++;
-    g_xpcConns[@(h)] = [NSValue valueWithPointer:c];
+    g_xpcConns[@(h)] = c; // xpc 对象即 ObjC 对象(NSObject<OS_xpc_object>*), ARC 直接持有
     return @{@"h": @(h)};
 }
 
 static xpc_connection_t xpcConnGet(long h) {
-    NSValue *v = g_xpcConns[@(h)];
-    return v ? (xpc_connection_t)v.pointerValue : NULL;
+    id v = g_xpcConns[@(h)];
+    return (xpc_connection_t)v; // 同一 ObjC 类型, 直接桥回
 }
 
 static NSString *xpcCloseNative(long h) {
@@ -739,11 +739,11 @@ static NSDictionary *sandboxCheckNative(NSString *op) {
 // 钥匙串探针: SecItemCopyMatching 只查不取(不弹框不触发用户交互)，status 原样回传
 // 0=存在且可访问, -25300=errSecItemNotFound, -34018=errSecMissingEntitlement, -25291=交互被禁
 static NSDictionary *keychainProbeNative(NSString *cls, NSString *svc, NSString *acct) {
-    NSDictionary *clsMap = @{@"genp": @((__bridge id)kSecClassGenericPassword),
-                             @"inet": @((__bridge id)kSecClassInternetPassword),
-                             @"cert": @((__bridge id)kSecClassCertificate),
-                             @"keys": @((__bridge id)kSecClassKey),
-                             @"idnt": @((__bridge id)kSecClassIdentity)};
+    NSDictionary *clsMap = @{@"genp": @((__bridge NSString *)kSecClassGenericPassword),
+                             @"inet": @((__bridge NSString *)kSecClassInternetPassword),
+                             @"cert": @((__bridge NSString *)kSecClassCertificate),
+                             @"keys": @((__bridge NSString *)kSecClassKey),
+                             @"idnt": @((__bridge NSString *)kSecClassIdentity)};
     id secClass = clsMap[cls ?: @"genp"];
     if (!secClass) return @{@"err": @"bad-class", @"known": @[@"genp", @"inet", @"cert", @"keys", @"idnt"]};
     NSMutableDictionary *q = [NSMutableDictionary dictionary];
