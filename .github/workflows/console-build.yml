@@ -1,0 +1,35 @@
+name: console-build
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xcodegen
+        run: which xcodegen || brew install xcodegen
+      - name: Generate Xcode project
+        run: cd RyConsole && xcodegen generate --spec project.yml
+      - name: Build unsigned
+        run: |
+          cd RyConsole
+          set -eo pipefail
+          xcodebuild -scheme RyConsole -project RyConsole.xcodeproj -configuration Release \
+            -derivedDataPath build CODE_SIGN_IDENTITY="" CODE_SIGNING_ALLOWED=NO \
+            -sdk iphoneos 2>&1 | tee build.log
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildlog
+          path: RyConsole/build.log
+      - name: Package IPA
+        run: |
+          mkdir -p ipa/Payload
+          cp -R "RyConsole/build/Build/Products/Release-iphoneos/RyConsole.app" ipa/Payload/
+          cd ipa && zip -qr RyConsole.ipa Payload
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RyConsole.ipa
+          path: ipa/RyConsole.ipa
