@@ -72,6 +72,46 @@ python ryc_autorun.py result --host <IP> --id j1
 
 脚本位置：`RyConsole/tools/ryc_autorun.py`（纯标准库，无依赖）
 
+## 4.5 电脑端图形界面（GUI）
+
+```bash
+# 双击启动
+tools\RunAutorunPanel.bat
+# 或命令行（可预填目标 / 关掉控制接口）
+python ryc_gui.py --host 192.168.0.110 --port 8899
+python ryc_gui.py --no-control
+python ryc_gui.py --selftest --port 18899      # 无界面自测（需 mock 服务）
+```
+
+深色科技风，与 iPad 端同一套配色。布局：
+
+| 区域 | 内容 |
+|---|---|
+| 顶栏 | `iPad IP` / `端口` / 「连接」+ **状态灯**（灰=未连接，绿=已连接） |
+| 中 | 「发送到 iPad 的代码」编辑区：`载入 .js` / `另存 .js` / `清空` / `执行 ▶`（`Ctrl+Enter` 同效） |
+| 下 | 「执行结果 / 回传内容」：状态 pill（**待命 → 执行中 → 已回传 / 未回传**）、往返毫秒、`---- print 输出 ----`、`---- 返回值 ----`、错误段；可一键复制 |
+| 底 | 「事件日志」：逐次打印轮询进度（`第 N/12 次轮询：running`） |
+| 状态栏 | AI 控制接口地址、启动/停止、打开日志目录 |
+
+**每次交互都会追加到 `tools/logs/autorun_gui.jsonl`**（追加写，不覆盖），Agent 直接读文件也能取结果。
+
+### 内置 AI 控制接口（默认开，只绑 127.0.0.1:8877）
+
+GUI 开着时，Agent 可以不走 CLI 直接驱动它 —— 好处是**用户能实时看到 AI 发了什么代码、回传了什么**：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/status` | 目标 / 连接 / 忙闲 / 最近结果摘要 |
+| GET | `/ping` | 代理到 iPad |
+| POST | `/exec` | `{"code":"…","host":"…","port":8899}`，**阻塞式**跑完 submit + 3s×12 轮询后返回最终 JSON |
+| GET | `/result?id=j7` | 代理查结果 |
+| GET | `/last` | 最近一次完整结果 |
+| GET | `/log?n=80` | 事件日志文本 |
+| GET | `/history?n=20` | 历史（不含代码，防爆量） |
+| POST | `/stop` | 断开当前连接状态 |
+
+`/exec` 发来的代码会**自动回显到 GUI 编辑区**，用户看得见正在跑什么。
+
 ## 5. 协议（想自己写客户端时看这里）
 
 | 方法 | 路径 | 请求 | 返回 |
@@ -108,13 +148,22 @@ curl -s -X POST http://192.168.0.110:8899/eval \
 | 一直 `running` | 看 iPad 屏幕：是不是弹了系统权限框（局域网权限）没点；或代码卡住了 |
 | 端口被占用 | 面板换端口，电脑端 `--port` 同步改 |
 
-## 8. ⚠️ 尚未验证的部分（诚实交底）
+## 8. 验证状态（诚实交底）
 
-- ObjC 新代码（`AutorunServer.m`）**本地无法编译验证**（Windows 没有 Xcode）。
-  已做静态自检：括号配平零差、`main.m` 五处接线齐全。
-  **第一次云端构建可能需要改一两处**——如果编译报错，把错误贴出来即可快速修掉。
-- `RYAutorunRunCapture` 复用了 `RunCode` 的 ctx 装配流程（安装原语 → 加载桥 → 载入 engine.js），
-  但**没有在真机上跑过**，首次执行请先用 `return 1+1` 这种最小代码验证通路。
+| 部分 | 状态 |
+|---|---|
+| ObjC 原生代码（`AutorunServer.m` / `MainShell.m` / `main.m`） | ✅ **已云端编译通过**，IPA 产出正常（`com.research.ryconsole`，MinimumOSVersion 16.0） |
+| 电脑端 CLI（`ryc_autorun.py`） | ✅ 已用模拟服务端到端自测（ping / eval / submit+result / run 轮询 / --json / 连不上报错） |
+| 电脑端 GUI（`ryc_gui.py`） | ✅ 隐藏窗口冒烟测试 10 项全过（构建 → 连接 → 执行 → 轮询 → 渲染 → AI 接口 → 代码回显 → jsonl 落盘） |
+| `RYAutorunRunCapture` 真机执行 | ⚠️ **未在真机跑过** —— 首次请先用 `return 1+1` 这种最小代码验证通路 |
+
+**编译时踩过的坑（已修，留档备查）**：
+1. `project.yml` 引用的 `AppIcon.xcassets` / `RyConsoleScripts` 必须先推上去，否则 `xcodegen` 直接报
+   `missing source directory`（构建 10 秒即失败，且**不产出任何日志 artifact**）。
+2. `MainShell.m` 里「先调用后定义」且未声明的方法，clang 会把参数当 `id` → ARC 下传 `NSInteger` 直接 error
+   （无参方法只是 warning）。修法：在调用点之前补声明。
+3. 改了代码重新构建却**报一模一样的错、行号也一样** → 多半是**推送/触发竞态**（文件多、推送慢，
+   dispatch 落在旧提交上）。判断法：比对 GitHub 上文件 sha256 与本地是否一致。
 
 ## 9. 安全
 
