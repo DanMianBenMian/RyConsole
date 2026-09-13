@@ -1,0 +1,67 @@
+name: RyConsole
+options:
+  bundleIdPrefix: com.research
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  RyConsole:
+    type: application
+    platform: iOS
+    sources:
+      - path: PayloadApp
+      - path: PayloadApp/AppIcon.xcassets
+      - path: RyConsoleScripts
+        buildPhase: resources
+    info:
+      path: PayloadApp/Info.plist
+      properties:
+        MinimumOSVersion: "16.0"
+        UIFileSharingEnabled: true
+        UISupportsDocumentBrowser: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UIApplicationSupportsIndirectInputEvents: true
+        # ---- 渲染相关（缺了会"能装能开但看着不对"，且构建全绿）----
+        # UILaunchScreen 缺失 → iPad 上按 iPhone 尺寸运行、四周黑边（永远拿不到 iPad 全屏分辨率）
+        UILaunchScreen: {}
+        # 方向：壳是左侧栏布局，竖横都支持；iPad 额外允许倒置
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # ---- 网络：AI 后端 / 结果回传 ----
+        # 线上 AI 接口多为 https，无需 ATS 例外；
+        # 局域网（本地模型 / 代理 / 结果回传 如 192.168.x.x）需要下面两项。
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: false
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: 用于访问局域网内的研究桥接服务（结果回传、本地模型或代理）。只连接你本人的地址，不扫描他人网络。
+        NSBonjourServices:
+          - _http._tcp
+          - _localsend._tcp
+        # ---- 合规：仅使用标准 https 加密，避免出口合规问询 ----
+        ITSAppUsesNonExemptEncryption: false
+        # ---- 允许从「文件」App 直接把探针脚本丢进来（热重载，不重编 IPA）----
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: RyConsole Probe Script
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - com.netscape.javascript-source
+              - public.json
+              - public.plain-text
+    settings:
+      base:
+        INFOPLIST_FILE: PayloadApp/Info.plist
+        # ★ 必须显式关掉：Xcode 26 默认 GENERATE_INFOPLIST_FILE=YES 会自己生成一份，
+        #    把我们手写的 ATS / NSLocalNetworkUsageDescription 等键静默吞掉（构建仍 SUCCESS）。
+        GENERATE_INFOPLIST_FILE: "NO"
+        PRODUCT_NAME: RyConsole
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_ALLOWED: "NO"
+        PRODUCT_BUNDLE_IDENTIFIER: com.research.ryconsole
+        OTHER_LDFLAGS: "-framework UIKit -framework Foundation -framework JavaScriptCore -framework IOSurface -framework Security -framework IOKit"
