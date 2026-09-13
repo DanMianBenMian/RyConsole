@@ -739,11 +739,11 @@ static NSDictionary *sandboxCheckNative(NSString *op) {
 // 钥匙串探针: SecItemCopyMatching 只查不取(不弹框不触发用户交互)，status 原样回传
 // 0=存在且可访问, -25300=errSecItemNotFound, -34018=errSecMissingEntitlement, -25291=交互被禁
 static NSDictionary *keychainProbeNative(NSString *cls, NSString *svc, NSString *acct) {
-    NSDictionary *clsMap = @{@"genp": @((__bridge NSString *)kSecClassGenericPassword),
-                             @"inet": @((__bridge NSString *)kSecClassInternetPassword),
-                             @"cert": @((__bridge NSString *)kSecClassCertificate),
-                             @"keys": @((__bridge NSString *)kSecClassKey),
-                             @"idnt": @((__bridge NSString *)kSecClassIdentity)};
+    NSDictionary *clsMap = @{@"genp": (__bridge NSString *)kSecClassGenericPassword,
+                             @"inet": (__bridge NSString *)kSecClassInternetPassword,
+                             @"cert": (__bridge NSString *)kSecClassCertificate,
+                             @"keys": (__bridge NSString *)kSecClassKey,
+                             @"idnt": (__bridge NSString *)kSecClassIdentity};
     id secClass = clsMap[cls ?: @"genp"];
     if (!secClass) return @{@"err": @"bad-class", @"known": @[@"genp", @"inet", @"cert", @"keys", @"idnt"]};
     NSMutableDictionary *q = [NSMutableDictionary dictionary];
