@@ -16,6 +16,9 @@
 #import <IOKit/IOKitLib.h>
 #import <sys/sysctl.h>
 #import <mach/mach_time.h>
+#import <dlfcn.h>
+#import <spawn.h>
+#import <sys/wait.h>
 #import <unistd.h>
 #import "AutorunServer.h"
 #import "RyExec.h"
@@ -604,6 +607,205 @@ static xpc_object_t xpcFromObj(id obj) {
     return xpc_string_create("");
 }
 
+// ============================================================
+//  V2 扩展原语（2026-09-13 重构）: XPC 结构化桥 / dyld 符号 / 沙盒 / 钥匙串 / 进程
+//  设计原则: 错误码/原始返回值原样回传，JS 探针侧自行解读（诚实测量，不替用户下结论）
+// ============================================================
+
+// ---- XPC 持久连接注册表（handle -> xpc_connection_t）----
+static NSMutableDictionary<NSNumber *, NSValue *> *g_xpcConns = nil;
+static long g_xpcNextHandle = 1000;
+
+// xpc_object_t -> ObjC（递归解析 reply；深度限 6、每层条目限 64 防 reply 轰炸）
+// UINT64 转十六进制字符串回传，避免 JS Number 53 位精度丢失
+static id xpcToObj(xpc_object_t o, int depth) {
+    if (depth > 6) return @"[depth-limit]";
+    xpc_type_t t = xpc_get_type(o);
+    if (t == XPC_TYPE_DICTIONARY) {
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        __block int n = 0;
+        xpc_dictionary_apply(o, ^bool(const char *k, xpc_object_t v) {
+            if (n++ < 64) d[[NSString stringWithUTF8String:k]] = xpcToObj(v, depth + 1);
+            return true;
+        });
+        return d;
+    }
+    if (t == XPC_TYPE_ARRAY) {
+        NSMutableArray *a = [NSMutableArray array];
+        __block int n = 0;
+        xpc_array_apply(o, ^bool(size_t i, xpc_object_t v) {
+            if (n++ < 64) [a addObject:xpcToObj(v, depth + 1)];
+            return true;
+        });
+        return a;
+    }
+    if (t == XPC_TYPE_STRING) { const char *s = xpc_string_get_string_ptr(o); return s ? [NSString stringWithUTF8String:s] : @""; }
+    if (t == XPC_TYPE_INT64) return @(xpc_int64_get_value(o));
+    if (t == XPC_TYPE_UINT64) return [NSString stringWithFormat:@"0x%016llx", xpc_uint64_get_value(o)];
+    if (t == XPC_TYPE_BOOL) return @(xpc_bool_get_value(o));
+    if (t == XPC_TYPE_DOUBLE) return @(xpc_double_get_value(o));
+    if (t == XPC_TYPE_DATE) return @(xpc_date_get_value(o)); // ns since epoch
+    if (t == XPC_TYPE_DATA) {
+        size_t l = xpc_data_get_length(o);
+        const void *p = xpc_data_get_bytes_ptr(o);
+        NSData *d = p ? [NSData dataWithBytes:p length:l] : [NSData data];
+        return [d base64EncodedStringWithOptions:0];
+    }
+    return [NSString stringWithFormat:@"<%s>", xpc_type_get_name(t)]; // NULL/ERROR/FD 等只给类型名
+}
+
+static NSDictionary *xpcConnNative(NSString *svc) {
+    if (!g_xpcConns) g_xpcConns = [NSMutableDictionary new];
+    xpc_connection_t c = xpc_connection_create([svc UTF8String], NULL);
+    if (!c) return @{@"err": @"create-failed"};
+    // 事件 handler 必须设（空实现即可）：默认 handler 收到 error 事件会直接 crash 进程
+    xpc_connection_set_event_handler(c, ^(xpc_object_t ev) {});
+    xpc_connection_resume(c);
+    long h = g_xpcNextHandle++;
+    g_xpcConns[@(h)] = [NSValue valueWithPointer:c];
+    return @{@"h": @(h)};
+}
+
+static xpc_connection_t xpcConnGet(long h) {
+    NSValue *v = g_xpcConns[@(h)];
+    return v ? (xpc_connection_t)v.pointerValue : NULL;
+}
+
+static NSString *xpcCloseNative(long h) {
+    xpc_connection_t c = xpcConnGet(h);
+    if (!c) return @"NOT_FOUND";
+    xpc_connection_cancel(c);
+    xpc_release(c);
+    [g_xpcConns removeObjectForKey:@(h)];
+    return @"ok";
+}
+
+// 结构化收发: h=连接句柄, msg=任意嵌套 JS 对象(转 xpc_dictionary), timeoutSec<=0 为发射不等待
+// 回传解析后的 reply 对象；超时 {err:timeout}；对端回 ERROR 事件时回传 "<error-type>" 字符串
+static id xpcSendMsgNative(long h, NSDictionary *msg, double timeoutSec) {
+    xpc_connection_t c = xpcConnGet(h);
+    if (!c) return @{@"err": @"bad-handle"};
+    if (![msg isKindOfClass:[NSDictionary class]]) return @{@"err": @"msg-not-dict"};
+    xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
+    for (NSString *k in msg) xpc_dictionary_set_value(m, [k UTF8String], xpcFromObj(msg[k]));
+    if (timeoutSec <= 0) {
+        xpc_connection_send_message(c, m);
+        xpc_release(m);
+        return @"SENT";
+    }
+    __block id reply = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    xpc_connection_send_message_with_reply(c, m, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(xpc_object_t r) {
+        reply = xpcToObj(r, 0);
+        dispatch_semaphore_signal(sem);
+    });
+    xpc_release(m);
+    dispatch_time_t t = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutSec * NSEC_PER_SEC));
+    if (dispatch_semaphore_wait(sem, t) != 0) return @{@"err": @"timeout"};
+    return reply;
+}
+
+// bootstrap_look_up 原始版: 回传 kr + port 名(uint32 句柄)，供探针比对服务可达性与句柄分配
+static NSDictionary *machLookUpNative(NSString *svc) {
+    mach_port_t bp = MACH_PORT_NULL;
+    task_get_bootstrap_port(mach_task_self(), &bp);
+    mach_port_t sp = MACH_PORT_NULL;
+    kern_return_t kr = bootstrap_look_up(bp, [svc UTF8String], &sp);
+    if (kr != BOOTSTRAP_SUCCESS) return @{@"kr": @((long)kr), @"port": @0};
+    return @{@"kr": @(0), @"port": @((unsigned long long)sp)};
+}
+
+// dlopen 私有框架: path 如 /System/Library/PrivateFrameworks/Foo.framework/Foo
+static NSDictionary *dlopenFWNative(NSString *path, int mode) {
+    void *h = dlopen([path UTF8String], mode > 0 ? mode : RTLD_LAZY);
+    if (!h) { const char *e = dlerror(); return @{@"err": e ? [NSString stringWithUTF8String:e] : @"dlopen-failed"}; }
+    return @{@"h": @((unsigned long long)(uintptr_t)h)};
+}
+
+// dlsym 符号解析: handle=0 时用 RTLD_DEFAULT(全镜像搜索)；addr 以 hex 回传(基址+slide 已含)
+static NSDictionary *dlsymAddrNative(uint64_t handle, NSString *name) {
+    void *h = handle ? (void *)(uintptr_t)handle : RTLD_DEFAULT;
+    void *p = dlsym(h, [name UTF8String]);
+    if (!p) { const char *e = dlerror(); return @{@"err": e ? [NSString stringWithUTF8String:e] : @"not-found"}; }
+    return @{@"addr": [NSString stringWithFormat:@"0x%016llx", (unsigned long long)(uintptr_t)p]};
+}
+
+// sandbox_check: 苹果语义模糊(不同文档/版本对返回值解释不一)，回传原始返回值+errno，不解读
+extern int sandbox_check(pid_t pid, const char *operation, ...);
+static NSDictionary *sandboxCheckNative(NSString *op) {
+    errno = 0;
+    int r = sandbox_check(getpid(), [op UTF8String]);
+    return @{@"ret": @(r), @"errno": @(errno)};
+}
+
+// 钥匙串探针: SecItemCopyMatching 只查不取(不弹框不触发用户交互)，status 原样回传
+// 0=存在且可访问, -25300=errSecItemNotFound, -34018=errSecMissingEntitlement, -25291=交互被禁
+static NSDictionary *keychainProbeNative(NSString *cls, NSString *svc, NSString *acct) {
+    NSDictionary *clsMap = @{@"genp": @(__bridge id)kSecClassGenericPassword,
+                             @"inet": @(__bridge id)kSecClassInternetPassword,
+                             @"cert": @(__bridge id)kSecClassCertificate,
+                             @"keys": @(__bridge id)kSecClassKey,
+                             @"idnt": @(__bridge id)kSecClassIdentity};
+    id secClass = clsMap[cls ?: @"genp"];
+    if (!secClass) return @{@"err": @"bad-class", @"known": @[@"genp", @"inet", @"cert", @"keys", @"idnt"]};
+    NSMutableDictionary *q = [NSMutableDictionary dictionary];
+    q[(__bridge id)kSecClass] = secClass;
+    if (svc.length) q[(__bridge id)kSecAttrService] = svc;
+    if (acct.length) q[(__bridge id)kSecAttrAccount] = acct;
+    q[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
+    q[(__bridge id)kSecReturnData] = @NO;
+    q[(__bridge id)kSecReturnAttributes] = @NO;
+    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, NULL);
+    return @{@"status": @((long)st), @"exists": @(st == errSecSuccess),
+             @"stHex": [NSString stringWithFormat:@"0x%08x", st]};
+}
+
+// 进程枚举: proc_listallpids 沙盒内多半 EPERM，错误本身即测量结果
+extern int proc_listallpids(void *buffer, int buffersize);
+static id procListPidsNative(void) {
+    int n = proc_listallpids(NULL, 0);
+    if (n <= 0) return @{@"err": @"proc_listallpids-failed", @"n": @(n)};
+    if (n > 2048) n = 2048;
+    pid_t *buf = (pid_t *)calloc((size_t)n, sizeof(pid_t));
+    if (!buf) return @{@"err": @"oom"};
+    int real = proc_listallpids(buf, n * (int)sizeof(pid_t));
+    NSMutableArray *a = [NSMutableArray arrayWithCapacity:real > 0 ? (NSUInteger)real : 0];
+    for (int i = 0; i < real; i++) [a addObject:@(buf[i])];
+    free(buf);
+    return @{@"n": @(real), @"pids": a};
+}
+
+// posix_spawn: 沙盒内多被拒(spawn 错误码原样回传)；成功则 waitpid 轮询到退出/超时
+// 超时不 reap(留僵尸，进程表可见——本身就是信号)。timeoutMs 上限 30s
+static NSDictionary *posixSpawnNative(NSString *path, NSArray *argvArr, double timeoutSec) {
+    if (timeoutSec <= 0 || timeoutSec > 30) timeoutSec = 5;
+    int cap = (int)(argvArr.count ?: 0) + 2;
+    char **argv = (char **)calloc((size_t)cap, sizeof(char *));
+    if (!argv) return @{@"err": @"oom"};
+    argv[0] = strdup([path UTF8String]);
+    int i = 1;
+    for (id v in argvArr) { if ([v isKindOfClass:[NSString class]] && i < cap - 1) argv[i++] = strdup([v UTF8String]); }
+    argv[i] = NULL;
+    extern char **environ;
+    pid_t pid = -1;
+    int sp = posix_spawn(&pid, [path UTF8String], NULL, NULL, argv, environ);
+    for (int j = 0; j < cap && argv[j]; j++) free(argv[j]);
+    free(argv);
+    if (sp != 0) return @{@"spawn": @((long)sp), @"errstr": [NSString stringWithUTF8String:strerror(sp)]};
+    int status = 0; BOOL done = NO;
+    double deadline = CFAbsoluteTimeGetCurrent() + timeoutSec;
+    while (CFAbsoluteTimeGetCurrent() < deadline) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid || r < 0) { done = YES; break; }
+        usleep(50000);
+    }
+    NSMutableDictionary *res = [NSMutableDictionary dictionaryWithObject:@(pid) forKey:@"pid"];
+    if (!done) { res[@"timeout"] = @YES; return res; }
+    if (WIFEXITED(status)) res[@"exit"] = @(WEXITSTATUS(status));
+    if (WIFSIGNALED(status)) res[@"signal"] = @(WTERMSIG(status));
+    return res;
+}
+
 // ---- 内嵌脚本库：把整套 JS 探针环境打进 IPA，离线可用 ----
 static NSArray<NSString*> *bundledScripts(void) {
     NSString *res = [[NSBundle mainBundle] resourcePath];
@@ -902,6 +1104,18 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"iokitClose"]=^(NSNumber *conn){ return @(iokitCloseNative([conn longValue])); };
             ctx[@"iokitEnum"]=^{ return iokitEnumNative(); };
             ctx[@"sysctlGet"]=^(NSString *n){ return sysctlGetNative(n); };
+
+            // ---- V2 扩展桥（2026-09-13）: XPC 结构化 / dyld 符号 / 沙盒 / 钥匙串 / 进程 ----
+            ctx[@"xpcConn"]=^(NSString *svc){ return xpcConnNative(svc); };
+            ctx[@"xpcSendMsg"]=^(NSNumber *h, NSDictionary *msg, NSNumber *timeoutSec){ return xpcSendMsgNative([h longValue], msg, [timeoutSec doubleValue]); };
+            ctx[@"xpcClose"]=^(NSNumber *h){ return xpcCloseNative([h longValue]); };
+            ctx[@"machLookUp"]=^(NSString *svc){ return machLookUpNative(svc); };
+            ctx[@"dlopenFW"]=^(NSString *p, NSNumber *mode){ return dlopenFWNative(p, [mode intValue]); };
+            ctx[@"dlsymAddr"]=^(NSNumber *h, NSString *name){ return dlsymAddrNative([h unsignedLongLongValue], name); };
+            ctx[@"sandboxCheck"]=^(NSString *op){ return sandboxCheckNative(op); };
+            ctx[@"keychainProbe"]=^(NSString *cls, NSString *svc, NSString *acct){ return keychainProbeNative(cls, svc, acct); };
+            ctx[@"procListPids"]=^{ return procListPidsNative(); };
+            ctx[@"posixSpawn"]=^(NSString *path, NSArray *argvArr, NSNumber *timeoutMs){ return posixSpawnNative(path, argvArr, [timeoutMs doubleValue]/1000.0); };
 
             // ---- AI / Autorun 辅助原语（探针迭代常用；每次执行都是全新 ctx，跨轮状态请落盘）----
             // 限速/间隔：JavaScriptCore 没有 setTimeout，用阻塞 sleep 代替（上限 120s 防呆）
