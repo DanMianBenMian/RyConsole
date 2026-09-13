@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      RyConsole 最小 entitlement 集。
+
+      刻意只保留一个键：不申请任何特权 entitlement。
+      原因：越权 entitlement 会被 AMFI 拒绝，表现为「装不上」或「启动即闪退」，
+      排查成本远高于收益。需要什么再加什么，一次加一个。
+
+      注意：下面这两个键由签名工具按你的描述文件自动注入，**不要手写**，
+      写错值会导致安装失败：
+        application-identifier
+        com.apple.developer.team-identifier
+    -->
+    <key>get-task-allow</key>
+    <true/>
+</dict>
+</plist>
