@@ -8,8 +8,8 @@
 //   primHelp("iokitMap")      → 单个桥完整说明（含参数范围/返回/常见错误）
 //   primErrors()              → 错误约定总说明（返回值形态 / 错误串格式 / kr 怎么读）
 //   primMissing()             → 还没做成自解释错误的桥（诚实清单）
-var HELP_VERSION = "bridge_help v1.0 (build 2026-09-18)";
-var BRIDGE_VERSION = "v1.0 (build 2026-09-18)";
+var HELP_VERSION = "bridge_help v1.1 (build 2026-09-19)";
+var BRIDGE_VERSION = "v1.1 (build 2026-09-19)";
 if (typeof RYC_BRIDGES === "undefined") { var RYC_BRIDGES = {}; }
 RYC_BRIDGES["bridge_help"] = BRIDGE_VERSION;
 
@@ -63,7 +63,7 @@ var PRIM_DOC = [
   { cat: "IOSurface", name: "iosurfaceProbe", sig: "iosurfaceProbe()", err: "ok",
     args: [], ret: "文本报告（CREATE_OK / MAP_OK / CREATE_FAILED + 原因）", errs: "失败时文本里带 [iosurfaceProbe error]", hint: "最省事的「内核相邻面是否可用」一枪测" },
   { cat: "IOSurface", name: "iosurfaceCreate", sig: "iosurfaceCreate(props)", err: "self",
-    args: [{ n: "props", t: "object", r: "可省略；最小可用集 {IOSurfaceWidth:4, IOSurfaceHeight:4, IOSurfaceBytesPerElement:4, IOSurfaceBytesPerRow:16}" }],
+    args: [{ n: "props", t: "object", r: "★ 必须带最小集 {IOSurfaceWidth:4, IOSurfaceHeight:4, IOSurfaceBytesPerElement:4, IOSurfaceBytesPerRow:16}（实测省略/空对象都返回 NULL）" }],
     ret: ">0 = 句柄（本进程内有效）", errs: "失败返回 \"[iosurfaceCreate error] …\" 字符串（不是 -1）",
     hint: "句柄跨调用存活（原生注册表持有），用完 iosurfaceRelease" },
   { cat: "IOSurface", name: "iosurfaceGetID", sig: "iosurfaceGetID(handle)", err: "self",
@@ -78,6 +78,14 @@ var PRIM_DOC = [
   { cat: "IOSurface", name: "iosurfaceLookup", sig: "iosurfaceLookup(cid)", err: "self",
     args: [{ n: "cid", t: "uint32", r: "本机当前活着的 surface id" }], ret: ">0 = 新句柄",
     errs: "查不到 → \"[iosurfaceLookup error] IOSurfaceLookup(N) 返回 NULL…\"" },
+
+  { cat: "FFI", name: "callPtr", sig: "callPtr(addrHex, args?, opts?)", err: "self",
+    args: [{ n: "addrHex", t: "string", r: "函数地址 0x…（dlsymAddr/symResolve 给的；会先做可读性体检）" },
+           { n: "args", t: "array", r: "≤8 个：number=位槽 / string=C 字符串 / {hex}=原始指针 / {buf:n} 或 {str:..}=可写缓冲(内容按 base64 回传 out.bufN) / null=NULL" },
+           { n: "opts", t: "object", r: "可选；{bufSize:n} 设 {buf:true} 未指大小时的默认（1024，上限 65536）" }],
+    ret: "{ok:true, value:\"0x…\", out?:{buf0:base64}}   value=x0 按 uintptr_t 转 hex",
+    errs: "[callPtr error] 地址不可读 / too many args (>8) / buf alloc failed / exception …",
+    hint: "★ 红线：只支持整型·指针返回，float/struct 不适用；调用未知函数可能崩（crashGuard 会拦成 guarded:true，内核 panic 拦不住）。例：callPtr(dlsymAddr(0,'strlen').addr,['hello']) 期望 value=\"0x5\"" },
 
   // ---------- 内存 / ObjC runtime ----------
   { cat: "内存", name: "memRead", sig: "memRead(hex, len)", err: "self",
