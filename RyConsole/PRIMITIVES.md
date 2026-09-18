@@ -331,3 +331,26 @@ function kr(code) {                       // 传有符号数或 0x… 都行
 - 新原语必须在 `main.m` 的 `installPrimitives(ctx)` 里注册 —— **属于原生代码，改完要重编 IPA**。
 - 只想加"高层函数"（组合已有原语）→ 写进 `RyConsoleScripts/bridge_*.js`，**不用重编**。
 - 返回 JSON 字符串比返回裸对象更稳（可打印、可落盘、可回传）。
+
+### 桥的作业方式（装桥 / 改桥都不用重编，v2.2.5）
+
+加载顺序：**Documents 同名文件优先于包内默认**。所以改桥 = 写进 Documents。
+一条命令搞定（`tools/ryc_bridge.py`，纯标准库）：
+
+```bash
+python tools/ryc_bridge.py <iPadIP> list          # 看：谁在用 Documents 覆盖、谁用包内默认、两边字节数
+python tools/ryc_bridge.py <iPadIP> versions      # 看：设备上**实际加载**的每个桥版本（各桥自报 RYC_BRIDGES）
+python tools/ryc_bridge.py <iPadIP> push bridge_x.js     # 装/改单个桥（写完回读校验字节数）
+python tools/ryc_bridge.py <iPadIP> pushall             # 把本地 RyConsoleScripts/*.js 全推上去
+python tools/ryc_bridge.py <iPadIP> get bridge_objc.js  # 把设备当前生效的源码拉回来（含包内默认）
+python tools/ryc_bridge.py <iPadIP> rm bridge_x.js      # 删覆盖 → 回落包内默认
+python tools/ryc_bridge.py <iPadIP> check               # 总览：连通/桥开关/覆盖数/版本/崩溃日志大小
+```
+
+**每个桥必须自报版本**（用户 2026-08-12 硬性要求，v2.2.5 起全量落实）：
+```js
+var BRIDGE_VERSION = "vX.Y (build YYYY-MM-DD)";
+if (typeof RYC_BRIDGES === "undefined") { var RYC_BRIDGES = {}; }   // 各桥自持一段，顺序无关
+RYC_BRIDGES["bridge_x"] = BRIDGE_VERSION;
+print("[bridge_x] 已加载: … (" + BRIDGE_VERSION + ")");
+```
