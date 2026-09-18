@@ -31,6 +31,10 @@ int32_t ryLiveActivityStop(void);
 /// 只续「保鲜期」（数字不动）。保活脉冲定期调用，避免还在监听却被系统标成陈旧。
 int32_t ryLiveActivityTouch(void);
 
+/// V2.4 权限请求提醒：后台调用被禁命令时，用灵动岛 / 锁屏把"要调用 xxx 命令"顶出来。
+/// title/sub 拼成一行文案（sub 可 NULL）；title 传 "" 或 NULL = 清除提醒。
+int32_t ryLiveActivityAlert(const char *title, const char *sub);
+
 /// 清扫上一个进程残留的活动（用户强杀 App 后灵动岛不消失的补救），App 启动时调一次。
 /// 返回清掉的个数。
 int32_t ryLiveActivitySweep(void);
