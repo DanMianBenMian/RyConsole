@@ -81,8 +81,8 @@ function machScan(svcNames) {
 function symResolve(fwPath, symNames) {
   if (typeof fwPath !== "string" || fwPath.length === 0)
     return { stage: "arg", error: "[symResolve error] fwPath must be a non-empty string, e.g. '/System/Library/PrivateFrameworks/Foo.framework/Foo'" };
-  if (fwPath.indexOf("/") < 0)
-    return { stage: "arg", error: "[symResolve error] fwPath 必须是以 / 开头的绝对路径（写 .framework 里的可执行文件，不是目录）: " + fwPath };
+  if (fwPath.charAt(0) !== "/")
+    return { stage: "arg", error: "[symResolve error] fwPath 必须是**以 / 开头的绝对路径**（指向 .framework 里的可执行文件，不是 .framework 目录）: " + fwPath };
   if (!(symNames instanceof Array) || symNames.length === 0)
     return { stage: "arg", error: "[symResolve error] symNames must be a non-empty array of symbol-name strings, e.g. ['_foo']" };
   var dl = dlopenFW(fwPath, 0);
