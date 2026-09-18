@@ -2,7 +2,13 @@
 
 > 由 `main.m` 的 `installPrimitives(ctx)` 注册，JS 侧**直接当全局函数调用**。
 > 每次执行都是**全新 JSContext**（原语会重新注册），所以跨轮次状态必须落盘（见 §6 文件 IO）。
-> 共 **51 个原生原语** + 6 个 JS 桥库函数。
+> 共 **68 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 7 个 JS 桥库文件。
+>
+> | 批次 | 新增 |
+> |---|---|
+> | V2 | 结构化 XPC（`xpcConn`/`xpcSendMsg`/`xpcClose`）、`machLookUp`、dyld（`dlopenFW`/`dlsymAddr`）、`sandboxCheck`、`keychainProbe`、`procListPids`、`posixSpawn` |
+> | V2.1 | ObjC runtime：`objc_getClass` / `sel_registerName` / `objc_msgSend` / `objcDesc` |
+> | V2.2 | `objc_msgSendSafe`（结构化错误 + 参数上限）、`memRead`（映射内存 dump）、`keepAliveStatus` / `keepAliveInfo` |
 
 ## 通用约定
 
@@ -50,14 +56,24 @@ if (conn > 0) {
 | `iosurfaceLookup` | `(cid: number) → number` | 按 ID 反查（跨进程可见性探测） |
 | `iosurfaceRelease` | `(handle) → string` | 释放 |
 
-## 3. XPC / 系统服务 🟡
+## 3. XPC / 系统服务 / dyld / 沙盒 / 钥匙串 / 进程 🟡
 
 | 原语 | 签名 | 说明 |
 |---|---|---|
 | `xpcLookup` | `(svc) → "REACHABLE"／"NOT_REACHABLE"` | 端口可见性 |
 | `xpcProbe` | `(svc) → string` | 连接 + 探测结果 |
-| `xpcSend` | `(svc, selector, payloadJSON) → string` | 发送消息 |
+| `xpcSend` | `(svc, selector, payloadJSON) → string` | 发送消息（旧版，裸字典） |
 | `nsxpcProbe` | `(svc) → string` | NSXPC 风格探测 |
+| **`xpcConn`** ★ | `(svc) → "0x…"／错误串` | **结构化 XPC**：建连接句柄（V2） |
+| **`xpcSendMsg`** ★ | `(conn, dict) → JSON` | 发结构化消息（`{type:"dictionary"|"string"|"uint64"|…}`），回 `{ok,reply}` |
+| **`xpcClose`** ★ | `(conn) → "ok"` | 关连接 |
+| **`machLookUp`** ★ | `(svc) → "0x…"` | `bootstrap_look_up` 拿 mach port（不发消息也能看可达性） |
+| **`dlopenFW`** ★ | `(path, flag?) → JSON` | `dlopen` 私有框架（如 `/System/Library/PrivateFrameworks/…`） |
+| **`dlsymAddr`** ★ | `(handle, sym) → "0x…"` | 取符号地址，配合 `objc_msgSend`/`memRead` 用 |
+| **`sandboxCheck`** ★ | `() → JSON` | 读自身 sandbox 容器/权限概况（判定"能碰哪"） |
+| **`keychainProbe`** ★ | `(class, service, account) → JSON` | Keychain 读探测（通常 `errSecMissingEntitlement`） |
+| **`procListPids`** ★ | `() → JSON` | 进程 PID 列表（`sysctl KERN_PROC_ALL`） |
+| **`posixSpawn`** ★ | `(path, argv[], timeoutMs) → JSON` | 起子进程 + 收 stdout（超时上限 30s） |
 
 ## 4. 网络 🟡
 
@@ -155,7 +171,49 @@ for (var sel = 0; sel < 8; sel++) {
 | `autorunLog` | `() → string` | 最近日志 |
 | `openAutorunPanel` | `() → "OK"` | 打开图形面板 |
 
-## 9. JS 桥库函数（`RyConsoleScripts/*.js`，随 bundle 加载）
+**后台保活（V2.2）**：`autorunStart` 成功后会**自动开启保活**，`autorunStop` 会立刻释放。
+保活 = `AVAudioSession(playback, mixWithOthers)` 循环播放 ≈ -78 dBFS 的极低幅度音频
+（人耳不可闻，但样本非零，系统才认"在播放"）+ `beginBackgroundTaskWithName` 每 8s 无限续期
++ 周期性重新激活音频会话（被通话/录音抢走后自愈）。
+
+- 效果：**监听期间可以切后台、锁屏，App 不会被挂起**，电脑端仍能连；停止监听即完全断开保活。
+- 前置：`Info.plist` 必须声明 `UIBackgroundModes = [audio, fetch]`（本仓库 project.yml 已写死）。
+- 自签（免费/个人证书）同样生效——这是 Info.plist 声明，不依赖特殊 entitlement。
+- 只读查询：`keepAliveStatus()` 一行字串；`keepAliveInfo()` JSON `{active, audioPlaying, audioRestarts, bgTaskRenewals, background, …}`。
+- 限制：iOS 仍可能在某些场景（低电量模式、系统回收压力、录音占用）终止进程；
+  音频保活是"极大延长"，不是"永久豁免"。真机长时间挂后台请以 `/ping` 心跳确认。
+
+## 9. ObjC runtime 万用桥（V2.1 / V2.2）🔴
+
+> 一次性投入：拿到 Class / SEL / 任意消息发送能力后，**所有已链接到进程的 ObjC 类**（含私有框架类）
+> 立即可驱动 —— 应用枚举、URL 打开、系统服务这些公开能力不再需要额外 entitlement。
+
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| `objc_getClass` | `(name) → "0x…"` | 类句柄（永生，不会失效） |
+| `sel_registerName` | `(name) → "0x…"` | SEL 句柄 |
+| `objc_msgSend` | `(recv, sel, args[]) → "0x…"` | 原始调用，直接返回寄存器值 |
+| `objc_msgSendSafe` | `(recv, sel, args[]) → JSON` | **推荐用这个**：`{ok,value}` / `{ok:false,error}`，参数 >7 直接拒绝 |
+| `objcDesc` | `(hex) → string` | 回读句柄：NSString 给原文，其它对象给 `description` |
+| `memRead` | `(hex, len) → hex string` | 读那根指针指向的映射内存（上限 64KB，越界返回 `vm_read kr=` 不崩） |
+
+**args 规则**：字符串 → 自动转 `NSString`；数字 → 当 `uint64` 位槽传；`{hex:"0x…"}` → 原始指针；`null` → `nil`。
+
+```js
+var WS   = objc_getClass("LSApplicationWorkspace");
+var inst = objc_msgSendSafe(WS, "defaultWorkspace", []);
+var url  = objc_msgSendSafe(objc_getClass("NSURL"), "URLWithString:", ["https://example.com"]);
+var r    = objc_msgSendSafe(JSON.parse(inst).value, "openURL:options:configuration:error:", [url, {}, {}]);
+print(r);
+```
+
+**红线**
+- 只对**整型/指针返回**可靠；返回 `float`/`struct` 的方法不要用（arm64 无 stret 约定）。
+- `alloc` / `new` / `copy` 经 msgSend 会泄漏 +1 引用（无 release 通道，短命进程可忽略）。
+- ≤7 个参数（含 self/_cmd 之外的显式参数）。
+- **block 参数方法不可调**（explicit `void(^)(void)` 变参在 JSC 里没有承载形态）。
+
+## 10. JS 桥库函数（`RyConsoleScripts/*.js`，随 bundle 加载）
 
 | 文件 | 函数 |
 |---|---|
@@ -163,10 +221,11 @@ for (var sel = 0; sel < 8; sel++) {
 | `bridge_info.js` | `dumpIdentity()`、`dumpEntitlements()` |
 | `bridge_net.js` | `scanCommonPorts(host)`、`httpGet(host, port, path)`、`hexEncode(str)` |
 | `bridge_ui.js` | `enumSchemes()` |
-| `jbV3StructProbe.js` | `zeroStructB64(n)`、`krStr(code)`、`log(...)` |
+| `bridge_xpc.js` | 结构化 XPC 封装（`xpcConn`/`xpcSendMsg` 的字典构造） |
+| `bridge_objc.js` | `objPtr`、`lsWorkspace`、`lsAppList`、`lsAppInfo`、`lsOpenURL`、`lsOpenApp`、`objCall` |
 | `engine.js` | `RYC_RUN(code)`（可热重载；改它不用重编） |
 
-## 10. IOReturn 错误码字典（回喂给 AI 用，必需）🟢
+## 11. IOReturn 错误码字典（回喂给 AI 用，必需）🟢
 
 ```js
 var IORETURN = {
@@ -197,18 +256,22 @@ function kr(code) {
 - `kIOReturnBadArgument` → 入参结构/标量不对，调整参数。
 - `kIOReturnNotPrivileged` → 缺 entitlement。
 
-## 11. 已知没有的能力（别浪费时间找）
+## 12. 已知没有的能力（别浪费时间找）
 
-| 缺什么 | 替代方案 |
+| 缺什么 | 替代方案 / 现状 |
 |---|---|
 | `setTimeout` / `setInterval` | 用阻塞 `sleep(ms)` |
 | 跨执行保留变量 | 落盘（`writeFile`/`fileAppend` + `readFile`） |
-| 进程列表 / 任务枚举 | `sysctlGet` + `iokitEnum` |
-| Keychain 访问 | 未提供 |
-| 后台常驻监听 | iOS 限制：App 必须前台 |
-| Objective-C 运行时 / dlopen | 未提供（桥是白名单式的） |
+| Swift / block 参数方法 | `objc_msgSend` 只能带指针/整型参，block 无承载形态 |
+| 返回值是 `float` / `struct` 的方法 | 同上，只能拿整型/指针寄存器 |
+| 开放 Keychain 明文 | `keychainProbe` 只做**读探测**，沙盒外条目一律 `errSecMissingEntitlement` |
+| 内核内存 / 页表 | 用户态 `vm_read` 只能读**自己任务**的映射（`memRead`） |
+| 真正的 PPL / KTRR 绕过 | 不在用户态桥的能力范围内 |
+| 后台永久常驻 | 已用音频+bgTask 保活把监听期拉到"很长"，但不是永久豁免 |
 
-## 12. 改动须知
+> 曾经的"App 必须前台"限制**已解决**：见 §8 后台保活。
+
+## 13. 改动须知
 
 - 新原语必须在 `main.m` 的 `installPrimitives(ctx)` 里注册 —— **属于原生代码，改完要重编 IPA**。
 - 只想加"高层函数"（组合已有原语）→ 写进 `RyConsoleScripts/bridge_*.js`，**不用重编**。
