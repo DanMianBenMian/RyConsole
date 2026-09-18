@@ -318,9 +318,9 @@ static NSString *RYEmbeddedEntitlementsString(void) {
                 ok = (v >= 0);
                 detail = [NSString stringWithFormat:@"sandbox_check = %d（errno %d）", v, errno];
             } else if ([key isEqualToString:@"cap:iokit"]) {
-                // iOS 没有 IOMasterPort → 直接用 kIOMasterPortDefault（IOKit 在 iOS 上的标准入口）
+                // iOS 既没有 IOMasterPort 也没有 kIOMasterPortDefault → 与 main.m 一致，直接传 MACH_PORT_NULL
                 CFMutableDictionaryRef m = IOServiceMatching("IOSurfaceRoot");
-                io_service_t svc = m ? IOServiceGetMatchingService(kIOMasterPortDefault, m) : 0;
+                io_service_t svc = m ? IOServiceGetMatchingService(MACH_PORT_NULL, m) : 0;   // iOS：与 main.m 一致，传 MACH_PORT_NULL
                 {
                     kern_return_t kr = svc ? KERN_SUCCESS : KERN_FAILURE;
                     io_connect_t conn = 0;
