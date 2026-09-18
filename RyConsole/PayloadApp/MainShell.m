@@ -9,6 +9,7 @@
 
 #import "MainShell.h"
 #import "AutorunServer.h"
+@class ResourceManagerVC;
 #import "RyExec.h"
 #import "RyShellBridge.h"
 #import <stdlib.h>
@@ -697,7 +698,7 @@ static void ryScrollToBottom(UITextView *tv) {
 - (void)layoutIndicator;
 - (void)refreshSideStatus;
 - (void)firstLaunchDisclaimer;
-- (void)applyCompact:(BOOL)compact;
+- (void)configureNavForBottom:(BOOL)bottom;
 @end
 
 @implementation RYShellVC
@@ -714,6 +715,14 @@ static void ryScrollToBottom(UITextView *tv) {
     self.sidebar.layer.borderWidth = 0.5f;
     [self.view addSubview:self.sidebar];
 
+    // ---- 底部栏（手机 / iPad 竖屏用；横屏 iPad 用左侧栏）----
+    self.bottomBar = [[UIView alloc] init];
+    self.bottomBar.backgroundColor = RY_PANEL;
+    self.bottomBar.layer.borderColor = RY_BORDER.CGColor;
+    self.bottomBar.layer.borderWidth = 0.5f;
+    self.bottomBar.hidden = YES;
+    [self.view addSubview:self.bottomBar];
+
     UILabel *title = ryLabel(@"RyConsole", 15.0f, RY_TEXT, NO);
     title.font = ryUI(15.0f, UIFontWeightMedium);
     title.tag = 8090;
@@ -727,8 +736,9 @@ static void ryScrollToBottom(UITextView *tv) {
 
     NSArray *items = @[@[@"terminal", @"终端"],
                        @[@"antenna.radiowaves.left.and.right", @"Autorun"],
-                       @[@"gearshape", @"设置"]];
-    self.navTitles = @[@"终端", @"Autorun", @"设置"];
+                       @[@"gearshape", @"设置"],
+                       @[@"folder", @"资源管理器"]];
+    self.navTitles = @[@"终端", @"Autorun", @"设置", @"资源管理器"];
     for (NSInteger i = 0; i < (NSInteger)items.count; i++) {
         CGFloat y = 76.0f + i * 48.0f;
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -790,24 +800,40 @@ static void ryScrollToBottom(UITextView *tv) {
     [super viewDidLayoutSubviews];
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
-
-    // iPhone / 窄屏：侧栏收缩为纯图标栏，内容区避开安全区（刘海/小黑条）
-    BOOL compact = (w < 500.0f);
-    if (compact != self.compact) {
-        self.compact = compact;
-        [self applyCompact:compact];
+    UIEdgeInsets sa = self.view.safeAreaInsets;
+    BOOL isPhone = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPhone);
+    BOOL isPad = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad);
+    // 手机 / iPad 竖屏 → 底部栏；iPad 横屏 → 左侧栏
+    BOOL bottomTab = isPhone || (isPad && w < h);
+    if (bottomTab != self.bottomMode) {
+        self.bottomMode = bottomTab;
+        [self configureNavForBottom:bottomTab];
     }
-    CGFloat sw = compact ? kSidebarCompactW : kSidebarW;
-
-    self.sidebar.frame = CGRectMake(0.0f, 0.0f, sw, h);
-    [self.sideStatus setFrame:CGRectMake(16.0f, h - 56.0f, kSidebarW - 32.0f, 40.0f)];
-    if (compact) {
-        UIEdgeInsets sa = self.view.safeAreaInsets;
+    if (bottomTab) {
+        self.sidebar.hidden = YES;
+        self.bottomBar.hidden = NO;
+        CGFloat barH = 52.0f;
         CGFloat top = fmaxf(sa.top, 20.0f);
-        CGFloat bot = fmaxf(sa.bottom, 8.0f);
-        self.content.frame = CGRectMake(sw, top, w - sw, h - top - bot);
+        CGFloat bot = sa.bottom;
+        self.bottomBar.frame = CGRectMake(0.0f, h - barH - bot, w, barH + bot);
+        CGFloat bw = w / (CGFloat)self.navButtons.count;
+        for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++)
+            self.navButtons[i].frame = CGRectMake(i * bw, 0.0f, bw, barH);
+        self.content.frame = CGRectMake(0.0f, top, w, h - top - barH - bot);
     } else {
-        self.content.frame = CGRectMake(sw, 0.0f, w - sw, h);
+        self.sidebar.hidden = NO;
+        self.bottomBar.hidden = YES;
+        self.compact = (w < 500.0f);
+        CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
+        self.sidebar.frame = CGRectMake(0.0f, 0.0f, sw, h);
+        [self.sideStatus setFrame:CGRectMake(16.0f, h - 56.0f, kSidebarW - 32.0f, 40.0f)];
+        if (self.compact) {
+            CGFloat top = fmaxf(sa.top, 20.0f);
+            CGFloat bot = fmaxf(sa.bottom, 8.0f);
+            self.content.frame = CGRectMake(sw, top, w - sw, h - top - bot);
+        } else {
+            self.content.frame = CGRectMake(sw, 0.0f, w - sw, h);
+        }
     }
     for (UIView *p in @[self.terminalPane, self.autorunPane, self.settingsPane]) {
         p.frame = self.content.bounds;
@@ -815,36 +841,50 @@ static void ryScrollToBottom(UITextView *tv) {
     [self layoutIndicator];
 }
 
-// 紧凑/常规侧栏切换：标题、按钮形态、底部状态
-- (void)applyCompact:(BOOL)compact {
-    CGFloat sw = compact ? kSidebarCompactW : kSidebarW;
-    [[self.sidebar viewWithTag:8090] setHidden:compact];
-    [[self.sidebar viewWithTag:8091] setHidden:compact];
-    [self.sideStatus setHidden:compact];
-
-    for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++) {
+// 侧栏 ↔ 底部栏切换：手机/iPad竖屏底部栏，iPad横屏左侧栏
+- (void)configureNavForBottom:(BOOL)bottom {
+    self.bottomMode = bottom;
+    UIView *host = bottom ? self.bottomBar : self.sidebar;
+    [[self.sidebar viewWithTag:8090] setHidden:bottom];
+    [[self.sidebar viewWithTag:8091] setHidden:bottom];
+    [self.sideStatus setHidden:bottom];
+    NSInteger n = (NSInteger)self.navButtons.count;
+    for (NSInteger i = 0; i < n; i++) {
         UIButton *b = self.navButtons[i];
-        b.frame = CGRectMake(0.0f, 76.0f + i * 48.0f, sw, 44.0f);
-        if (compact) {
-            [b setTitle:nil forState:UIControlStateNormal];
+        if (b.superview != host) [host addSubview:b];
+        if (bottom) {
             b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
             b.contentEdgeInsets = UIEdgeInsetsZero;
+            b.titleLabel.font = ryUI(11.0f, UIFontWeightMedium);
+            [b setTitle:self.navTitles[i] forState:UIControlStateNormal];
         } else {
-            [b setTitle:[@"  " stringByAppendingString:self.navTitles[i]] forState:UIControlStateNormal];
+            b.frame = CGRectMake(0.0f, 76.0f + i * 48.0f, kSidebarW, 44.0f);
             b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
             b.contentEdgeInsets = UIEdgeInsetsMake(0.0f, 16.0f, 0.0f, 0.0f);
+            b.titleLabel.font = ryUI(13.5f, UIFontWeightMedium);
+            [b setTitle:[@"  " stringByAppendingString:self.navTitles[i]] forState:UIControlStateNormal];
         }
     }
 }
 
 - (void)layoutIndicator {
     UIView *bar = [self.sidebar viewWithTag:8100];
+    bar.hidden = self.bottomMode;
+    if (self.bottomMode) return;
     CGFloat y = 76.0f + self.current * 48.0f;
     bar.frame = CGRectMake(0.0f, y + 6.0f, 3.0f, 32.0f);
 }
 
 - (void)onNav:(UIButton *)sender {
-    [self select:sender.tag - 8000];
+    NSInteger idx = sender.tag - 8000;
+    if (idx == 3) {   // 资源管理器：弹出（复用现有 UI）
+        ResourceManagerVC *r = [[ResourceManagerVC alloc] init];
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:r];
+        nav.modalPresentationStyle = UIModalPresentationFormSheet;
+        [self presentViewController:nav animated:YES completion:nil];
+        return;
+    }
+    [self select:idx];
 }
 
 - (void)select:(NSInteger)idx {
@@ -882,20 +922,34 @@ static void ryScrollToBottom(UITextView *tv) {
     CGRect inSelf = [self.view convertRect:end fromView:nil];
     CGFloat overlap = self.view.bounds.size.height - inSelf.origin.y;
     if (overlap < 0.0f) overlap = 0.0f;
-    CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
-    CGFloat top = self.compact ? fmaxf(self.view.safeAreaInsets.top, 20.0f) : 0.0f;
-    self.content.frame = CGRectMake(sw, top,
-                                    self.view.bounds.size.width - sw,
-                                    self.view.bounds.size.height - overlap - top);
+    if (self.bottomMode) {
+        CGFloat barH = 52.0f;
+        CGFloat top = fmaxf(self.view.safeAreaInsets.top, 20.0f);
+        self.content.frame = CGRectMake(0.0f, top, self.view.bounds.size.width,
+                                        self.view.bounds.size.height - overlap - top - barH - self.view.safeAreaInsets.bottom);
+    } else {
+        CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
+        CGFloat top = self.compact ? fmaxf(self.view.safeAreaInsets.top, 20.0f) : 0.0f;
+        self.content.frame = CGRectMake(sw, top,
+                                        self.view.bounds.size.width - sw,
+                                        self.view.bounds.size.height - overlap - top);
+    }
 }
 
 - (void)onKeyboardHide:(NSNotification *)n {
-    CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
-    CGFloat top = self.compact ? fmaxf(self.view.safeAreaInsets.top, 20.0f) : 0.0f;
-    CGFloat bot = self.compact ? fmaxf(self.view.safeAreaInsets.bottom, 8.0f) : 0.0f;
-    self.content.frame = CGRectMake(sw, top,
-                                    self.view.bounds.size.width - sw,
-                                    self.view.bounds.size.height - top - bot);
+    if (self.bottomMode) {
+        CGFloat barH = 52.0f;
+        CGFloat top = fmaxf(self.view.safeAreaInsets.top, 20.0f);
+        self.content.frame = CGRectMake(0.0f, top, self.view.bounds.size.width,
+                                        self.view.bounds.size.height - top - barH - self.view.safeAreaInsets.bottom);
+    } else {
+        CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
+        CGFloat top = self.compact ? fmaxf(self.view.safeAreaInsets.top, 20.0f) : 0.0f;
+        CGFloat bot = self.compact ? fmaxf(self.view.safeAreaInsets.bottom, 8.0f) : 0.0f;
+        self.content.frame = CGRectMake(sw, top,
+                                        self.view.bounds.size.width - sw,
+                                        self.view.bounds.size.height - top - bot);
+    }
 }
 
 - (void)viewDidAppear:(BOOL)animated {
