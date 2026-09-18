@@ -8,6 +8,9 @@
 //   其它负值     = 其它 kr 错误码
 // 安装: RyConsole → 资源管理器 → 🔌 安装桥… → 名字取 "iokit" (自动存成 bridge_iokit.js, 覆盖内置版)
 var BRIDGE_VERSION = "v4.2 (build 2026-09-18)"; // 包体版本：每次改桥都递增，方便真机核对跑的是哪版
+// 自报版本：加载后可在设备上一次性查"每个桥跑的是哪版" —— return JSON.stringify(RYC_BRIDGES)
+if (typeof RYC_BRIDGES === "undefined") { var RYC_BRIDGES = {}; }
+RYC_BRIDGES["bridge_iokit"] = BRIDGE_VERSION;
 
 var V3_KR_NOTPERMITTED = -536870174; // 0xe00002e2 (有符号 32 位真值)
 var V3_KR_BADARGUMENT  = -536870206; // 0xe00002c2
