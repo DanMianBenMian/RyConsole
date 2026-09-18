@@ -9,7 +9,6 @@
 
 #import "MainShell.h"
 #import "AutorunServer.h"
-@class ResourceManagerVC;
 #import "RyExec.h"
 #import "RyShellBridge.h"
 #import <stdlib.h>
@@ -818,7 +817,7 @@ static void ryScrollToBottom(UITextView *tv) {
         self.bottomBar.frame = CGRectMake(0.0f, h - barH - bot, w, barH + bot);
         CGFloat bw = w / (CGFloat)self.navButtons.count;
         for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++)
-            self.navButtons[i].frame = CGRectMake(i * bw, 0.0f, bw, barH);
+            ((UIButton *)self.navButtons[i]).frame = CGRectMake(i * bw, 0.0f, bw, barH);
         self.content.frame = CGRectMake(0.0f, top, w, h - top - barH - bot);
     } else {
         self.sidebar.hidden = NO;
@@ -877,8 +876,10 @@ static void ryScrollToBottom(UITextView *tv) {
 
 - (void)onNav:(UIButton *)sender {
     NSInteger idx = sender.tag - 8000;
-    if (idx == 3) {   // 资源管理器：弹出（复用现有 UI）
-        ResourceManagerVC *r = [[ResourceManagerVC alloc] init];
+    if (idx == 3) {   // 资源管理器：弹出（复用 main.m 里现成的 UI）
+        // 走工厂函数拿 VC：ResourceManagerVC 的 @interface 只在 main.m 内部，
+        // 跨文件用前向声明的类型做 alloc/init 会被编译器拒绝。
+        UIViewController *r = RYMakeResourceManagerVC();
         UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:r];
         nav.modalPresentationStyle = UIModalPresentationFormSheet;
         [self presentViewController:nav animated:YES completion:nil];
