@@ -14,6 +14,7 @@
 #import "AutorunServer.h"
 #import "KeepAlive.h"
 #import "LiveActivityBridge.h"
+#import "RyExec.h"          // 崩溃兜底状态（RYGuard*）—— /ping 里要报出来
 
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -665,7 +666,14 @@ static void rySendAll(int fd, NSData *data) {
         @"lastPrim": @(RYLastPrimitive()),          // 最近调用的原语（崩溃定位）
         @"session": rySessionTag(),
         @"pid": @(getpid()),
-        @"jobTtlSec": @((int)RY_JOB_TTL)
+        @"jobTtlSec": @((int)RY_JOB_TTL),
+        // ---- V2.2.6 崩溃兜底（★ 兜底开着时，被拦下的崩溃**不会**改 pid → pid 差分法失效，改看这里）----
+        @"guardOn": @(RYGuardEnabled() ? YES : NO),
+        @"guardHits": @(RYGuardHits()),
+        @"guardLastSignal": @(RYGuardLastSignal()),
+        @"guardLastAddr": [NSString stringWithFormat:@"0x%llx", RYGuardLastAddr()],
+        @"guardLastPrim": [NSString stringWithUTF8String:RYGuardLastPrim()],
+        @"guardDegraded": @(RYGuardDegraded() ? YES : NO)
     };
     return [self jsonFrom:d];
 }
