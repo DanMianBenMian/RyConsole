@@ -20,25 +20,37 @@
 // ============================================================
 
 // ===== 包体版本号（硬性要求：所有输出须带此前缀）=====
-var PKG_VER = "RyConsole#9";
+var PKG_VER = "RyConsole#10 (kr表勘误)";
 function log(s) { print("[" + PKG_VER + "] " + s); }
 
-// kr 字典：常见 IOKit 返回码 -> 语义
-var KR = {
+// kr 字典（2026-09-18 勘误）：旧表**几乎整张错位**，且错得危险 ——
+//   0xe00002e2 旧标 NotPrivileged，实为 **NotPermitted（沙盒门禁）**；0xe00002c7 旧标 NotReadable，实为 **Unsupported**；
+//   0xe00002d2 旧标 Unsupported，实为 StillOpen；0xe00002c9/ca 旧标 NoMemory/NoResources，实为 InternalError/IOError。
+//   而 V3 的结论正是照着这些名字读的 → 现改为**优先调用 bridge_iokit 的 krWhy()**（单一事实源），
+//   桥不可用时才用兜底表（已按 IOKit/IOKitReturn.h 重校）。
+var KR_FALLBACK = {
   0: "kIOReturnSuccess",
+  0xe00002bd: "kIOReturnNoMemory",
+  0xe00002be: "kIOReturnNoResources",
+  0xe00002c0: "kIOReturnNoDevice",
+  0xe00002c1: "kIOReturnNotPrivileged",
   0xe00002c2: "kIOReturnBadArgument",
-  0xe00002c7: "kIOReturnNotReadable",
-  0xe00002cb: "kIOReturnNoDevice",
-  0xe00002cc: "kIOReturnNotOpen",
-  0xe00002d2: "kIOReturnUnsupported",
-  0xe00002e2: "kIOReturnNotPrivileged",
-  0xe00002fe: "kIOReturnNotPermitted",
-  0xe00002c9: "kIOReturnNoMemory",
-  0xe00002ca: "kIOReturnNoResources"
+  0xe00002c5: "kIOReturnExclusiveAccess",
+  0xe00002c6: "kIOReturnBadMessageID",
+  0xe00002c7: "kIOReturnUnsupported",
+  0xe00002c9: "kIOReturnInternalError",
+  0xe00002ca: "kIOReturnIOError",
+  0xe00002cd: "kIOReturnNotOpen",
+  0xe00002db: "kIOReturnNoSpace",
+  0xe00002e2: "kIOReturnNotPermitted",
+  0xe00002eb: "kIOReturnAborted",
+  0xe00002f0: "kIOReturnNotFound"
 };
 function krStr(kr) {
+  if (typeof krWhy === "function") { try { return krWhy(kr); } catch (e) {} }  // 优先用桥（唯一真源）
   var h = "0x" + (kr >>> 0).toString(16);
-  return KR[kr >>> 0] ? (h + " (" + KR[kr >>> 0] + ")") : h;
+  var nm = KR_FALLBACK[kr >>> 0];
+  return nm ? (h + " (" + nm + ")") : h;
 }
 
 // 最小零块 inputStruct：16 字节全 0，足以触发 handler 对 inputStruct 的解析分支
