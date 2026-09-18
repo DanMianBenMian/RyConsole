@@ -15,4 +15,5 @@ void RYResourceManagerRefresh(UIViewController *vc);    // 面板显示时刷新
 @property (nonatomic, strong) UIView *bottomBar;
 @property (nonatomic, assign) BOOL bottomMode;
 @property (nonatomic, strong) UIViewController *resourcePane;   // 第 4 个面板（懒加载）
+@property (nonatomic, strong) UIViewController *securityPane;   // 第 5 个面板「权限与安全」（懒加载）
 @end
