@@ -9,6 +9,9 @@
 //   primErrors()              → 错误约定总说明（返回值形态 / 错误串格式 / kr 怎么读）
 //   primMissing()             → 还没做成自解释错误的桥（诚实清单）
 var HELP_VERSION = "bridge_help v1.0 (build 2026-09-18)";
+var BRIDGE_VERSION = "v1.0 (build 2026-09-18)";
+if (typeof RYC_BRIDGES === "undefined") { var RYC_BRIDGES = {}; }
+RYC_BRIDGES["bridge_help"] = BRIDGE_VERSION;
 
 // err: "self" = 失败返回 "[桥名 error] 参数名 + 合法范围"（memRead 风格，自解释）
 //      "code" = 返回数字/裸码，需用 krName/krWhy/machKrWhy 解码
