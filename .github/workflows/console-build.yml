@@ -27,6 +27,10 @@ jobs:
         run: |
           mkdir -p ipa/Payload
           cp -R "RyConsole/build/Build/Products/Release-iphoneos/RyConsole.app" ipa/Payload/
+          # 注入 entitlements：无签名导出本身不含 __entitlements 段（段由 codesign 写入）。
+          # 先签内层 Widget appex，再签主 App（嵌套代码签名顺序要求）。
+          codesign -f -s - --entitlements RyConsole/RyConsole.entitlements "ipa/Payload/RyConsole.app/PlugIns/RyConsoleWidget.appex"
+          codesign -f -s - --entitlements RyConsole/RyConsole.entitlements "ipa/Payload/RyConsole.app"
           cd ipa && zip -qr RyConsole.ipa Payload
       - name: Upload artifact
         uses: actions/upload-artifact@v4
