@@ -8,10 +8,15 @@ targets:
     type: application
     platform: iOS
     sources:
+      # Widget 目录属于扩展 target：绝不能同时编进主 App（@main / ActivityConfiguration 会撞车）
       - path: PayloadApp
+        excludes:
+          - "Widget/**"
       - path: PayloadApp/AppIcon.xcassets
       - path: RyConsoleScripts
         buildPhase: resources
+    dependencies:
+      - target: RyConsoleWidget
     info:
       path: PayloadApp/Info.plist
       properties:
@@ -53,6 +58,8 @@ targets:
         # ---- 界面：进 App 后隐藏系统状态栏（时间/电量太挡）+ 由 plist 全局控制 ----
         UIStatusBarHidden: true
         UIViewControllerBasedStatusBarAppearance: false
+        # ---- 实时活动（灵动岛 / 锁屏「监听中」）：必须显式声明，缺了 request 直接抛错 ----
+        NSSupportsLiveActivities: true
         # ---- 合规：仅使用标准 https 加密，避免出口合规问询 ----
         ITSAppUsesNonExemptEncryption: false
         # ---- 允许从「文件」App 直接把探针脚本丢进来（热重载，不重编 IPA）----
@@ -75,3 +82,30 @@ targets:
         CODE_SIGNING_ALLOWED: "NO"
         PRODUCT_BUNDLE_IDENTIFIER: com.research.ryconsole
         OTHER_LDFLAGS: "-framework UIKit -framework Foundation -framework JavaScriptCore -framework IOSurface -framework Security -framework IOKit -framework AVFoundation"
+        # 主 target 现在含 Swift（LiveActivity.swift）→ 不设 SWIFT_VERSION 会直接构建报错
+        SWIFT_VERSION: "5.0"
+
+  # ---- 实时活动扩展：唯一能"画"灵动岛的地方（主 App 自己画不了）----
+  RyConsoleWidget:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.1"      # ActivityKit 起始版本；低于它会要求一堆 @available
+    sources:
+      - path: PayloadApp/Widget
+      - path: PayloadApp/RyListenAttributes.swift   # 与主 App 共享的活动模型（两边各编一份）
+    info:
+      path: PayloadApp/Widget/Info.plist
+      properties:
+        CFBundleDisplayName: RyConsole 监听
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_NAME: RyConsoleWidget
+        PRODUCT_BUNDLE_IDENTIFIER: com.research.ryconsole.widget
+        INFOPLIST_FILE: PayloadApp/Widget/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_ALLOWED: "NO"
+        SKIP_INSTALL: "YES"
+        SWIFT_VERSION: "5.0"
