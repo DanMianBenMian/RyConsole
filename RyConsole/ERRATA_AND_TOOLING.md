@@ -1,6 +1,6 @@
 # 勘误与桥工具（安全测试交接）
 
-更新时间 **2026-09-18** ｜ 对应发布 **V2.2.5**（Release tag `RyConsole-iPad-v1`）
+更新时间 **2026-09-19** ｜ 对应发布 **V2.4.0**（Release tag `RyConsole-iPad-v1`）
 
 ---
 
@@ -75,10 +75,45 @@ python tools/ryc_bridge.py <iPadIP> check                 # 总览：连通 / �
 
 ---
 
+## 四之二、崩溃兜底（V2.2.6 起，**改变崩溃检测方式**）
+
+探针触发的**用户态信号崩溃**（SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP）不再重启进程：
+执行以「触发崩溃，已兜底」返回，App 存活。
+
+```js
+crashGuardStatus()   // {enabled, hits, lastSignal, lastAddr, lastPrim, degraded, …}
+crashGuardSet(0)     // 关掉 → 恢复"真崩"（需要真崩时用，跑完 crashGuardSet(1) 恢复）
+```
+
+**★ 三条必读（直接影响你的测试方法）**
+
+1. **pid 差分法在兜底开着时失效** —— 被拦下的崩溃不改 pid。改看：
+   - `/eval` 返回里的 **`guarded: true`** + `guardSignal / guardAddr / guardPrim`；
+   - `/ping` 的 `guardOn / guardHits / guardLastPrim / guardDegraded`。
+2. **`guarded:true` ≠ 普通失败**：它的语义是"这条代码确实会把 App 打崩，只是被拦了"。
+   这是**有价值的结论**（找到了一个真实的崩溃面），别当成偶发错误重试。
+3. **兜住 ≠ 无损**：被拦下的那次执行是被掀栈结束的，锁/内存/JSC 状态可能不干净
+   （`/ping` 的 `guardDegraded:true`）。若后续行为诡异（莫名失败、卡住），**重启 App 复位**再继续。
+
+覆盖边界（别误判）：✅ 用户态信号崩溃；❌ **内核 panic**（IOKit/驱动内核侧触发 → 设备重启，用户态无解）、
+❌ 看门狗卡死（0x8badf00d）、❌ 非布点线程上的崩溃、❌ 外部 kill。
+另：内核 panic 时崩溃日志通常来不及写 —— 设备重启后如果没有新日志，大概率是内核侧。
+
+> **V2.2.6 → V2.2.7 重要勘误**：V2.2.6 的兜底**实测没有生效**（处理器跑了、日志写了，但 App 仍死）——
+> 根因是 `sigsetjmp` 会"返回两次"，撤点语句写在它后面**正常路径也会执行**，等于布完点立刻撤了。
+> V2.2.7 已修（撤点只在"跳回"分支做）。**判断你手上跑的是不是修过的版本：发一条给垃圾对象发消息的探针，
+> 若返回 `guarded:true` 且 App 活着 → 是 V2.2.7+；若 App 直接死了 → 还是 V2.2.6。**
+
+---
+
 ## 五、版本对应
 
 | IPA | 关键内容 |
 |---|---|
+| **V2.4.0** | ★ 新增第5选项卡「权限与安全」：①**权限诊断**（逐项实测 entitlement/能力，可用/禁用各自独立显示）②**安全**（命令可用性开关，默认全启用，高危命令带提示；被禁用的命令调用时请求用户确认——后台优先灵动岛提醒、前台/无岛直接弹窗，主标题「请求权限」、子标题「要调用 xxx、xx 命令」，不同意回 AI「权限请求驳回」）③**日志**（顶层「高危命令 x 次 / 一般命令 n 次」计数 + 可筛选列表，高危红、一般绿）。原语统一经 `__ry_gate` 闸门；灵动岛 `LiveActivity` 加 `alert` 字段承载权限提醒 |
+| **V2.3.0** | ★ **`callPtr`**（C 函数指针调用/FFI，规格 `RYCONSOLE_CALLPTR_SPEC.md`；地址 vm_read 体检 + crashGuard 兜底）+ 版本号显示修复（UI/`/ping` 从 Bundle 读，本版 = 2.3.0）|
+| **V2.2.7** | ★ 修兜底"没拦到"的真 bug（sigsetjmp 返回两次，撤点在正常路径也跑 → 布完即撤）；`objc_msgSendSafe` 加**接收方体检**（vm_read 探 16 字节，垃圾指针 → 结构化错误不崩） |
+| **V2.2.6** | ★ 崩溃兜底（sigsetjmp/siglongjmp + sigaction/altstack；`crashGuardStatus/Set`；`/eval` 带 `guarded*`、`/ping` 带 `guard*`）+ 修「资源管理器跑脚本无反应」回归 |
 | **V2.2.5** | 默认桥整修（探针 kr 表勘误、3 个桥补版本号、8 个桥自报版本）+ `bridge_guard.js` 类型守卫 + `tools/ryc_bridge.py` |
 | **V2.2.4** | Bug 6 自解释错误 + `bridge_help.js`（`primHelp`）+ `iokitMapTry` + IOReturn 表勘误 |
 | **V2.2.3** | `objc_msgSend` 返回值 ARC 血案修复（`__unsafe_unretained`） |
