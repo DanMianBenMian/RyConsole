@@ -28,6 +28,12 @@
 | ② 结构化结果 | `{ret/kr, ok, outputs, error?, hint?, note?}` | `ok:false` 时看 `error`（是什么）+ `hint`（下一步怎么办） |
 | ③ 裸数字/裸码 | `iokitOpen("Foo")` → `-2`；`iokitCall(...).ret` → `0xe00002c2` | **先过 `krWhy(kr)`（IOKit）或 `machKrWhy(kr)`（Mach/bootstrap）**，别把数字贴给人看 |
 | ④ 单例哨兵 | `-1` / `-2` / `-3` / `0x0` | `-2`=类不存在、`-3`=类名为空（参数错）、`0x0`=类/符号不存在 |
+| ⑤ 类型错（v2.2.5） | `iosurfaceCreate("x")` → `[iosurfaceCreate error] props must be an object/dictionary (可省略), got string("x") \| 签名: … \| 查参数: primHelp("iosurfaceCreate")` | 由 `bridge_guard.js` 在进入原生前拦住 |
+
+> **为什么会有 ⑤**：原生桥 block 参数是强类型的（`NSDictionary*`/`NSString*`/`NSNumber*`），JS 传错类型时
+> **JavaScriptCore 会在进入原生校验前就抛英文 `TypeError`**（如 `Cannot convert primitive to NSDictionary`），
+> 中文错误根本没机会执行。`bridge_guard.js`（纯 JS，**可热更新**）给 33 个原语套了类型守卫，把这种错误转成 ①。
+> 通用技巧：**桥脚本能覆盖原生全局**，所以"外壳逻辑"（参数/类型校验）尽量放 JS 层 —— 不用重编 IPA。
 
 **排查顺序**：① 有 `] error]`/`ok:false` → 参数错；② conn 报"不是有效 send right" → 句柄失效；③ `kr=0xe00002e2` → 沙盒/entitlement 门禁（用户态无解）；④ `kr=0xe00002c2` → 驱动的 check* 拒了 (selector, 标量数, struct 大小) 组合，换形状；⑤ `kr=0xe00002c6` → selector 没注册。
 
@@ -245,6 +251,7 @@ print(r);
 | 文件 | 函数 |
 |---|---|
 | `bridge_iokit.js` | `jbIokitEnum()`、`jbProbeIOKit(...)`、`jbIokitVerdict(...)`、`jbV3Battery()`、`jbV3Report()`、`jbV3MethodCall(...)`、**`iokitMapTry(conn, types?)`**、**`krName/krHex/krWhy/krHint`** |
+| `bridge_guard.js` ★v2.2.5 新增 | **`installGuards()`** —— 给 33 个原语套类型守卫（`iosurfaceCreate`/`iokitMap`/`iokitCall`/`memRead`/`sysctlGet`/文件与网络族…），传错类型不再抛 JSC 英文 `TypeError` |
 | `bridge_help.js` ★v2.2.4 新增 | **`primHelp(过滤词?)`**（原语自解释手册）、**`primErrors()`**（错误约定）、**`primMissing()`**（还欠自解释的桥清单） |
 | `bridge_info.js` | `dumpIdentity()`、`dumpEntitlements()` |
 | `bridge_net.js` | `scanCommonPorts(host)`、`httpGet(host, port, path)`、`hexEncode(str)` |
