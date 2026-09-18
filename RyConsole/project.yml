@@ -43,6 +43,16 @@ targets:
         NSBonjourServices:
           - _http._tcp
           - _localsend._tcp
+        # ---- 后台保活（V2.2）----
+        # audio：Autorun 监听期间循环播放≈不可闻的极低幅度音频，进程不被挂起。
+        #   这是 Info.plist 声明，个人开发者(自签)签名同样生效，无需额外 entitlement。
+        # fetch：兜底，允许系统给后台拉取机会（不实现也不报错）。
+        UIBackgroundModes:
+          - audio
+          - fetch
+        # ---- 界面：进 App 后隐藏系统状态栏（时间/电量太挡）+ 由 plist 全局控制 ----
+        UIStatusBarHidden: true
+        UIViewControllerBasedStatusBarAppearance: false
         # ---- 合规：仅使用标准 https 加密，避免出口合规问询 ----
         ITSAppUsesNonExemptEncryption: false
         # ---- 允许从「文件」App 直接把探针脚本丢进来（热重载，不重编 IPA）----
@@ -64,4 +74,4 @@ targets:
         CODE_SIGN_IDENTITY: ""
         CODE_SIGNING_ALLOWED: "NO"
         PRODUCT_BUNDLE_IDENTIFIER: com.research.ryconsole
-        OTHER_LDFLAGS: "-framework UIKit -framework Foundation -framework JavaScriptCore -framework IOSurface -framework Security -framework IOKit"
+        OTHER_LDFLAGS: "-framework UIKit -framework Foundation -framework JavaScriptCore -framework IOSurface -framework Security -framework IOKit -framework AVFoundation"
