@@ -24,6 +24,9 @@ struct RYListenAttributes: ActivityAttributes {
         var lastPeer: String
         /// 开始监听时刻（用于显示已运行时长）
         var startedAt: Date
+        /// ★ V2.4：待用户确认的**权限请求提醒**（空串 = 无待确认）。
+        ///   后台禁用命令被调用时，灵动岛/锁屏用它把"要调用 xxx 命令"顶出来。
+        var alert: String
     }
 
     /// 固定不变的部分
