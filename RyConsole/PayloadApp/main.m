@@ -24,6 +24,8 @@
 #import <unistd.h>
 #import <execinfo.h>
 #import <signal.h>
+#import <setjmp.h>
+#import <pthread.h>
 #import "AutorunServer.h"
 #import "KeepAlive.h"
 #import "LiveActivityBridge.h"
@@ -1438,6 +1440,12 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
                         ryLiveActivityActive() ? @"true" : @"false"];
             };
 
+            // ---- V2.2.6 崩溃兜底（只读状态 + 开关）----
+            //   默认开：执行会被自动套上检查点，用户态信号崩溃 → 变成"触发崩溃，已兜底"返回
+            //   crashGuardSet(0) 关掉 → 恢复真崩（想在探针里用 pid 差分定位崩溃时用）
+            ctx[@"crashGuardStatus"]=^NSString*{ return RYGuardStatusJSON(); };
+            ctx[@"crashGuardSet"]=^(NSNumber *on){ RYGuardSetEnabled([on intValue] != 0); return RYGuardStatusJSON(); };
+
             // ---- AI / Autorun 辅助原语（探针迭代常用；每次执行都是全新 ctx，跨轮状态请落盘）----
             // 限速/间隔：JavaScriptCore 没有 setTimeout，用阻塞 sleep 代替（上限 120s 防呆）
             ctx[@"sleep"]=^(NSNumber *ms){
@@ -1518,13 +1526,81 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
 }
 
 // ---- 执行用户代码（流式输出，立即跳转输出页；UI 锁死，异常不崩 App）----
+// ============================================================
+//  崩溃兜底状态（V2.2.6）—— 定义必须在使用点（RunCode / RYExecStream）之前
+// ============================================================
+//  详见 §「崩溃兜底」段与 RyExec.h：执行前在**本层栈帧**布 sigsetjmp 检查点，
+//  本线程发生用户态信号崩溃时由处理器 siglongjmp 回检查点 → 本次执行以
+//  「触发崩溃，已兜底」返回，进程存活。
+//  ✅ 覆盖：野指针 / 空函数指针 / objc_msgSend 打空 / 越界读 / JSC 爆栈（已装 altstack）
+//  ❌ 不覆盖：内核 panic、看门狗卡死、非布点线程上的崩溃、外部 kill
+//  ⚠ 拦下后那次执行是**被掀栈**结束的，锁/内存/JSC 可能不干净 → degraded=1，建议重启 App 复位
+// ============================================================
+static sigjmp_buf gGuardJmp;
+static volatile sig_atomic_t gGuardEnabled = 1;   // 可关：关掉就恢复"真崩"（想用 pid 差分法时需要）
+static volatile sig_atomic_t gGuardArmed = 0;     // 1 = 当前线程已布好检查点
+static volatile uintptr_t    gGuardThread = 0;    // 布点线程（必须是崩的那个线程才敢跳）
+static volatile sig_atomic_t gGuardInHandler = 0; // 防重入
+static volatile sig_atomic_t gGuardHits = 0;
+static volatile sig_atomic_t gGuardLastSig = 0;
+static volatile uintptr_t    gGuardLastAddr = 0;
+static volatile sig_atomic_t gGuardDegraded = 0;
+static volatile sig_atomic_t gGuardSeq = 0;       // 每拦下一次自增；执行前后比对即知"本次是否被拦"
+static char gGuardLastPrim[128] = {0};
+
+// 布/撤检查点。★ 必须**在本层栈帧**里 sigsetjmp：
+//   放到 helper 里再返回 = longjmp 回到一个已返回的帧 → 跳进已被覆盖的栈内存 → 二次崩。
+//   返回 0 = 正常进入；非 0 = 刚从信号里跳回来（值 = 信号号）
+#define RY_GUARD_ARM(dst)                                   \
+    do {                                                    \
+        (dst) = 0;                                          \
+        if (gGuardEnabled) {                                \
+            gGuardInHandler = 0;   /* 新一次执行：允许再兜 */ \
+            gGuardThread = (uintptr_t)pthread_self();       \
+            gGuardArmed = 1;                                \
+            (dst) = sigsetjmp(gGuardJmp, 1);  /* 1 = 连信号掩码一起存/恢复 */ \
+            gGuardArmed = 0;                                \
+        }                                                   \
+    } while (0)
+#define RY_GUARD_DISARM() do { gGuardArmed = 0; gGuardThread = 0; } while (0)
+
 static void RunCode(UIViewController *from, NSString *code) {
-    if (!from.navigationController) return;
+    if (!from) return;
+    // ★ 修回归（V2.2.1 把资源管理器从弹窗改成**外壳内嵌面板**之后留下的）：
+    //   内嵌面板没有 navigationController，而旧代码这里直接 `return` ——
+    //   于是"在资源管理器里点脚本运行"什么都不发生（不弹输出页、也没任何提示）。
+    //   现在两条路都通：有导航栈就 push（经典控制台），没有就**模态弹出**同一个输出页。
     OutputVC *ovc = [[OutputVC alloc] init];
-    [from.navigationController pushViewController:ovc animated:YES];
+    if (from.navigationController) {
+        [from.navigationController pushViewController:ovc animated:YES];
+    } else {
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:ovc];
+        nav.modalPresentationStyle = UIModalPresentationFullScreen;
+        [from presentViewController:nav animated:YES completion:nil];
+    }
     if (!gOutBuf) gOutBuf = [NSMutableString string];
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         @autoreleasepool {
+            // ★ 崩溃兜底（V2.2.6）：终端 / 资源管理器跑脚本也套检查点（块体就是本层栈帧）
+            int guardedSig = 0;
+            RY_GUARD_ARM(guardedSig);
+            if (guardedSig != 0) {
+                NSString *what = [NSString stringWithFormat:
+                        @"\n[崩溃兜底] 该脚本触发信号 %d（%s）@ 0x%llx（原语 %s）—— 已拦截，**进程存活**。\n"
+                         "  ⚠ 本次执行被掀栈，状态可能不干净；行为异常就重启 App。\n"
+                         "  ⚠ 内核 panic / 看门狗兜不住。想真崩（pid 差分定位）先跑 crashGuardSet(0)；详情 crashGuardStatus()。\n",
+                        guardedSig, strsignal(guardedSig), RYGuardLastAddr(), RYGuardLastPrim()];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (gOutTV) gOutTV.text = [gOutTV.text stringByAppendingString:what];
+                    else [gOutBuf appendString:what];
+                    NSString *done = @"\n=== 执行完成（已兜底，进程存活）===\n";
+                    if (gOutTV) gOutTV.text = [gOutTV.text stringByAppendingString:done];
+                    else [gOutBuf appendString:done];
+                    NSString *finalOut = gOutTV ? [gOutTV.text copy] : [gOutBuf copy];
+                    if (gRunCompletion) { void (^cb)(NSString *) = gRunCompletion; gRunCompletion = nil; cb(finalOut); }
+                });
+                return;
+            }
             [gOutBuf setString:@""];
             JSContext *ctx = [[JSContext alloc] init];
             ctx.exceptionHandler = ^(JSContext *c, JSValue *e) {
@@ -1565,6 +1641,7 @@ static void RunCode(UIViewController *from, NSString *code) {
                     if (gOutTV) gOutTV.text = [gOutTV.text stringByAppendingString:out]; else [gOutBuf appendString:out];
                 });
             }
+            RY_GUARD_DISARM();   // 正常跑完撤检查点（之后崩溃恢复"真崩"老行为）
             dispatch_async(dispatch_get_main_queue(), ^{
                 NSString *done = @"\n=== 执行完成 ===\n";
                 if (gOutTV) gOutTV.text = [gOutTV.text stringByAppendingString:done]; else [gOutBuf appendString:done];
@@ -1602,8 +1679,28 @@ static NSString *rycExceptionText(JSValue *e, NSString *stage) {
 // ---- 通用流式执行器（Terminal / Autorun 共用同一条执行路径）----
 void RYExecStream(NSString *code, void (^onLine)(NSString *line),
                   void (^onDone)(NSString *result, NSString *error, double ms)) {
-    double t0 = [[NSDate date] timeIntervalSince1970];
+    volatile double t0 = [[NSDate date] timeIntervalSince1970];   // volatile：longjmp 回来后还要用它算耗时
     NSMutableArray *errs = [NSMutableArray array];
+
+    // ★★ 崩溃兜底检查点（V2.2.6）：布在**当前线程**（Autorun 连接线程 / Terminal 主线程），
+    //    且必须布在**本层栈帧**（宏里直接展开 sigsetjmp）。本线程随后若发生 SIGSEGV 等，
+    //    信号处理器会 siglongjmp 回这里 → 这次执行以"触发崩溃，已兜底"返回，App 不死。
+    int guardedSig = 0;
+    RY_GUARD_ARM(guardedSig);
+    if (guardedSig != 0) {
+        // 刚从信号里跳回来：这次执行是**被掀栈**结束的，直接就地收尾（不再碰 JSC / 不建新 ctx）
+        NSString *what = [NSString stringWithFormat:
+                @"[崩溃兜底] 该操作触发信号 %d（%s）@ 0x%llx，已被拦截 —— **进程存活**。\n"
+                 "  崩时原语: %s\n"
+                 "  ⚠ 本次执行是中途被掀栈的，状态可能不干净（锁/内存/JSC）。若后续行为异常，重启 App 即可复位。\n"
+                 "  ⚠ 兜底只覆盖用户态信号崩溃；内核 panic / 看门狗卡死抓不到。想让它真崩（用 pid 差分定位）就先跑 crashGuardSet(0)。\n"
+                 "  详情: crashGuardStatus() 或 GET /ping 的 guard 字段。",
+                guardedSig, strsignal(guardedSig), RYGuardLastAddr(), RYGuardLastPrim()];
+        if (onLine) onLine(what);
+        double ms0 = ([[NSDate date] timeIntervalSince1970] - t0) * 1000.0;
+        if (onDone) onDone(nil, what, ms0);
+        return;
+    }
 
     JSContext *ctx = [[JSContext alloc] init];
     // Bug 3 修复：异常要带 name / message / stack 前 20 行，别只给一行 description
@@ -1639,6 +1736,7 @@ void RYExecStream(NSString *code, void (^onLine)(NSString *line),
     if (err == nil && errs.count > 0) err = [errs componentsJoinedByString:@"\n"];
 
     double ms = ([[NSDate date] timeIntervalSince1970] - t0) * 1000.0;
+    RY_GUARD_DISARM();   // 正常跑完：撤掉检查点（撤了之后崩溃就恢复"真崩"老行为）
     if (onDone) onDone(resStr, err, ms);
 }
 
@@ -1648,18 +1746,30 @@ static NSString *RYAutorunRunCapture(NSString *code) {
     __block NSString *resStr = nil;
     __block NSString *err = nil;
     __block double ms = 0;
+    int seqBefore = RYGuardSeq();          // 用来判断"本次执行有没有被崩溃兜底拦下"
     RYExecStream(code,
                  ^(NSString *line) { if (line) [cap addObject:line]; },
                  ^(NSString *r, NSString *e, double m) { resStr = r; err = e; ms = m; });
 
     NSString *out = [cap componentsJoinedByString:@"\n"];
-    NSDictionary *d = @{
+    NSMutableDictionary *d = [@{
         @"ok":     (err ? @NO : @YES),
         @"output": (out ? out : @""),
         @"result": (resStr ? resStr : [NSNull null]),
         @"error":  (err ? err : [NSNull null]),
         @"ms":     @((int)ms)
-    };
+    } mutableCopy];
+    // ★ 崩溃兜底标注：调用方（AI）可以直接按 guarded 分流 ——
+    //   guarded=true ⇒ 这条代码会把这个 App 打崩，但已被拦下，进程还活着；
+    //   结论仍然是"会崩"，别当成普通失败重试。
+    if (RYGuardSeq() != seqBefore) {
+        d[@"guarded"]     = @YES;
+        d[@"guardSignal"] = @(RYGuardLastSignal());
+        d[@"guardAddr"]   = [NSString stringWithFormat:@"0x%llx", RYGuardLastAddr()];
+        d[@"guardPrim"]   = [NSString stringWithUTF8String:RYGuardLastPrim()];
+    } else {
+        d[@"guarded"] = @NO;
+    }
     NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
     NSString *s = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : nil;
     return s ? s : @"{\"ok\":false,\"error\":\"serialize failed\"}";
@@ -1685,7 +1795,14 @@ static NSString *RYAutorunRunCapture(NSString *code) {
     gOutTV = _textView;
 }
 - (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; if (gOutTV == _textView) gOutTV = nil; }
-- (void)goBack { [self.navigationController popViewControllerAnimated:YES]; }
+// 返回：有上级页面就 pop（经典控制台 push 进来的）；模态弹出的（资源管理器那条路）就 dismiss
+- (void)goBack {
+    if (self.navigationController && self.navigationController.viewControllers.count > 1) {
+        [self.navigationController popViewControllerAnimated:YES];
+    } else if (self.presentingViewController) {
+        [self dismissViewControllerAnimated:YES completion:nil];
+    }
+}
 @end
 
 // ---- 编辑器（新增/编辑 脚本·桥）----
@@ -2301,6 +2418,29 @@ static void ryCrashLog(NSString *s) {
     if (c) ryCrashWrite(c, strlen(c));
 }
 
+// 崩溃兜底的状态与私有宏定义在**文件前部**（通用流式执行器之前）：
+// setjmp 宏必须在使用点之前展开，且 gGuard* 必须在使用点已声明 → 见「崩溃兜底状态」段。
+
+int RYGuardHits(void)             { return (int)gGuardHits; }
+int RYGuardLastSignal(void)       { return (int)gGuardLastSig; }
+unsigned long long RYGuardLastAddr(void) { return (unsigned long long)gGuardLastAddr; }
+int RYGuardSeq(void)              { return (int)gGuardSeq; }
+int RYGuardEnabled(void)          { return (int)gGuardEnabled; }
+int RYGuardDegraded(void)         { return (int)gGuardDegraded; }
+const char *RYGuardLastPrim(void) { return gGuardLastPrim[0] ? gGuardLastPrim : "(none)"; }
+void RYGuardSetEnabled(int on)    { gGuardEnabled = on ? 1 : 0; }
+
+// 给 JS（crashGuardStatus）与 Autorun（/ping、autorunStatus）共用的状态 JSON
+NSString *RYGuardStatusJSON(void) {
+    return [NSString stringWithFormat:
+            @"{\"enabled\":%d,\"hits\":%d,\"lastSignal\":%d,\"lastAddr\":\"0x%llx\","
+             "\"lastPrim\":\"%s\",\"degraded\":%d,"
+             "\"canCatch\":\"用户态信号(SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP)\","
+             "\"cannotCatch\":\"内核panic / 看门狗卡死 / 非布点线程上的崩溃\"}",
+            (int)gGuardEnabled, (int)gGuardHits, (int)gGuardLastSig,
+            RYGuardLastAddr(), RYGuardLastPrim(), (int)gGuardDegraded];
+}
+
 static void ryUncaughtExceptionHandler(NSException *e) {
     NSMutableString *m = [NSMutableString string];
     [m appendFormat:@"\n==== RyConsole 未捕获异常 @ %@ ====\n", [NSDate date]];
@@ -2315,16 +2455,40 @@ static void ryUncaughtExceptionHandler(NSException *e) {
 }
 
 // 信号处理里只允许 async-signal-safe 调用：纯 write / snprintf / backtrace_symbols_fd，**不碰 ObjC**
-static void rySignalHandler(int sig) {
-    char buf[288];
+// V2.2.6：改成带 si_addr 的三参版本（装的时候带 SA_SIGINFO），并在"本线程布过检查点"时
+//         siglongjmp 回执行器 —— 这就是崩溃兜底的核心一跳。
+static void rySignalHandler(int sig, siginfo_t *info, void *uap) {
+    (void)uap;
+    uintptr_t faddr = info ? (uintptr_t)info->si_addr : 0;
+    char buf[320];
     // ★ lastPrim：崩溃时正在执行哪个 JS 原语（只读无锁 char 数组 + write，信号安全）
-    int n = snprintf(buf, sizeof(buf), "\n==== RyConsole 收到信号 %d（%s） lastPrim=%s ====\n",
-                     sig, strsignal(sig), RYLastPrimitive());
+    int n = snprintf(buf, sizeof(buf),
+                     "\n==== RyConsole 收到信号 %d（%s） lastPrim=%s addr=0x%llx ====\n",
+                     sig, strsignal(sig), RYLastPrimitive(), (unsigned long long)faddr);
     if (n > 0) ryCrashWrite(buf, (size_t)n);
     void *bt[64];
     int frames = backtrace(bt, 64);
     if (ryCrashFd >= 0 && frames > 0) backtrace_symbols_fd(bt, frames, ryCrashFd);
-    // 还原默认处理再重抛：保留系统侧的崩溃上报/看门狗行为
+
+    // ★★ 崩溃兜底：当前线程布了检查点、兜底开启、且不是重入 → 记账后跳回执行器
+    //    （跨线程绝不跳：别的线程的栈对不上，跳过去必死）
+    if (gGuardEnabled && gGuardArmed && !gGuardInHandler
+        && (uintptr_t)pthread_self() == gGuardThread) {
+        gGuardInHandler = 1;
+        gGuardLastSig = sig;
+        gGuardLastAddr = faddr;
+        strlcpy(gGuardLastPrim, RYLastPrimitive(), sizeof(gGuardLastPrim));
+        gGuardHits++;
+        gGuardDegraded = 1;
+        gGuardSeq++;
+        gGuardArmed = 0;
+        const char *m = "\n[崩溃兜底] 已拦截 —— 本次执行以「触发崩溃」返回，进程继续存活\n";
+        ryCrashWrite(m, strlen(m));
+        siglongjmp(gGuardJmp, sig ? sig : 1);
+    }
+
+    // 兜不了（没布点 / 别的线程 / 被关掉）→ 保持老行为：还原默认处理再重抛，
+    // 保留系统侧崩溃上报与看门狗语义（日志已经写完了）
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -2342,8 +2506,29 @@ void RYInstallCrashLogger(void) {
         if (ryCrashFd < 0) return;
         ryCrashLog([NSString stringWithFormat:@"\n######## RyConsole 启动 @ %@ ########\n", [NSDate date]]);
         NSSetUncaughtExceptionHandler(&ryUncaughtExceptionHandler);
+
+        // 兜底要能拿到故障地址 → 用 sigaction + SA_SIGINFO；
+        // 再要一份 altstack：栈溢出（SIGSEGV 落在栈上）时处理器才有地方跑
+        static void *guardAltStk = NULL;
+        if (guardAltStk == NULL) {
+            guardAltStk = malloc(64 * 1024);
+            if (guardAltStk) {
+                stack_t ss;
+                ss.ss_sp = guardAltStk;
+                ss.ss_size = 64 * 1024;
+                ss.ss_flags = 0;
+                if (sigaltstack(&ss, NULL) != 0) guardAltStk = NULL;   // 装不上也不致命
+            }
+        }
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = rySignalHandler;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
         int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE };
-        for (int i = 0; i < 6; i++) signal(sigs[i], rySignalHandler);
+        for (int i = 0; i < 6; i++) sigaction(sigs[i], &sa, NULL);
+        ryCrashLog([NSString stringWithFormat:@"[RyCrash] 处理器已装（sigaction+SA_SIGINFO+altstack=%s）；崩溃兜底默认%s\n",
+                    guardAltStk ? "on" : "off", RYGuardEnabled() ? "开" : "关"]);
     } @catch (NSException *e) {
         NSLog(@"[RyCrash] 安装失败: %@", e.reason);
     }
