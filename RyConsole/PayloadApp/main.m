@@ -1030,6 +1030,119 @@ static NSString *memReadNative(NSString *hex, NSNumber *lenN) {
 //   ③ 异常转 JSON {ok,value|error}，调用方可清晰区分成功/失败
 //   返回整型/指针寄存器(id/BOOL/long)；float/struct 返回方法不适用（同原桥）。
 // ============================================================
+// ============================================================
+//  V2.3 C 函数指针调用（callPtr）：调用 dlopenFW/dlsymAddr 拿到的地址
+//   规格：2026-07-22-11-14-51/RYCONSOLE_CALLPTR_SPEC.md（研究侧 2026-09-19 提供）
+//   与 objcMsgSendNative 同一套 arity 显式分发 + 位槽打包（arm64 不可变参偷懒）。
+//   注意 ① 返回值用 uintptr_t 接，绝不能用 id（ARC 会 retain 标量 → SIGSEGV）
+//        ② 字符串参数给 const char*（UTF8String），不是 NSString*
+//        ③ 只支持整型/指针返回；float/struct 返回不适用
+//   相对规格参考实现的两处修正（构建侧补充）：
+//        ④ {buf:<数字>} 的数字就是缓冲大小（规格 3.2 写了 {buf:<n>}，参考实现却只认 v[@"size"]）
+//        ⑤ 函数地址先做可读性体检（vm_read 4 字节）→ 垃圾地址给结构化错误，不靠崩溃兜底硬扛
+// ============================================================
+static NSString *callPtrNative(NSString *addrHex, NSArray *args, NSDictionary *opts) {
+    if (![addrHex isKindOfClass:[NSString class]] || !addrHex.length)
+        return @"{\"ok\":false,\"error\":\"[callPtr error] addrHex must be a non-empty hex string 形如 \\\"0x00000002218bbdc4\\\"  |  签名: callPtr(addrHex, args, opts)  |  查参数: primHelp(\\\"callPtr\\\")\"}";
+    uintptr_t fp = objcHexToPtr(addrHex);
+    if (!fp) return @"{\"ok\":false,\"error\":\"[callPtr error] null address (addrHex 形如 0x...)  |  签名: callPtr(addrHex, args, opts)\"}";
+
+    // 函数地址体检：不可读 → 干净报错（调用垃圾地址 = SIGSEGV，@try 拦不住）
+    {
+        vm_offset_t probe = 0; mach_msg_type_number_t pc = 0;
+        kern_return_t kr = vm_read(mach_task_self(), (mach_vm_address_t)fp, 4, &probe, &pc);
+        if (kr != KERN_SUCCESS) {
+            if (probe) vm_deallocate(mach_task_self(), probe, (vm_size_t)pc);
+            return [NSString stringWithFormat:
+                    @"{\"ok\":false,\"error\":\"[callPtr error] 地址 0x%llx 不可读 (vm_read kr=0x%x) —— 不是有效的函数指针\""
+                     @",\"hint\":\"地址来自 dlsymAddr/symResolve 的 0x… 串；先 memRead(addr,8) 确认可读\"}",
+                    (unsigned long long)fp, (unsigned int)kr];
+        }
+        if (probe) vm_deallocate(mach_task_self(), probe, (vm_size_t)pc);
+    }
+
+    NSUInteger defaultBuf = 1024;
+    if ([opts isKindOfClass:[NSDictionary class]] && opts[@"bufSize"]) {
+        NSUInteger b = (NSUInteger)[opts[@"bufSize"] unsignedLongLongValue];
+        if (b > 0 && b <= 65536) defaultBuf = b;
+    }
+
+    unsigned long long nums[8] = {0};
+    void *slots[8] = {0};
+    NSMutableArray *inbufs = [NSMutableArray array];      // {buf:...} 分配的缓冲
+    NSMutableArray *bufIdx = [NSMutableArray array];      // [槽位, 大小] 成对
+    int n = 0;
+    for (id v in (args ?: @[])) {
+        if (n >= 8) return @"{\"ok\":false,\"error\":\"[callPtr error] too many args (>8)\"}";
+        if (v == nil || [v isKindOfClass:[NSNull class]]) { slots[n] = NULL; }
+        else if ([v isKindOfClass:[NSNumber class]]) {
+            nums[n] = [v unsignedLongLongValue];
+            slots[n] = (void *)nums[n];
+        }
+        else if ([v isKindOfClass:[NSString class]]) {
+            slots[n] = (void *)[v UTF8String];            // ★ C 字符串（不是 NSString 对象）
+        }
+        else if ([v isKindOfClass:[NSDictionary class]] && v[@"hex"]) {
+            slots[n] = (void *)objcHexToPtr(v[@"hex"]);
+        }
+        else if ([v isKindOfClass:[NSDictionary class]] && (v[@"buf"] || v[@"str"])) {
+            // 大小优先级：{buf:<数字>} > {size:<n>} > opts.bufSize > 1024（上限 65536）
+            NSUInteger sz = defaultBuf;
+            if ([v[@"buf"] isKindOfClass:[NSNumber class]] && [v[@"buf"] unsignedLongLongValue] > 0)
+                sz = (NSUInteger)[v[@"buf"] unsignedLongLongValue];
+            else if ([v[@"size"] isKindOfClass:[NSNumber class]] && [v[@"size"] unsignedLongLongValue] > 0)
+                sz = (NSUInteger)[v[@"size"] unsignedLongLongValue];
+            if (sz == 0 || sz > 65536) sz = defaultBuf;
+            void *p = calloc(1, sz);
+            if (!p) return @"{\"ok\":false,\"error\":\"[callPtr error] buf alloc failed\"}";
+            if (v[@"str"]) { const char *s = [[NSString stringWithFormat:@"%@", v[@"str"]] UTF8String]; strncpy(p, s ?: "", sz - 1); }
+            slots[n] = p;
+            [inbufs addObject:[NSValue valueWithPointer:p]];
+            [bufIdx addObject:@(n)];
+            [bufIdx addObject:@(sz)];
+        }
+        else { slots[n] = NULL; }
+        n++;
+    }
+
+    uintptr_t r = 0;
+    @try {
+        switch (n) {
+            case 0: r = ((uintptr_t(*)(void))fp)(); break;
+            case 1: r = ((uintptr_t(*)(void *))fp)(slots[0]); break;
+            case 2: r = ((uintptr_t(*)(void *, void *))fp)(slots[0], slots[1]); break;
+            case 3: r = ((uintptr_t(*)(void *, void *, void *))fp)(slots[0], slots[1], slots[2]); break;
+            case 4: r = ((uintptr_t(*)(void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3]); break;
+            case 5: r = ((uintptr_t(*)(void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4]); break;
+            case 6: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5]); break;
+            case 7: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6]); break;
+            default: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7]); break;
+        }
+    } @catch (NSException *e) {
+        for (NSValue *bv in inbufs) free([bv pointerValue]);
+        NSString *reason = [e.reason stringByReplacingOccurrencesOfString:@"\"" withString:@"'"];
+        return [NSString stringWithFormat:@"{\"ok\":false,\"error\":\"[callPtr exception] %@\"}", reason];
+    }
+
+    // 回传 {buf:} 缓冲内容（base64）
+    NSMutableString *outs = [NSMutableString string];
+    for (NSUInteger i = 0; i + 1 < bufIdx.count; i += 2) {
+        NSUInteger bi = (NSUInteger)[bufIdx[i] unsignedIntegerValue];
+        NSUInteger sz = (NSUInteger)[bufIdx[i + 1] unsignedIntegerValue];
+        void *p = slots[bi];
+        NSData *d = [NSData dataWithBytes:p length:sz];
+        [outs appendFormat:@"%@\"buf%d\":\"%@\"", (outs.length ? @"," : @""), (int)bi,
+                           [d base64EncodedStringWithOptions:0]];
+    }
+    for (NSValue *bv in inbufs) free([bv pointerValue]);
+
+    if (outs.length) {
+        return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\",\"out\":{%@}}",
+                (unsigned long long)r, outs];
+    }
+    return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\"}", (unsigned long long)r];
+}
+
 static NSString *objcMsgSendSafeNative(id recvArg, NSString *selName, NSArray *args) {
     uintptr_t rp = objcHexToPtr(recvArg);
     if (!rp) return @"{\"ok\":false,\"error\":\"null receiver\"}";
@@ -1444,6 +1557,11 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             //   memRead：给定 objc_msgSend 返回的指针(句柄)，把那块映射内存 dump 成 hex
             ctx[@"objc_msgSendSafe"]=^(id recv, NSString *sel, NSArray *args){ return objcMsgSendSafeNative(recv, sel, args); };
             ctx[@"memRead"]=^(NSString *hex, NSNumber *len){ return memReadNative(hex, len); };
+
+            // ---- V2.3 callPtr：C 函数指针调用（FFI）—— 补齐 dlopen/dlsym 之后的最后一环 ----
+            //   规格：RYCONSOLE_CALLPTR_SPEC.md。只支持整型/指针返回；函数地址会先做可读性体检。
+            //   ★ 崩溃兜底对它同样生效（调用坏函数 → guarded:true），内核 panic 除外。
+            ctx[@"callPtr"]=^(NSString *addrHex, NSArray *args, NSDictionary *opts){ return callPtrNative(addrHex, args, opts); };
 
             // ---- V2.2 保活状态（只读）：保活由 Autorun 监听开关驱动，JS 只能查不能改 ----
             ctx[@"keepAliveStatus"]=^{ return [[RYKeepAlive shared] statusLine]; };
