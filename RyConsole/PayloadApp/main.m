@@ -819,6 +819,15 @@ static NSString *objcSelNative(NSString *name) {
 static NSString *objcDescNative(NSString *hex) {
     uintptr_t p = objcHexToPtr(hex);
     if (!p) return @"(nil)";
+    // ★ 同源防护（2026-09-18）：objc_msgSend 如果把 **标量返回值**（count / length / BOOL…）
+    //   一路传到 objcDesc，下面 `[o isKindOfClass:]` 就是在给非法地址发消息 → SIGSEGV。
+    //   这里做最便宜的体检：8 字节对齐 + 高于用户空间起点（arm64 tagged pointer 仍会通过）。
+    if ((p & 0x7) != 0 || p < 0x100000000ULL) {
+        return [NSString stringWithFormat:
+                @"[objcDesc] 0x%llx 不像对象指针（对齐/范围体检未过）——"
+                @"该 selector 大概返回的是标量，别把它丢给 objcDesc",
+                (unsigned long long)p];
+    }
     @try {
         id o = (__bridge id)(void *)p;
         if (!o) return @"(nil)";
@@ -862,7 +871,16 @@ static NSString *objcMsgSendNative(id recvArg, NSString *selName, NSArray *args)
     }
     @try {
         // 显式 arity 分发: 每档独立签名 cast, 不多传垃圾实参
-        id ret = nil;
+        //
+        // ★★ 严重崩溃根因（2026-09-18，由安全研究 AI 源码级定位）：
+        //   这里原来写的是 `id ret = nil;`。ARC 下 `id` 是 **__strong**，所以每一条
+        //     ret = ((id(*)(id,SEL))objc_msgSend)(...)      // ret 被赋值为"裸指针"
+        //   都会插入 objc_retain()。当被调 selector **返回标量**（count / length /
+        //   intValue / BOOL …）时，ret 拿到的是一个小整数（如 0x1f），
+        //   objc_retain(0x1f) 就去解引用 0x1f → **SIGSEGV**（信号级，@try 抓不到）。
+        //   这正是"lsAppList() 一次调用即崩""栈顶崩在 block 内、没有下层帧"的成因。
+        //   修法：__unsafe_unretained（不参与 ARC 所有权）—— 指针原样透传，不再 retain。
+        __unsafe_unretained id ret = nil;
         switch (n) {
             case 0: ret = ((id(*)(id, SEL))objc_msgSend)(recv, sel); break;
             case 1: ret = ((id(*)(id, SEL, void *))objc_msgSend)(recv, sel, slots[0]); break;
@@ -935,7 +953,9 @@ static NSString *objcMsgSendSafeNative(id recvArg, NSString *selName, NSArray *a
         n++;
     }
     @try {
-        id ret = nil;
+        // ★ 同 objcMsgSendNative：必须是 __unsafe_unretained，
+        //   否则标量返回值（count/length/BOOL…）会被 ARC objc_retain 成野指针 → SIGSEGV。
+        __unsafe_unretained id ret = nil;
         switch (n) {
             case 0: ret = ((id(*)(id, SEL))objc_msgSend)(recv, sel); break;
             case 1: ret = ((id(*)(id, SEL, void *))objc_msgSend)(recv, sel, slots[0]); break;
