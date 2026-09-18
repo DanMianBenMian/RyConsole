@@ -20,6 +20,15 @@ import WidgetKit
 
 private let kAccent = Color(red: 0.20, green: 0.90, blue: 0.62)   // 与 App 的 RY_GREEN 同色系
 
+/// 紧凑态里是否同时显示连接数。
+/// ⚠️ 默认 **0 = 只显示图标**：原生 iPhone 灵动岛放两个元素没问题，
+/// 但"强开灵动岛"（非原生，胶囊几何是假的）会被图标+数字两个元素撑变形。
+/// 用原生灵动岛且想看数字的话，把它改成 1 重编即可。
+private let kCompactShowsHits = 0
+
+/// 紧凑态图标尺寸：写死，别让它参与自适应去撑胶囊宽度
+private let kCompactIconSize: CGFloat = 12
+
 @main
 struct RyConsoleWidgetBundle: WidgetBundle {
     var body: some Widget {
@@ -95,25 +104,38 @@ struct RYListenLiveActivity: Widget {
                     .padding(.top, 2)
                 }
             } compactLeading: {
-                // ---- 紧凑态（左）：数据/信号图标 ----
+                // ---- 紧凑态（左）：数据/信号图标（固定尺寸，不参与撑宽）----
                 Image(systemName: "antenna.radiowaves.left.and.right")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: kCompactIconSize, weight: .semibold))
                     .foregroundStyle(kAccent)
+                    .frame(width: kCompactIconSize + 4, height: kCompactIconSize + 4)
+                    .fixedSize()
 
             } compactTrailing: {
-                // ---- 紧凑态（右）：连接数 ----
-                Text("\(context.state.hits)")
-                    .font(.system(size: 13, weight: .semibold))
-                    .monospacedDigit()
-                    .foregroundStyle(kAccent)
+                // ---- 紧凑态（右）：默认留空（见 kCompactShowsHits 说明）----
+                if kCompactShowsHits == 1 {
+                    Text("\(context.state.hits)")
+                        .font(.system(size: kCompactIconSize, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(kAccent)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                        .fixedSize()
+                } else {
+                    EmptyView()
+                }
 
             } minimal: {
                 Image(systemName: "antenna.radiowaves.left.and.right")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: kCompactIconSize, weight: .semibold))
                     .foregroundStyle(kAccent)
+                    .fixedSize()
             }
             .keylineTint(kAccent)
-            .widgetURL(URL(string: "ryconsole://listen"))
+            // 注意：这里**故意不挂 widgetURL**。
+            // 之前挂了 "ryconsole://listen"，但 App 没注册这个 URL scheme ——
+            // 在"强开灵动岛"的环境里点它会走到未注册 scheme 的处理路径（从灵动岛回 App 崩的嫌疑点）。
+            // 去掉后点击仍由系统默认行为回到本 App，且不留隐患。
         }
     }
 }
