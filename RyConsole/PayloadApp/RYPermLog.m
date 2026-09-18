@@ -16,7 +16,6 @@
 #import <mach-o/dyld.h>
 #import <mach-o/getsect.h>
 #import <spawn.h>
-#import <servers/bootstrap.h>
 #import <sys/wait.h>
 #import <errno.h>
 
@@ -338,12 +337,19 @@ static NSString *RYEmbeddedEntitlementsString(void) {
                     detail = [NSString stringWithFormat:@"IOMasterPort kr=0x%x", kr];
                 }
             } else if ([key isEqualToString:@"cap:mach"]) {
+                // iOS 不暴露 <servers/bootstrap.h> → 运行时 dlsym 取符号，取不到就明确说不可用
+                typedef kern_return_t (*BLookUpFn)(mach_port_t, const char *, mach_port_t *);
+                BLookUpFn bl = (BLookUpFn)dlsym(RTLD_DEFAULT, "bootstrap_look_up");
                 mach_port_t bp = MACH_PORT_NULL;
                 task_get_bootstrap_port(mach_task_self(), &bp);
-                mach_port_t p = MACH_PORT_NULL;
-                kern_return_t kr = bootstrap_look_up(bp, "com.apple.securityd", &p);
-                ok = (kr == KERN_SUCCESS);
-                detail = [NSString stringWithFormat:@"bootstrap_look_up kr=0x%x", kr];
+                if (!bl) {
+                    detail = @"bootstrap_look_up 不可用（iOS 未导出该符号）";
+                } else {
+                    mach_port_t p = MACH_PORT_NULL;
+                    kern_return_t kr = bl(bp, "com.apple.securityd", &p);
+                    ok = (kr == KERN_SUCCESS);
+                    detail = [NSString stringWithFormat:@"bootstrap_look_up(com.apple.securityd) kr=0x%x", kr];
+                }
             } else if ([key isEqualToString:@"cap:dyld"]) {
                 void *h = dlopen("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_NOW);
                 ok = (h != NULL);
