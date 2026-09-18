@@ -24,6 +24,7 @@
 #import <unistd.h>
 #import "AutorunServer.h"
 #import "KeepAlive.h"
+#import "LiveActivityBridge.h"
 #import "RyExec.h"
 #import "MainShell.h"
 #import "RyShellBridge.h"
@@ -1304,6 +1305,13 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             // ---- V2.2 保活状态（只读）：保活由 Autorun 监听开关驱动，JS 只能查不能改 ----
             ctx[@"keepAliveStatus"]=^{ return [[RYKeepAlive shared] statusLine]; };
             ctx[@"keepAliveInfo"]=^{ return [[RYKeepAlive shared] statusJSON]; };
+
+            // ---- V2.2 实时活动（灵动岛）状态（只读）：{"available":bool,"active":bool} ----
+            ctx[@"liveActivityStatus"]=^{
+                return [NSString stringWithFormat:@"{\"available\":%@,\"active\":%@}",
+                        ryLiveActivityAvailable() ? @"true" : @"false",
+                        ryLiveActivityActive() ? @"true" : @"false"];
+            };
 
             // ---- AI / Autorun 辅助原语（探针迭代常用；每次执行都是全新 ctx，跨轮状态请落盘）----
             // 限速/间隔：JavaScriptCore 没有 setTimeout，用阻塞 sleep 代替（上限 120s 防呆）
