@@ -574,7 +574,7 @@ static void ryScrollToBottom(UITextView *tv) {
         disc.tag = 9212;
         [self addSubview:disc];
 
-        UIButton *legacy = ryButton(@"经典界面（脚本 / 桥 / 修补）", self, @selector(onLegacy));
+        UIButton *legacy = ryButton(@"经典界面（旧版控制台）", self, @selector(onLegacy));
         legacy.tag = 9213;
         [self addSubview:legacy];
 
@@ -837,6 +837,7 @@ static void ryScrollToBottom(UITextView *tv) {
     for (UIView *p in @[self.terminalPane, self.autorunPane, self.settingsPane]) {
         p.frame = self.content.bounds;
     }
+    self.resourcePane.view.frame = self.content.bounds;   // 第 4 面板（懒加载，可能为 nil）
     [self layoutIndicator];
 }
 
@@ -875,21 +876,11 @@ static void ryScrollToBottom(UITextView *tv) {
 }
 
 - (void)onNav:(UIButton *)sender {
-    NSInteger idx = sender.tag - 8000;
-    if (idx == 3) {   // 资源管理器：弹出（复用 main.m 里现成的 UI）
-        // 走工厂函数拿 VC：ResourceManagerVC 的 @interface 只在 main.m 内部，
-        // 跨文件用前向声明的类型做 alloc/init 会被编译器拒绝。
-        UIViewController *r = RYMakeResourceManagerVC();
-        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:r];
-        nav.modalPresentationStyle = UIModalPresentationFormSheet;
-        [self presentViewController:nav animated:YES completion:nil];
-        return;
-    }
-    [self select:idx];
+    [self select:sender.tag - 8000];
 }
 
 - (void)select:(NSInteger)idx {
-    if (idx < 0 || idx > 2) idx = 0;
+    if (idx < 0 || idx > 3) idx = 0;
     self.current = idx;
     for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++) {
         UIButton *b = self.navButtons[i];
@@ -898,9 +889,24 @@ static void ryScrollToBottom(UITextView *tv) {
         b.tintColor = sel ? RY_ACCENT : RY_MUTED;
         b.backgroundColor = sel ? [UIColor colorWithWhite:1.0f alpha:0.05f] : [UIColor clearColor];
     }
+
+    // 第 4 个面板：资源管理器。**内嵌整页**（不是弹窗），首次进入才创建，省启动开销。
+    if (idx == 3) {
+        if (!self.resourcePane) {
+            self.resourcePane = RYMakeResourceManagerPane();
+            [self addChildViewController:self.resourcePane];
+            self.resourcePane.view.frame = self.content.bounds;
+            self.resourcePane.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            [self.content addSubview:self.resourcePane.view];
+            [self.resourcePane didMoveToParentViewController:self];
+        }
+        RYResourceManagerRefresh(self.resourcePane);   // 每次进来重扫 Documents（可能刚丢过脚本进来）
+    }
+
     self.terminalPane.hidden = (idx != 0);
     self.autorunPane.hidden = (idx != 1);
     self.settingsPane.hidden = (idx != 2);
+    self.resourcePane.view.hidden = (idx != 3);
     [self layoutIndicator];
     if (idx == 1) [self.autorunPane refresh];
 }
