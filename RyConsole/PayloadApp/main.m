@@ -23,6 +23,7 @@
 #import <sys/wait.h>
 #import <unistd.h>
 #import "AutorunServer.h"
+#import "KeepAlive.h"
 #import "RyExec.h"
 #import "MainShell.h"
 #import "RyShellBridge.h"
@@ -875,6 +876,79 @@ static NSString *objcMsgSendNative(id recvArg, NSString *selName, NSArray *args)
     }
 }
 
+// ============================================================
+//  V2.2 读映射内存桥（memRead）：从本任务地址空间读 len 字节，safe via vm_read
+//   用途：objc_msgSend 返回指针(句柄)后，可跟 memRead 把那块内存 dump 出来
+//         （对象 isa/ivars、C 结构体、映射区）。越界/未映射返回 kr 错误，不崩。
+//   限制：len 上限 64KB；只对本进程地址空间有效（沙盒内即 App 自身映射）。
+// ============================================================
+static NSString *memReadNative(NSString *hex, NSNumber *lenN) {
+    uintptr_t addr = objcHexToPtr(hex);
+    if (!addr) return @"[memRead error] null address";
+    mach_vm_size_t len = (mach_vm_size_t)[lenN unsignedLongLongValue];
+    if (len == 0 || len > 65536) return @"[memRead error] len must be 1..65536";
+    vm_offset_t data = 0; mach_msg_type_number_t count = 0;
+    kern_return_t kr = vm_read(mach_task_self(), (mach_vm_address_t)addr, len, &data, &count);
+    if (kr != KERN_SUCCESS) return [NSString stringWithFormat:@"[memRead error] vm_read kr=%d", (int)kr];
+    NSMutableString *out = [NSMutableString stringWithCapacity:count * 2];
+    const unsigned char *p = (const unsigned char *)(uintptr_t)data;
+    for (mach_msg_type_number_t i = 0; i < count; i++) [out appendFormat:@"%02x", p[i]];
+    vm_deallocate(mach_task_self(), data, count);
+    return out;
+}
+
+// ============================================================
+//  V2.2 objc_msgSend 安全封装（objc_msgSendSafe）：与原 objc_msgSend 区别
+//   ① nil recv/sel 返回结构化错误而非静默 0x0
+//   ② 参数 >7 直接拒绝（arm64 msgSend 无 stret，多传即崩）
+//   ③ 异常转 JSON {ok,value|error}，调用方可清晰区分成功/失败
+//   返回整型/指针寄存器(id/BOOL/long)；float/struct 返回方法不适用（同原桥）。
+// ============================================================
+static NSString *objcMsgSendSafeNative(id recvArg, NSString *selName, NSArray *args) {
+    uintptr_t rp = objcHexToPtr(recvArg);
+    if (!rp) return @"{\"ok\":false,\"error\":\"null receiver\"}";
+    id recv = (__bridge id)(void *)rp;
+    if (![selName isKindOfClass:[NSString class]] || !selName.length)
+        return @"{\"ok\":false,\"error\":\"bad selector\"}";
+    SEL sel = [selName hasPrefix:@"0x"] ? (SEL)objcHexToPtr(selName) : sel_registerName([selName UTF8String]);
+    if (!sel) return @"{\"ok\":false,\"error\":\"null selector\"}";
+
+    id objs[8] = {nil};
+    unsigned long long nums[8] = {0};
+    void *slots[8] = {0};
+    int n = 0;
+    for (id v in (args ?: @[])) {
+        if (n >= 8) return @"{\"ok\":false,\"error\":\"too many args (>7)\"}";
+        if (v == nil || [v isKindOfClass:[NSNull class]]) { slots[n] = NULL; }
+        else if ([v isKindOfClass:[NSNumber class]]) {
+            if (strcmp([v objCType], "c") == 0 || strcmp([v objCType], "B") == 0)
+                nums[n] = (unsigned long long)([v boolValue] ? 1 : 0);
+            else nums[n] = [v unsignedLongLongValue];
+            slots[n] = (void *)nums[n];
+        }
+        else if ([v isKindOfClass:[NSDictionary class]] && v[@"hex"]) { slots[n] = (void *)objcHexToPtr(v[@"hex"]); }
+        else if ([v isKindOfClass:[NSString class]]) { objs[n] = v; slots[n] = (__bridge void *)objs[n]; }
+        else { slots[n] = NULL; }
+        n++;
+    }
+    @try {
+        id ret = nil;
+        switch (n) {
+            case 0: ret = ((id(*)(id, SEL))objc_msgSend)(recv, sel); break;
+            case 1: ret = ((id(*)(id, SEL, void *))objc_msgSend)(recv, sel, slots[0]); break;
+            case 2: ret = ((id(*)(id, SEL, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1]); break;
+            case 3: ret = ((id(*)(id, SEL, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2]); break;
+            case 4: ret = ((id(*)(id, SEL, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3]); break;
+            case 5: ret = ((id(*)(id, SEL, void *, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3], slots[4]); break;
+            case 6: ret = ((id(*)(id, SEL, void *, void *, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3], slots[4], slots[5]); break;
+            default: ret = ((id(*)(id, SEL, void *, void *, void *, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6]); break;
+        }
+        return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"%@\"}", objcHexFromPtr((uintptr_t)ret)];
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"{\"ok\":false,\"error\":\"%@\"}", e.reason];
+    }
+}
+
 static NSDictionary *posixSpawnNative(NSString *path, NSArray *argvArr, double timeoutSec) {
     if (timeoutSec <= 0 || timeoutSec > 30) timeoutSec = 5;
     int cap = (int)(argvArr.count ?: 0) + 2;
@@ -1221,6 +1295,16 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"objc_msgSend"]=^(id recv, NSString *sel, NSArray *args){ return objcMsgSendNative(recv, sel, args); };
             ctx[@"objcDesc"]=^(id hex){ return objcDescNative(hex); };
 
+            // ---- V2.2 安全封装 + 读映射内存：与原生桥同级的全局原语 ----
+            //   objc_msgSendSafe：结构化错误返回，参数 >7 拒绝，调用方 JSON.parse 即可区分成败
+            //   memRead：给定 objc_msgSend 返回的指针(句柄)，把那块映射内存 dump 成 hex
+            ctx[@"objc_msgSendSafe"]=^(id recv, NSString *sel, NSArray *args){ return objcMsgSendSafeNative(recv, sel, args); };
+            ctx[@"memRead"]=^(NSString *hex, NSNumber *len){ return memReadNative(hex, len); };
+
+            // ---- V2.2 保活状态（只读）：保活由 Autorun 监听开关驱动，JS 只能查不能改 ----
+            ctx[@"keepAliveStatus"]=^{ return [[RYKeepAlive shared] statusLine]; };
+            ctx[@"keepAliveInfo"]=^{ return [[RYKeepAlive shared] statusJSON]; };
+
             // ---- AI / Autorun 辅助原语（探针迭代常用；每次执行都是全新 ctx，跨轮状态请落盘）----
             // 限速/间隔：JavaScriptCore 没有 setTimeout，用阻塞 sleep 代替（上限 120s 防呆）
             ctx[@"sleep"]=^(NSNumber *ms){
@@ -1413,9 +1497,9 @@ static NSString *RYAutorunRunCapture(NSString *code) {
 }
 
 // ============================================================
-//  UI — 受保护外壳（资源管理器 / 脚本 / 桥 / 修补）
-//  注意：本段为 UI 加载逻辑，锁死在此文件。修补页现在编辑所有可编辑「底层」JS
-//       （engine.js + 全部 bridge_*.js），但仍是运行时读本地 Documents，碰不到这里的原生代码。
+//  UI — 受保护外壳（资源管理器 / 脚本 / 桥）
+//  注意：本段为 UI 加载逻辑，锁死在此文件。可编辑的「底层」JS（engine.js + bridge_*.js）
+//       一律运行时从 Documents 读取（无效则回落 bundle），碰不到这里的原生代码。
 // ============================================================
 @implementation OutputVC
 - (void)viewDidLoad {
@@ -1485,16 +1569,11 @@ static NSString *RYAutorunRunCapture(NSString *code) {
 - (void)alert:(NSString*)msg { UIAlertController *a = [UIAlertController alertControllerWithTitle:@"提示" message:msg preferredStyle:UIAlertControllerStyleAlert]; [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]]; [self presentViewController:a animated:YES completion:nil]; }
 @end
 
-// ---- 资源管理器（3 分类：脚本 / 桥 / 修补）----
+// ---- 资源管理器（2 分类：脚本 / 桥；修补模块已于 V2.2 移除）----
 @class ResourceManagerVC;
 @interface ResourceManagerVC : UIViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UISegmentedControl *seg;
 @property (nonatomic, strong) UITableView *table;
-@property (nonatomic, strong) UITextView *patchEditor;
-@property (nonatomic, strong) UIView *patchBar;
-@property (nonatomic, strong) UISegmentedControl *patchSeg;
-@property (nonatomic, strong) NSArray *patchFiles;
-@property (nonatomic, assign) NSInteger patchSel;
 @property (nonatomic, strong) NSArray *scripts;
 @property (nonatomic, strong) NSArray *bridges;
 @property (nonatomic, assign) BOOL lpAdded;
@@ -1505,7 +1584,7 @@ static NSString *RYAutorunRunCapture(NSString *code) {
     self.view.backgroundColor = [UIColor systemBackgroundColor];
     self.title = @"资源管理器";
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(close)];
-    _seg = [[UISegmentedControl alloc] initWithItems:@[@"脚本", @"桥", @"修补"]];
+    _seg = [[UISegmentedControl alloc] initWithItems:@[@"脚本", @"桥"]];
     _seg.translatesAutoresizingMaskIntoConstraints = NO; _seg.selectedSegmentIndex = 0;
     [_seg addTarget:self action:@selector(segChanged) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:_seg];
@@ -1513,50 +1592,15 @@ static NSString *RYAutorunRunCapture(NSString *code) {
     _table.translatesAutoresizingMaskIntoConstraints = NO;     _table.delegate = self; _table.dataSource = self;
     [self.view addSubview:_table];
     _lpAdded = NO;
-    _patchEditor = [[UITextView alloc] initWithFrame:CGRectZero];
-    _patchEditor.translatesAutoresizingMaskIntoConstraints = NO; _patchEditor.font = [UIFont fontWithName:@"Menlo" size:11] ?: [UIFont systemFontOfSize:11];
-    _patchEditor.hidden = YES; [self.view addSubview:_patchEditor];
-    _patchBar = [[UIView alloc] init]; _patchBar.translatesAutoresizingMaskIntoConstraints = NO; _patchBar.hidden = YES; [self.view addSubview:_patchBar];
-    UIButton *saveB = [UIButton buttonWithType:UIButtonTypeSystem]; saveB.translatesAutoresizingMaskIntoConstraints = NO; [saveB setTitle:@"保存" forState:UIControlStateNormal]; [saveB addTarget:self action:@selector(patchSave) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *resetB = [UIButton buttonWithType:UIButtonTypeSystem]; resetB.translatesAutoresizingMaskIntoConstraints = NO; [resetB setTitle:@"恢复初始底层" forState:UIControlStateNormal]; [resetB addTarget:self action:@selector(patchReset) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *viewB = [UIButton buttonWithType:UIButtonTypeSystem]; viewB.translatesAutoresizingMaskIntoConstraints = NO; [viewB setTitle:@"查看main.m" forState:UIControlStateNormal]; [viewB addTarget:self action:@selector(patchViewMain) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *resetBridgesB = [UIButton buttonWithType:UIButtonTypeSystem]; resetBridgesB.translatesAutoresizingMaskIntoConstraints = NO; [resetBridgesB setTitle:@"重置内置桥" forState:UIControlStateNormal]; [resetBridgesB addTarget:self action:@selector(patchResetBuiltinBridges) forControlEvents:UIControlEventTouchUpInside];
-    [_patchBar addSubview:saveB]; [_patchBar addSubview:resetB]; [_patchBar addSubview:viewB]; [_patchBar addSubview:resetBridgesB];
-    // 修补页：底层文件切换条（engine.js + 全部桥）。点哪个就编辑哪个，保存到 Documents 覆盖版，下次执行生效。
-    // 目的：把所有可编辑底层(执行引擎 + 桥逻辑)在修补页一次性亮出来，改底层逻辑不再需要重编原生。
-    _patchSeg = [[UISegmentedControl alloc] initWithItems:@[@"engine.js", @"bridge_iokit", @"bridge_net", @"bridge_ui", @"bridge_info"]];
-    _patchSeg.translatesAutoresizingMaskIntoConstraints = NO; _patchSeg.selectedSegmentIndex = 0;
-    [_patchSeg addTarget:self action:@selector(patchFileChanged) forControlEvents:UIControlEventValueChanged];
-    _patchSeg.hidden = YES; [self.view addSubview:_patchSeg];
-    _patchFiles = @[@"engine.js", @"bridge_iokit.js", @"bridge_net.js", @"bridge_ui.js", @"bridge_info.js"];
-    _patchSel = 0;
+    // 修补模块已移除（V2.2）：引擎/桥逻辑改回走 require() 动态加载，不再内置编辑器
     [NSLayoutConstraint activateConstraints:@[
         [_seg.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8],
         [_seg.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
         [_seg.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
-        [_patchSeg.topAnchor constraintEqualToAnchor:_seg.bottomAnchor constant:8],
-        [_patchSeg.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
-        [_patchSeg.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
         [_table.topAnchor constraintEqualToAnchor:_seg.bottomAnchor constant:8],
         [_table.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:0],
         [_table.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:0],
         [_table.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:0],
-        [_patchEditor.topAnchor constraintEqualToAnchor:_patchSeg.bottomAnchor constant:8],
-        [_patchEditor.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:0],
-        [_patchEditor.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:0],
-        [_patchEditor.bottomAnchor constraintEqualToAnchor:_patchBar.topAnchor constant:0],
-        [_patchBar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:0],
-        [_patchBar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:0],
-        [_patchBar.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:0],
-        [_patchBar.heightAnchor constraintEqualToConstant:44],
-        [saveB.leadingAnchor constraintEqualToAnchor:_patchBar.leadingAnchor constant:12],
-        [saveB.centerYAnchor constraintEqualToAnchor:_patchBar.centerYAnchor],
-        [resetB.leadingAnchor constraintEqualToAnchor:saveB.trailingAnchor constant:12],
-        [resetB.centerYAnchor constraintEqualToAnchor:_patchBar.centerYAnchor],
-        [viewB.leadingAnchor constraintEqualToAnchor:resetB.trailingAnchor constant:12],
-        [viewB.centerYAnchor constraintEqualToAnchor:_patchBar.centerYAnchor],
-        [resetBridgesB.leadingAnchor constraintEqualToAnchor:viewB.trailingAnchor constant:12],
-        [resetBridgesB.centerYAnchor constraintEqualToAnchor:_patchBar.centerYAnchor],
     ]];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(addCurrent)];
     [self refreshRM];
@@ -1572,15 +1616,9 @@ static NSString *RYAutorunRunCapture(NSString *code) {
     for (NSString *f in docsB) { [br addObject:f]; [seen addObject:f]; }
     for (NSString *f in bundledScripts()) { if ([f hasPrefix:@"bridge_"] && [f hasSuffix:@".js"] && ![seen containsObject:f]) { [br addObject:f]; [seen addObject:f]; } }
     _bridges = br;
-    if (_seg.selectedSegmentIndex != 2) [_table reloadData];
-    else _patchEditor.text = [self patchLoadSelected];
+    [_table reloadData];
 }
-- (void)segChanged {
-    BOOL patch = (_seg.selectedSegmentIndex == 2);
-    _table.hidden = patch; _patchEditor.hidden = !patch; _patchBar.hidden = !patch; _patchSeg.hidden = !patch;
-    self.navigationItem.rightBarButtonItem = patch ? nil : [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(addCurrent)];
-    if (patch) [self patchFileChanged]; else [self refreshRM];
-}
+- (void)segChanged { [self refreshRM]; }
 - (void)addCurrent {
     if (_seg.selectedSegmentIndex == 0) { EditorVC *e = [[EditorVC alloc] init]; e.hostVC = self; e.isBridge = NO; e.isEdit = NO;
         UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:e]; nav.modalPresentationStyle = UIModalPresentationFormSheet; [self presentViewController:nav animated:YES completion:nil]; }
@@ -1640,63 +1678,7 @@ static NSString *RYAutorunRunCapture(NSString *code) {
         [self presentViewController:a animated:YES completion:nil];
     }
 }
-- (NSString *)patchLoadSelected {
-    NSString *name = _patchFiles[_patchSel];
-    if ([name isEqualToString:@"engine.js"]) return loadEngineSource() ?: @"";
-    NSString *dp = [docsDir() stringByAppendingPathComponent:name];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:dp]) return [NSString stringWithContentsOfFile:dp encoding:NSUTF8StringEncoding error:nil] ?: @"";
-    return loadBundledScript(name);
-}
-- (void)patchFileChanged {
-    if (_seg.selectedSegmentIndex != 2) return;
-    _patchSel = _patchSeg.selectedSegmentIndex;
-    _patchEditor.text = [self patchLoadSelected];
-}
-- (void)patchSave {
-    NSString *name = _patchFiles[_patchSel];
-    NSString *code = _patchEditor.text ?: @""; NSError *e;
-    NSString *path = [name isEqualToString:@"engine.js"] ? engineDocPath() : [docsDir() stringByAppendingPathComponent:name];
-    if ([code writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&e]) [self alert:[name stringByAppendingString:@" 已保存，下次执行生效"]];
-    else [self alert:[@"保存失败: " stringByAppendingString:e.localizedDescription]];
-}
-- (void)patchReset {
-    // 恢复当前选中的「底层」文件为初始版本：engine.js 删 docs 覆盖；桥删 docs 覆盖还原 bundle 原版并重置开关。
-    NSString *name = _patchFiles[_patchSel];
-    NSString *path = [name isEqualToString:@"engine.js"] ? engineDocPath() : [docsDir() stringByAppendingPathComponent:name];
-    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
-    if ([name hasPrefix:@"bridge_"]) setBridgeEnabled(name, YES);
-    _patchEditor.text = [self patchLoadSelected];
-    [self refreshRM]; [self alert:[NSString stringWithFormat:@"已恢复 %@ 为初始版本（下次执行生效）", name]];
-}
-- (void)patchResetBuiltinBridges {
-    // 仅还原「被用户覆盖的内置桥」：删除 Documents 里与 bundle 内置桥同名的覆盖文件，
-    // 让 bundle 原版重新生效，并把该桥开关重置为默认(开启)。
-    // 纯用户桥(Documents 独有、bundle 无同名)不受影响。
-    NSSet *bundled = [NSSet setWithArray:bundledScripts()];
-    NSString *dd = docsDir();
-    NSArray *df = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dd error:nil] ?: @[];
-    int restored = 0;
-    for (NSString *f in df) {
-        if ([f hasPrefix:@"bridge_"] && [f hasSuffix:@".js"] && [bundled containsObject:f]) {
-            NSString *p = [dd stringByAppendingPathComponent:f];
-            if ([[NSFileManager defaultManager] removeItemAtPath:p error:nil]) {
-                restored++;
-                setBridgeEnabled(f, YES);
-            }
-        }
-    }
-    [self refreshRM];
-    [self alert:restored > 0
-         ? [NSString stringWithFormat:@"已还原 %d 个被覆盖的内置桥（bundle 原版已恢复）", restored]
-         : @"没有需要还原的内置桥覆盖（内置桥均完好）"];
-}
-- (void)patchViewMain {
-    NSString *src = loadBundledScript(@"ryc_main_source.txt");
-    if (!src || [src hasPrefix:@"[loadBundledScript]"]) src = @"(未找到 ryc_main_source.txt)";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"RyConsole 底层 main.m（只读）" message:src preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:a animated:YES completion:nil];
-}
+// 修补模块已移除（V2.2）：引擎/桥逻辑统一走 require() 动态加载，改底层不再需要内置编辑器。
 - (void)alert:(NSString*)msg { UIAlertController *a = [UIAlertController alertControllerWithTitle:nil message:msg preferredStyle:UIAlertControllerStyleAlert]; [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]]; [self presentViewController:a animated:YES completion:nil]; }
 @end
 
