@@ -1682,6 +1682,9 @@ static NSString *RYAutorunRunCapture(NSString *code) {
 - (void)alert:(NSString*)msg { UIAlertController *a = [UIAlertController alertControllerWithTitle:nil message:msg preferredStyle:UIAlertControllerStyleAlert]; [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]]; [self presentViewController:a animated:YES completion:nil]; }
 @end
 
+// 资源管理器工厂：外壳（MainShell）通过它弹出本 VC，不必看到 main.m 内部的 @interface。
+UIViewController *RYMakeResourceManagerVC(void) { return [[ResourceManagerVC alloc] init]; }
+
 // ---- LocalSend（局域网服务端投喂：Update / Code / UpdateIPA 三 head）----
 @interface LocalSendDetailVC : UIViewController <NSURLSessionDelegate>
 @property (nonatomic, strong) NSDictionary *payload;
