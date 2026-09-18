@@ -28,4 +28,11 @@ int32_t ryLiveActivityUpdate(int32_t hits, const char *peer);
 /// 结束并立刻移除
 int32_t ryLiveActivityStop(void);
 
+/// 只续「保鲜期」（数字不动）。保活脉冲定期调用，避免还在监听却被系统标成陈旧。
+int32_t ryLiveActivityTouch(void);
+
+/// 清扫上一个进程残留的活动（用户强杀 App 后灵动岛不消失的补救），App 启动时调一次。
+/// 返回清掉的个数。
+int32_t ryLiveActivitySweep(void);
+
 #endif
