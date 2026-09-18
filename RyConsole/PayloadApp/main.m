@@ -200,16 +200,49 @@ static NSString *appInfoStr(void) {
 }
 static int getPidInt(void) { return (int)getpid(); }
 
-// ===== V3 决定性原语: IOKit UserClient 打开 (沙盒可达性探针) =====
-// 返回: OPEN_OK / NOT_FOUND / OPEN_DENIED:<kr> / EXC:<reason>
-// 沙盒无对应 entitlement 时, IOServiceOpen 返回 kIOReturnNotPermitted(0xe00002e2)。
-// 若该 UserClient 的 newUserClient 不查 entitlement(如静态审计点名的 VCPDRM),
-// 沙盒 App 将得到 OPEN_OK —— 这正是 V3 要证实/证伪的。
-// --- V3 决定性原语集: 打开/调用/映射/关闭/枚举 IOKit UserClient ---
-// iokitOpen: 返回 io_connect_t (>=0 成功)；失败返回负 kr (如 -536870194 = 0xe00002e2 NotPermitted)，-2 = 未找到服务。
+#pragma mark - Bug6: 自解释错误（格式与 memRead 一致: "[<桥名> error] 参数名 + 合法范围"）
+// 目标：桥失败时，调用方（人或 AI）只看返回串就能改对参数，不必读源码猜签名。
+// 动因：iokitMap 曾对所有形态只回 {"ret":-536870206}（kIOReturnBadArgument），
+//       完全无法推断该传什么 —— 与 memRead 的自解释风格形成鲜明对比。
+static NSString *ryPrimErr(NSString *prim, NSString *why) {
+    return [NSString stringWithFormat:@"[%@ error] %@", prim, why ?: @"unknown"];
+}
+
+// errno → 名称 + 人话（sysctl / 文件类桥共用）
+static NSString *ryErrnoName(int e) {
+    switch (e) {
+        case ENOENT: return @"ENOENT 无此名字";
+        case EPERM:  return @"EPERM 权限不足（沙盒拒绝）";
+        case EACCES: return @"EACCES 拒绝访问";
+        case EINVAL: return @"EINVAL 名字或参数非法";
+        case EIO:    return @"EIO 底层 IO 错误";
+        case ENOMEM: return @"ENOMEM 内存不足";
+        case ENOTDIR:return @"ENOTDIR 路径中有非目录";
+        case EISDIR: return @"EISDIR 目标是目录";
+        default:     return nil;
+    }
+}
+
+// 句柄体检：把"连接已失效"与"参数形状不对"分开，避免两者都糊成 kIOReturnBadArgument
+static NSString *ryConnProblem(long conn) {
+    if (conn <= 0)
+        return [NSString stringWithFormat:
+                @"conn must be a handle from iokitOpen() (>0), got %ld；先 jbProbeIOKit('IOSurfaceRoot') 拿句柄", conn];
+    mach_port_type_t pt = 0;
+    if (mach_port_type(mach_task_self(), (mach_port_name_t)conn, &pt) != KERN_SUCCESS || pt == 0)
+        return [NSString stringWithFormat:
+                @"conn %ld 不是有效的 Mach send right（已 iokitClose，或服务被回收）", conn];
+    return nil;
+}
+
+// ===== V3 决定性原语: 打开/调用/映射/关闭/枚举 IOKit UserClient =====
+// iokitOpen: 返回 io_connect_t (>0 成功)；失败返回负值：
+//   -2 = 服务类不存在(名错)   -3 = 类名为空(参数错)   -9999 = 原生抛异常
+//   其它负值 = IOServiceOpen 的 kr（如 0xe00002e2 → -536870174 kIOReturnNotPermitted = 沙盒门禁）
 //   沙盒无对应 entitlement 时 IOServiceOpen 返回 kIOReturnNotPermitted；若该 UserClient 的 newUserClient
 //   不查 entitlement(如静态审计点名的 VCPDRM)，沙盒 App 将得到 >=0 的 conn —— 这正是 V3 要证实/证伪的。
 static long iokitOpenNative(NSString *className, int type) {
+    if (![className isKindOfClass:[NSString class]] || className.length == 0) return -3;
     @try {
         io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
                                                         IOServiceMatching([className UTF8String]));
@@ -224,38 +257,69 @@ static long iokitOpenNative(NSString *className, int type) {
     }
 }
 
-// IOConnectCallMethod 封装。inputs: NSArray<NSNumber> (最多16个uint64)；返回 {ret:kr, outputs:[...]}。
+// IOConnectCallMethod 封装。inputs: NSArray<NSNumber> (最多16个uint64)；返回 {ret:kr, outputs:[...], ok, error?}
+// Bug6：conn 先体检；inputs 里非数字项会被丢弃并在 note 里点名（旧版把它们当占位槽，形状静默变宽）
 static NSDictionary *iokitCallNative(long conn, uint32_t selector, NSArray *inputs) {
-    uint64_t in[16] = {0}; uint32_t inCnt = 0;
+    NSString *bad = ryConnProblem(conn);
+    if (bad) {
+        return @{@"ret":@((long)kIOReturnBadArgument), @"outputs":@[], @"ok":@NO,
+                 @"error":ryPrimErr(@"iokitCall", bad),
+                 @"hint":@"iokitCall(conn, selector, inputs): conn = iokitOpen() 句柄；selector = uint32；inputs = 数字数组(≤16)"};
+    }
+    if (inputs != nil && ![inputs isKindOfClass:[NSArray class]])
+        return @{@"ret":@((long)kIOReturnBadArgument), @"outputs":@[], @"ok":@NO,
+                 @"error":ryPrimErr(@"iokitCall", @"inputs must be an array of numbers (可省略/空数组)")};
+    uint64_t in[16] = {0}; uint32_t inCnt = 0; NSUInteger dropped = 0, overflow = 0;
     if ([inputs isKindOfClass:[NSArray class]]) {
-        for (NSUInteger i = 0; i < inputs.count && i < 16; i++) {
+        for (NSUInteger i = 0; i < inputs.count; i++) {
             id v = inputs[i];
-            if ([v isKindOfClass:[NSNumber class]]) in[i] = [v unsignedLongLongValue];
-            inCnt++;
+            if (![v isKindOfClass:[NSNumber class]]) { dropped++; continue; }
+            if (inCnt >= 16) { overflow++; continue; }
+            in[inCnt++] = [v unsignedLongLongValue];
         }
     }
     uint64_t out[16] = {0}; uint32_t outCnt = 16;
     kern_return_t kr = IOConnectCallMethod((io_connect_t)conn, selector, in, inCnt, NULL, 0, out, &outCnt, NULL, NULL);
     NSMutableArray *oa = [NSMutableArray arrayWithCapacity:outCnt];
     for (uint32_t i = 0; i < outCnt; i++) [oa addObject:@(out[i])];
-    return @{@"ret":@((long)kr), @"outputs":oa};
+    NSMutableDictionary *res = [@{@"ret":@((long)kr), @"outputs":oa, @"inCount":@(inCnt),
+                                  @"ok":@(kr == KERN_SUCCESS)} mutableCopy];
+    if (dropped || overflow)
+        res[@"note"] = [NSString stringWithFormat:@"inputs 有 %lu 个非数字项被忽略%s（标量输入上限 16）",
+                        (unsigned long)dropped, overflow ? "，并有超出 16 的项被丢弃" : ""];
+    return res;
 }
 
 // IOConnectCallMethod 封装（struct 变体）：在标量输入基础上额外接受 inputStruct 字节块，
 // 返回标量输出 + struct 输出（base64）。这是 V3 (b) 的关键 —— 旧版 iokitCallNative 把
 // inputStruct/OOL 实参传 NULL，打不动需要 OSData/结构化输入的 IOExternalMethod 方法。
 static NSDictionary *iokitCallStructNative(long conn, uint32_t selector, NSArray *scalarInputs, NSData *structInput, NSUInteger outStructSize) {
-    uint64_t in[16] = {0}; uint32_t inCnt = 0;
+    NSString *bad = ryConnProblem(conn);
+    if (bad) {
+        return @{@"ret":@((long)kIOReturnBadArgument), @"outputs":@[], @"ok":@NO, @"outStructSize":@0,
+                 @"error":ryPrimErr(@"iokitCallStruct", bad),
+                 @"hint":@"iokitCallStruct(conn, selector, scalarInputs, structB64, outSize): outSize 合法范围 1..65536（0/超界会被按 4096 兜底）"};
+    }
+    NSMutableArray *notes = [NSMutableArray array];
+    uint64_t in[16] = {0}; uint32_t inCnt = 0; NSUInteger dropped = 0;
+    if (scalarInputs != nil && ![scalarInputs isKindOfClass:[NSArray class]])
+        return @{@"ret":@((long)kIOReturnBadArgument), @"outputs":@[], @"ok":@NO, @"outStructSize":@0,
+                 @"error":ryPrimErr(@"iokitCallStruct", @"scalarInputs must be an array of numbers (可省略)")};
     if ([scalarInputs isKindOfClass:[NSArray class]]) {
-        for (NSUInteger i = 0; i < scalarInputs.count && i < 16; i++) {
+        for (NSUInteger i = 0; i < scalarInputs.count; i++) {
             id v = scalarInputs[i];
-            if ([v isKindOfClass:[NSNumber class]]) in[i] = [v unsignedLongLongValue];
-            inCnt++;
+            if (![v isKindOfClass:[NSNumber class]]) { dropped++; continue; }
+            if (inCnt >= 16) { dropped++; continue; }
+            in[inCnt++] = [v unsignedLongLongValue];
         }
     }
+    if (dropped) [notes addObject:[NSString stringWithFormat:@"scalarInputs 有 %lu 项被忽略（非数字 / 超过 16）", (unsigned long)dropped]];
     const void *inStruct = (structInput && structInput.length) ? structInput.bytes : NULL;
     size_t inStructSize = structInput ? structInput.length : 0;
-    if (outStructSize == 0 || outStructSize > 65536) outStructSize = 4096;
+    if (outStructSize == 0 || outStructSize > 65536) {
+        [notes addObject:[NSString stringWithFormat:@"outSize 收到 %lu，超出合法范围 1..65536 → 已按 4096 兜底", (unsigned long)outStructSize]];
+        outStructSize = 4096;
+    }
     NSMutableData *outStruct = [NSMutableData dataWithLength:outStructSize];
     uint64_t out[16] = {0}; uint32_t outCnt = 16;
     size_t outStructUsed = outStructSize;
@@ -273,7 +337,7 @@ static NSDictionary *iokitCallStructNative(long conn, uint32_t selector, NSArray
     }
     NSMutableArray *oa = [NSMutableArray arrayWithCapacity:outCnt];
     for (uint32_t i = 0; i < outCnt; i++) [oa addObject:@(out[i])];
-    NSMutableDictionary *res = [@{@"ret":@((long)kr), @"outputs":oa} mutableCopy];
+    NSMutableDictionary *res = [@{@"ret":@((long)kr), @"outputs":oa, @"ok":@(kr == KERN_SUCCESS)} mutableCopy];
     // 修复：仅 kr==kIOReturnSuccess 且确有输出字节时才回填 struct 输出，
     // 避免失败时把默认 4096 缓冲误报为"有输出"（测量噪声，会使 hasOutStruct 信号失真）
     if (kr == kIOReturnSuccess && outStructUsed > 0 && outStructUsed <= outStructSize) {
@@ -283,6 +347,7 @@ static NSDictionary *iokitCallStructNative(long conn, uint32_t selector, NSArray
     } else {
         res[@"outStructSize"] = @(0);
     }
+    if (notes.count) res[@"note"] = [notes componentsJoinedByString:@"；"];
     return res;
 }
 
@@ -308,12 +373,27 @@ static NSArray *b64ToBytes(NSString *b64) {
     return a;
 }
 
-// IOConnectMapMemory64 封装。返回 {ret:kr} 或 {ret, addr, size}。
+// IOConnectMapMemory64 封装。成功: {ret:0, ok, addr, size}
+// 失败: {ret:kr, ok:NO, error:"[iokitMap error] …", hint:"…"} —— 不再只回一个裸 kr
 static NSDictionary *iokitMapNative(long conn, uint32_t memType) {
+    NSString *bad = ryConnProblem(conn);
+    if (bad) {
+        return @{@"ret":@((long)kIOReturnBadArgument), @"ok":@NO,
+                 @"error":ryPrimErr(@"iokitMap", bad),
+                 @"hint":@"iokitMap(conn, memType): conn = iokitOpen() 的句柄(>0)；memType = uint32(常见 0..15)"};
+    }
     mach_vm_address_t addr = 0; mach_vm_size_t size = 0;
     kern_return_t kr = IOConnectMapMemory64((io_connect_t)conn, memType, mach_task_self(), &addr, &size, kIOMapAnywhere);
-    if (kr != KERN_SUCCESS) return @{@"ret":@((long)kr)};
-    return @{@"ret":@((long)kr), @"addr":@((unsigned long long)addr), @"size":@((unsigned long long)size)};
+    if (kr != KERN_SUCCESS) {
+        return @{@"ret":@((long)kr), @"ok":@NO, @"conn":@(conn), @"memType":@(memType),
+                 @"error":[NSString stringWithFormat:
+                           @"[iokitMap error] IOConnectMapMemory64 kr=0x%08x (memType=%u 被拒)",
+                           (uint32_t)kr, memType],
+                 @"hint":@"该 UserClient 多半没为这个 memType 实现 clientMemoryForType；先跑 iokitMapTry(conn) 扫 0..15，"
+                         @"全 BadArgument 就换路径（IOSurface 不必 map，直接 IOSurfaceGetBaseAddress）"};
+    }
+    return @{@"ret":@((long)kr), @"ok":@YES, @"addr":@((unsigned long long)addr),
+             @"size":@((unsigned long long)size), @"memType":@(memType)};
 }
 
 static long iokitCloseNative(long conn) {
@@ -342,23 +422,34 @@ static NSArray *iokitEnumNative(void) {
     return [classes allObjects];
 }
 
-// 读 sysctl (by name)。字符串型返回 NSString，整数型返回 NSNumber，错误返回 "<sysctl err N>"。
+// 读 sysctl (by name)。字符串型返回 NSString，整数型返回 NSNumber。
+// 失败返回 "[sysctlGet error] 名字/errno 说明"（Bug6：不再只回 "<sysctl err N>"）。
 // 关键用途: kern.bootargs(看 AMFI/sandbox 例外痕迹) / kern.version(内核版本) / hw.*。
 static id sysctlGetNative(NSString *name) {
-    if (!name) return @"";
+    if (![name isKindOfClass:[NSString class]] || name.length == 0)
+        return ryPrimErr(@"sysctlGet", @"name must be a non-empty string, e.g. \"kern.version\" / \"kern.bootargs\" / \"hw.memsize\"");
     const char *cname = [name UTF8String];
     size_t len = 0;
     if (sysctlbyname(cname, NULL, &len, NULL, 0) != 0) {
+        int e0 = errno;
         long long lval = 0; size_t llen = sizeof(lval);
         if (sysctlbyname(cname, &lval, &llen, NULL, 0) == 0) return @(lval);
         int ival = 0; size_t ilen = sizeof(ival);
         if (sysctlbyname(cname, &ival, &ilen, NULL, 0) == 0) return @(ival);
-        return [NSString stringWithFormat:@"<sysctl err %d>", errno];
+        NSString *why = ryErrnoName(e0);
+        return ryPrimErr(@"sysctlGet", [NSString stringWithFormat:
+                @"unknown name \"%@\" (errno %d%@); 名字必须真实存在，可用 sysctlGet(\"kern.version\") 先验证桥通不通",
+                name, e0, why ? [@" " stringByAppendingString:why] : @""]);
     }
-    if (len == 0) return @"";
+    if (len == 0)
+        return ryPrimErr(@"sysctlGet", [NSString stringWithFormat:@"\"%@\" 存在但长度为 0（无可读值）", name]);
     NSMutableData *buf = [NSMutableData dataWithLength:len];
-    if (sysctlbyname(cname, [buf mutableBytes], &len, NULL, 0) != 0)
-        return [NSString stringWithFormat:@"<sysctl read err %d>", errno];
+    if (sysctlbyname(cname, [buf mutableBytes], &len, NULL, 0) != 0) {
+        int e1 = errno;
+        NSString *why = ryErrnoName(e1);
+        return ryPrimErr(@"sysctlGet", [NSString stringWithFormat:@"读 \"%@\" 失败 (errno %d%@)", name, e1,
+                                        why ? [@" " stringByAppendingString:why] : @""]);
+    }
     char *c = (char *)[buf mutableBytes];
     BOOL printable = YES;
     for (size_t i = 0; i + 1 < len; i++) {
@@ -423,7 +514,8 @@ static NSString *iosurfaceProbeStr(void) {
         if (m) { memset(m, 0xAB, 4*4*4); [s appendString:@"MAP_OK baseWritable=YES\n"]; }
         CFRelease(surf);
     } else {
-        [s appendString:@"CREATE_FAILED\n"];
+        [s appendFormat:@"CREATE_FAILED %@\n",
+              ryPrimErr(@"iosurfaceProbe", @"IOSurfaceCreate 返回 NULL；探针写死的 props 为 {Width:4,Height:4,BytesPerElement:4,BytesPerRow:16}，失败说明本进程拿不到 IOSurface（沙盒/框架不可用），不是参数问题")];
     }
     return s;
 }
@@ -433,24 +525,31 @@ static NSString *iosurfaceProbeStr(void) {
 static NSMutableDictionary<NSNumber*, id> *gSurfRegistry = nil;
 static int gSurfNextHandle = 1;
 
-static NSNumber *iosurfaceCreateNative(NSDictionary *props) {
+// 返回：>0 持久句柄；失败返回 "[iosurfaceCreate error] …" 字符串（Bug6：原来只回 -1，看不出是哪种参数错）
+static id iosurfaceCreateNative(NSDictionary *props) {
+    if (props != nil && ![props isKindOfClass:[NSDictionary class]])
+        return ryPrimErr(@"iosurfaceCreate", @"props must be an object (省略也行)，键示例 {IOSurfaceWidth:4, IOSurfaceHeight:4, IOSurfaceBytesPerElement:4}");
     if (!gSurfRegistry) gSurfRegistry = [NSMutableDictionary dictionary];
     IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)(props ?: @{}));
-    if (!surf) return @(-1);
+    if (!surf)
+        return ryPrimErr(@"iosurfaceCreate", @"IOSurfaceCreate 返回 NULL —— props 缺必需键或值非法；"
+                         @"最小可用集 {IOSurfaceWidth:4, IOSurfaceHeight:4, IOSurfaceBytesPerElement:4, IOSurfaceBytesPerRow:16}");
     NSNumber *h = @(gSurfNextHandle++);
     gSurfRegistry[h] = (__bridge_transfer id)surf; // ARC 接管所有权, 安全持有
     return h;
 }
-static NSNumber *iosurfaceGetIDNative(NSNumber *handle) {
-    if (!gSurfRegistry) return @(-1);
+static id iosurfaceGetIDNative(NSNumber *handle) {
+    if (!gSurfRegistry) return ryPrimErr(@"iosurfaceGetID", @"本进程还没创建过任何 surface（注册表为空），先 iosurfaceCreate(props)");
     IOSurfaceRef surf = (__bridge IOSurfaceRef)(gSurfRegistry[handle]);
-    if (!surf) return @(-1);
+    if (!surf) return ryPrimErr(@"iosurfaceGetID", [NSString stringWithFormat:
+                        @"unknown handle %@；句柄由 iosurfaceCreate()/iosurfaceLookup() 返回（本进程内有效，重启即失效）", handle]);
     return @((unsigned int)IOSurfaceGetID(surf));
 }
 static NSString *iosurfaceSetValueNative(NSNumber *handle, NSString *key, NSString *value) {
-    if (!gSurfRegistry) return @"[set] no registry";
+    if (!gSurfRegistry) return ryPrimErr(@"iosurfaceSetValue", @"本进程还没创建过任何 surface，先 iosurfaceCreate(props)");
     IOSurfaceRef surf = (__bridge IOSurfaceRef)(gSurfRegistry[handle]);
-    if (!surf) return @"[set] no surface";
+    if (!surf) return ryPrimErr(@"iosurfaceSetValue", [NSString stringWithFormat:
+                        @"unknown handle %@（句柄来自 iosurfaceCreate()/iosurfaceLookup()）", handle]);
     NSString *k = key.length ? key : @"k";
     // 支持 base64 -> CFData (构造大/畸形值), 否则 CFString
     NSData *d = [[NSData alloc] initWithBase64EncodedString:(value?:@"") options:0];
@@ -460,12 +559,13 @@ static NSString *iosurfaceSetValueNative(NSNumber *handle, NSString *key, NSStri
     return @"[set] ok";
 }
 static NSString *iosurfaceGetValueNative(NSNumber *handle, NSString *key) {
-    if (!gSurfRegistry) return @"[get] no registry";
+    if (!gSurfRegistry) return ryPrimErr(@"iosurfaceGetValue", @"本进程还没创建过任何 surface，先 iosurfaceCreate(props)");
     IOSurfaceRef surf = (__bridge IOSurfaceRef)(gSurfRegistry[handle]);
-    if (!surf) return @"[get] no surface";
+    if (!surf) return ryPrimErr(@"iosurfaceGetValue", [NSString stringWithFormat:
+                        @"unknown handle %@（句柄来自 iosurfaceCreate()/iosurfaceLookup()）", handle]);
     NSString *k = key.length ? key : @"k";
     CFTypeRef v = IOSurfaceCopyValue(surf, (__bridge CFStringRef)k);
-    if (!v) return @"[get] nil";
+    if (!v) return [NSString stringWithFormat:@"[get] key \"%@\" 不存在（不是错误；surface 上没有这个属性）", k];
     NSString *desc;
     if (CFGetTypeID(v) == CFDataGetTypeID()) {
         desc = [NSString stringWithFormat:@"<CFData len=%lu>", (unsigned long)CFDataGetLength((CFDataRef)v)];
@@ -476,14 +576,17 @@ static NSString *iosurfaceGetValueNative(NSNumber *handle, NSString *key) {
     return desc ?: @"[get] ?";
 }
 static NSString *iosurfaceReleaseNative(NSNumber *handle) {
-    if (!gSurfRegistry) return @"[release] no registry";
-    if (!gSurfRegistry[handle]) return @"[release] no surface";
+    if (!gSurfRegistry) return ryPrimErr(@"iosurfaceRelease", @"本进程还没创建过任何 surface，先 iosurfaceCreate(props)");
+    if (!gSurfRegistry[handle]) return ryPrimErr(@"iosurfaceRelease", [NSString stringWithFormat:
+                        @"unknown handle %@；可能已 release 过（重复 release 是唯一会让句柄消失的情形）", handle]);
     [gSurfRegistry removeObjectForKey:handle]; // ARC 释放 -> CFRelease surface
     return @"[release] ok";
 }
-static NSNumber *iosurfaceLookupNative(NSNumber *cid) {
+static id iosurfaceLookupNative(NSNumber *cid) {
     IOSurfaceRef surf = IOSurfaceLookup((unsigned int)[cid unsignedIntValue]);
-    if (!surf) return @(-1);
+    if (!surf) return ryPrimErr(@"iosurfaceLookup", [NSString stringWithFormat:
+                        @"IOSurfaceLookup(%u) 返回 NULL；cid 必须是**本机当前活着**的 surface id（IOSurfaceGetID 来的 uint32），跨进程/已释放的 id 查不到",
+                        (unsigned int)[cid unsignedIntValue]]);
     if (!gSurfRegistry) gSurfRegistry = [NSMutableDictionary dictionary];
     NSNumber *h = @(gSurfNextHandle++);
     gSurfRegistry[h] = (__bridge_transfer id)surf;
