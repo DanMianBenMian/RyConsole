@@ -12,6 +12,7 @@
 //
 
 #import "AutorunServer.h"
+#import "KeepAlive.h"
 
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -221,8 +222,12 @@ static void rySendAll(int fd, NSData *data) {
     self.port = port;
     self.running = YES;
 
+    // 监听开始 → 进入后台保活（静音音频 + 后台任务续期），App 退到后台也不会被挂起
+    [[RYKeepAlive shared] begin:@"autorun"];
+
     [self logLine:[NSString stringWithFormat:@"Autorun 已启动 · 端口 %d · 本机 %@，电脑端连 http://%@:%d/ping",
                    port, ryLANAddress(), ryLANAddress(), port]];
+    [self logLine:[[RYKeepAlive shared] statusLine]];
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         [self acceptLoop];
@@ -239,7 +244,10 @@ static void rySendAll(int fd, NSData *data) {
         close(self.listenFd);
         self.listenFd = -1;
     }
+    // 监听停止 → 立刻释放保活（音频/后台任务全关，不做后台偷跑）
+    [[RYKeepAlive shared] end];
     [self logLine:@"Autorun 已停止"];
+    [self logLine:[[RYKeepAlive shared] statusLine]];
     return @"OK:stopped";
 }
 
@@ -608,7 +616,7 @@ static void rySendAll(int fd, NSData *data) {
     [self.toggleBtn setTitle:(s.running ? @"停止" : @"启动") forState:UIControlStateNormal];
     self.hintLabel.text = [NSString stringWithFormat:
         @"%@\n电脑端连：http://%@:%d/ping",
-        s.running ? @"● 正在监听（App 需保持前台）" : @"○ 未启动",
+        s.running ? @"● 正在监听 · 后台保活已开（可切后台/锁屏）" : @"○ 未启动",
         ryLANAddress(), s.running ? s.port : RY_DEFAULT_PORT];
 }
 
