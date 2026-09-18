@@ -1033,6 +1033,22 @@ static NSString *memReadNative(NSString *hex, NSNumber *lenN) {
 static NSString *objcMsgSendSafeNative(id recvArg, NSString *selName, NSArray *args) {
     uintptr_t rp = objcHexToPtr(recvArg);
     if (!rp) return @"{\"ok\":false,\"error\":\"null receiver\"}";
+    // ★ 接收方体检（V2.2.7）：垃圾指针发消息必 SIGSEGV（@try 拦不住信号级崩溃）。
+    //   先用 vm_read 探一下接收方前 16 字节可不可读 —— 不可读就直接给结构化错误，
+    //   而不是让 objc_msgSend 去解引用 isa 当场崩掉。（安全测试 Agent 实测踩过：给 x0 垃圾对象发消息）
+    //   只探"长得像堆指针"的：奇数地址 / 高位非 0 可能是 tagged pointer（不是真实内存），别误杀。
+    if (((rp & 0x1ULL) == 0) && ((rp >> 47) == 0) && (rp > 0x1000ULL)) {
+        vm_offset_t probe = 0; mach_msg_type_number_t pc = 0;
+        kern_return_t kr = vm_read(mach_task_self(), (mach_vm_address_t)rp, 16, &probe, &pc);
+        if (kr != KERN_SUCCESS) {
+            if (probe) vm_deallocate(mach_task_self(), probe, (vm_size_t)pc);
+            return [NSString stringWithFormat:
+                    @"{\"ok\":false,\"error\":\"receiver 0x%llx 不可读 (vm_read kr=0x%x) —— 垃圾/野指针，消息未发送\""
+                     @",\"hint\":\"先用 memRead 验证这块内存可读且确是对象（objcDesc 体检更好），再发消息\"}",
+                    (unsigned long long)rp, (unsigned int)kr];
+        }
+        if (probe) vm_deallocate(mach_task_self(), probe, (vm_size_t)pc);
+    }
     id recv = (__bridge id)(void *)rp;
     if (![selName isKindOfClass:[NSString class]] || !selName.length)
         return @"{\"ok\":false,\"error\":\"bad selector\"}";
@@ -1550,17 +1566,20 @@ static char gGuardLastPrim[128] = {0};
 
 // 布/撤检查点。★ 必须**在本层栈帧**里 sigsetjmp：
 //   放到 helper 里再返回 = longjmp 回到一个已返回的帧 → 跳进已被覆盖的栈内存 → 二次崩。
+//   ★★ sigsetjmp 会"返回两次"（正常路径 0、从信号跳回信号号）—— 撤点必须**只在跳回分支**做。
+//      写在 sigsetjmp 之后无条件执行的话，正常路径把刚布的点立刻撤掉 → 兜底永远不触发。
+//      （V2.2.6 真机日志实证过这个坑：处理器跑了、日志写了，但 gGuardArmed 已是 0 → 走了真崩老路。）
 //   返回 0 = 正常进入；非 0 = 刚从信号里跳回来（值 = 信号号）
-#define RY_GUARD_ARM(dst)                                   \
-    do {                                                    \
-        (dst) = 0;                                          \
-        if (gGuardEnabled) {                                \
-            gGuardInHandler = 0;   /* 新一次执行：允许再兜 */ \
-            gGuardThread = (uintptr_t)pthread_self();       \
-            gGuardArmed = 1;                                \
+#define RY_GUARD_ARM(dst)                                            \
+    do {                                                             \
+        (dst) = 0;                                                   \
+        if (gGuardEnabled) {                                         \
+            gGuardInHandler = 0;   /* 新一次执行：允许再兜 */          \
+            gGuardThread = (uintptr_t)pthread_self();                \
+            gGuardArmed = 1;                                         \
             (dst) = sigsetjmp(gGuardJmp, 1);  /* 1 = 连信号掩码一起存/恢复 */ \
-            gGuardArmed = 0;                                \
-        }                                                   \
+            if ((dst) != 0) gGuardArmed = 0;  /* 仅跳回时撤；正常执行期间保持布防 */ \
+        }                                                            \
     } while (0)
 #define RY_GUARD_DISARM() do { gGuardArmed = 0; gGuardThread = 0; } while (0)
 
