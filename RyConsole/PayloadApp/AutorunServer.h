@@ -62,3 +62,16 @@ void RYAutorunObserve(void (^cb)(void));
 
 // 清空日志与最近结果
 void RYAutorunClear(void);
+
+// ==================== 崩溃定位：最近调用的原生原语 ====================
+//
+// 背景：真机 SIGSEGV 时我们只能从崩溃栈拿到一个 block 序号
+//       （__installPrimitives_block_invoke_N），反查源码极易错位（已踩过）。
+// 做法：installPrimitives 末尾在 JS 侧给每个原语套一层"登记"包装，调用即记名；
+//       崩溃日志里直接用 lastPrim 点名是哪个原语崩的。
+//
+//   RYNotePrimitive —— 由 JS 层包装调用（走 __ry_note 原语）
+//   RYLastPrimitive —— 读当前记录（崩溃处理器 / /ping 状态里用）
+//      ⚠️ 实现用的是**无锁 char 数组**：必须在信号处理器里也能安全读（只用 write/snprintf）。
+void RYNotePrimitive(const char *name);
+const char *RYLastPrimitive(void);
