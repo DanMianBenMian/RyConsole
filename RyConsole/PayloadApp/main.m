@@ -1377,7 +1377,21 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
                 return (r&&![r isUndefined])?[r description]:@"(loaded)";
             };
 
-            
+            // ---- 崩溃定位：登记"最后调用的原语"（见 RYNotePrimitive 注释）----
+            ctx[@"__ry_note"]=^BOOL(NSString *n){ RYNotePrimitive([n UTF8String]); return YES; };
+
+            // 给所有原生原语套一层"点名"包装。
+            //   · 跳过 __ry_* 自身、跳过 print（print 调用太频繁，会把真正的凶手冲掉）
+            //   · 只包函数，其它类型（对象/常量）原样不动
+            //   · 用 (function(n,fn){...}) 闭包逐层绑定名字，不能用 for 里的 k（闭包共享变量坑）
+            [ctx evaluateScript:
+                @"(function(){var g=this;var keys=Object.keys(g);for(var i=0;i<keys.length;i++){"
+                @"var k=keys[i];"
+                @"if(k==='__ry_note'||k==='print'||k.indexOf('__ry_')===0)continue;"
+                @"var f=g[k];"
+                @"if(typeof f!=='function')continue;"
+                @"g[k]=(function(n,fn){return function(){try{__ry_note(n);}catch(e){}return fn.apply(this,arguments);};})(k,f);"
+                @"}})();"];
 }
 
 // ---- 执行用户代码（流式输出，立即跳转输出页；UI 锁死，异常不崩 App）----
@@ -1441,6 +1455,27 @@ static void RunCode(UIViewController *from, NSString *code) {
 // ---- Autorun 专用：独立 ctx 执行用户代码并捕获输出，返回 JSON ----
 // 与 RunCode 的区别：①print 不写 UI，而是收进数组回传；②异常/返回值都结构化
 // 注意：本函数由 Autorun 的连接线程调用（与 RunCode 一样跑在后台线程），不碰主线程。
+// 把 JS 异常整理成可读文本（Bug 3）：name + message + stack 前 20 行。
+// 以前只丢一行 description，调用方看不出是 SyntaxError 还是 TypeError、也拿不到行号。
+static NSString *rycExceptionText(JSValue *e, NSString *stage) {
+    if (e == nil) return [NSString stringWithFormat:@"[%@] (nil exception)", stage ?: @"JS"];
+    JSValue *nv = [e objectForKeyedSubscript:@"name"];
+    JSValue *mv = [e objectForKeyedSubscript:@"message"];
+    JSValue *sv = [e objectForKeyedSubscript:@"stack"];
+    NSString *nm  = (nv && ![nv isUndefined] && ![nv isNull]) ? [nv toString] : nil;
+    NSString *msg = (mv && ![mv isUndefined] && ![mv isNull]) ? [mv toString] : nil;
+    NSString *stk = (sv && ![sv isUndefined] && ![sv isNull]) ? [sv toString] : nil;
+    if (nm.length == 0)  nm  = @"Error";
+    if (msg.length == 0) msg = [e description] ?: @"?";
+    NSMutableString *out = [NSMutableString stringWithFormat:@"[%@ %@] %@", stage ?: @"JS", nm, msg];
+    if (stk.length) {
+        NSArray *lines = [stk componentsSeparatedByString:@"\n"];
+        NSUInteger n = MIN(lines.count, (NSUInteger)20);
+        for (NSUInteger i = 0; i < n; i++) [out appendFormat:@"\n    %@", lines[i]];
+    }
+    return out;
+}
+
 // ---- 通用流式执行器（Terminal / Autorun 共用同一条执行路径）----
 void RYExecStream(NSString *code, void (^onLine)(NSString *line),
                   void (^onDone)(NSString *result, NSString *error, double ms)) {
@@ -1448,8 +1483,9 @@ void RYExecStream(NSString *code, void (^onLine)(NSString *line),
     NSMutableArray *errs = [NSMutableArray array];
 
     JSContext *ctx = [[JSContext alloc] init];
+    // Bug 3 修复：异常要带 name / message / stack 前 20 行，别只给一行 description
     ctx.exceptionHandler = ^(JSContext *c, JSValue *e) {
-        NSString *m = [NSString stringWithFormat:@"[JS Error] %@", [e description] ?: @"?"];
+        NSString *m = rycExceptionText(e, @"JS");
         [errs addObject:m];
         if (onLine) onLine(m);
     };
@@ -1476,7 +1512,7 @@ void RYExecStream(NSString *code, void (^onLine)(NSString *line),
     } @catch (NSException *e) {
         err = [NSString stringWithFormat:@"%@: %@", e.name, e.reason];
     }
-    if (ctx.exception && ctx.exception != nil) err = [ctx.exception description];
+    if (ctx.exception && ctx.exception != nil) err = rycExceptionText(ctx.exception, @"JS");
     if (err == nil && errs.count > 0) err = [errs componentsJoinedByString:@"\n"];
 
     double ms = ([[NSDate date] timeIntervalSince1970] - t0) * 1000.0;
@@ -2118,6 +2154,20 @@ void RYResourceManagerRefresh(UIViewController *vc) {
 // ============================================================
 static int ryCrashFd = -1;
 
+// 「最后调用的原语」：installPrimitives 在 JS 侧给每个原语套了登记包装（见 __ry_note），
+// 每次调用都会写这个 **无锁 char 数组** —— 这样信号处理器里也能安全读（只用 snprintf/write）。
+// 崩溃日志里直接点名是哪个原语崩的，省掉"从 block 序号反查源码"那套不可靠操作。
+static char gLastPrim[128] = {0};
+
+void RYNotePrimitive(const char *name) {
+    if (name == NULL) return;
+    strlcpy(gLastPrim, name, sizeof(gLastPrim));
+}
+
+const char *RYLastPrimitive(void) {
+    return gLastPrim[0] ? gLastPrim : "(none)";
+}
+
 static void ryCrashWrite(const char *s, size_t n) {
     if (ryCrashFd >= 0 && s && n) { ssize_t _ = write(ryCrashFd, s, n); (void)_; }
 }
@@ -2131,6 +2181,7 @@ static void ryCrashLog(NSString *s) {
 static void ryUncaughtExceptionHandler(NSException *e) {
     NSMutableString *m = [NSMutableString string];
     [m appendFormat:@"\n==== RyConsole 未捕获异常 @ %@ ====\n", [NSDate date]];
+    [m appendFormat:@"lastPrim: %s\n", RYLastPrimitive()];      // ★ 直接点名刚才在跑哪个原语
     [m appendFormat:@"name   : %@\nreason : %@\n", e.name, e.reason];
     [m appendString:@"userInfo:\n"];
     [m appendFormat:@"  %@\n", e.userInfo];
@@ -2142,8 +2193,10 @@ static void ryUncaughtExceptionHandler(NSException *e) {
 
 // 信号处理里只允许 async-signal-safe 调用：纯 write / snprintf / backtrace_symbols_fd，**不碰 ObjC**
 static void rySignalHandler(int sig) {
-    char buf[160];
-    int n = snprintf(buf, sizeof(buf), "\n==== RyConsole 收到信号 %d（%s）====\n", sig, strsignal(sig));
+    char buf[288];
+    // ★ lastPrim：崩溃时正在执行哪个 JS 原语（只读无锁 char 数组 + write，信号安全）
+    int n = snprintf(buf, sizeof(buf), "\n==== RyConsole 收到信号 %d（%s） lastPrim=%s ====\n",
+                     sig, strsignal(sig), RYLastPrimitive());
     if (n > 0) ryCrashWrite(buf, (size_t)n);
     void *bt[64];
     int frames = backtrace(bt, 64);
