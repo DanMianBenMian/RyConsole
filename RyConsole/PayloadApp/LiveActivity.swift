@@ -31,6 +31,11 @@ final class RYLiveActivityManager {
     private var peer = ""
     private var startedAt = Date()
 
+    /// 活动「保鲜期」。监听期间由保活脉冲定期 touch（见 KeepAlive.pulseOnce）；
+    /// 一旦 App 被强杀（强杀没有回调可走），超时后系统会把活动标成 stale（变灰），
+    /// 下次打开 RyConsole 再由 sweep 清掉 —— 这是 iOS 允许的唯一"自动过期"表达。
+    private static let staleWindow: TimeInterval = 900
+
     var isActive: Bool { activity != nil }
 
     /// 开启"监听中"实时活动。已有则复用（可重入）。
@@ -51,8 +56,9 @@ final class RYLiveActivityManager {
         let attrs = RYListenAttributes(title: "RyConsole · Autorun")
         let state = RYListenAttributes.ContentState(port: port, hits: 0,
                                                     lastPeer: "", startedAt: startedAt)
-        // staleDate: nil = 不设过期（监听期间一直有效）；nil 的 pushType = 只由本 App 更新
-        let content = ActivityContent(state: state, staleDate: nil)
+        // pushType: nil = 只由本 App 更新；staleDate = 保鲜期（由保活脉冲续）
+        let content = ActivityContent(state: state,
+                                      staleDate: Date().addingTimeInterval(Self.staleWindow))
         do {
             activity = try Activity.request(attributes: attrs, content: content, pushType: nil)
             NSLog("[LiveActivity] 已启动 id=%@", activity?.id ?? "-")
@@ -63,14 +69,25 @@ final class RYLiveActivityManager {
         }
     }
 
-    /// 连接计数 + 最近来源变化时刷新。
-    func update(hits: Int, peer newPeer: String) {
-        self.hits = hits
+    /// 刷新活动内容。
+    /// - hits >= 0：连接计数更新
+    /// - hits <  0：**只续保鲜期**（保活脉冲用，数字不动）
+    func update(hits newHits: Int, peer newPeer: String) {
+        // 调用方可能是 Autorun 的网络线程（handleConnection）→ 统一回主线程改状态，
+        // 避免与保活脉冲/前台切换并发读写同一批字段。
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.update(hits: newHits, peer: newPeer)
+            }
+            return
+        }
+        if newHits >= 0 { self.hits = newHits }
         if !newPeer.isEmpty { self.peer = newPeer }
         guard let a = activity else { return }
         let state = RYListenAttributes.ContentState(port: port, hits: hits,
                                                     lastPeer: peer, startedAt: startedAt)
-        let content = ActivityContent(state: state, staleDate: nil)
+        let content = ActivityContent(state: state,
+                                      staleDate: Date().addingTimeInterval(Self.staleWindow))
         Task { await a.update(content) }
     }
 
@@ -82,6 +99,24 @@ final class RYLiveActivityManager {
                                                     lastPeer: peer, startedAt: startedAt)
         let content = ActivityContent(state: state, staleDate: Date())
         Task { await a.end(content, dismissalPolicy: .immediate) }
+    }
+
+    /// 清扫"上一个进程残留"的活动。
+    /// 场景：用户从后台把 App 划掉（强杀）→ 系统不会回调我们 → 灵动岛留在那儿。
+    /// 这里是唯一能补救的时机：**下次启动时**，如果本进程还没开始监听，就把系统里所有
+    /// 属于本 App 的活动全部结束掉（并立刻移除）。
+    /// - Returns: 清掉的数量
+    @discardableResult
+    func sweepOrphans() -> Int {
+        if activity != nil { return 0 }             // 本进程正在监听 → 不动
+        let orphans = Activity<RYListenAttributes>.activities
+        guard !orphans.isEmpty else { return 0 }
+        for a in orphans {
+            let content = ActivityContent(state: a.content.state, staleDate: Date())
+            Task { await a.end(content, dismissalPolicy: .immediate) }
+        }
+        NSLog("[LiveActivity] 清扫残留活动 %d 个", orphans.count)
+        return orphans.count
     }
 }
 
@@ -127,6 +162,26 @@ public func ryLiveActivityStop() -> Int32 {
     if #available(iOS 17.0, *) {
         RYLiveActivityManager.shared.stop()
         return 1
+    }
+    return 0
+}
+
+/// 只续保鲜期（数字不动）。保活脉冲定期调用，保证"App 还活着"期间活动永不 stale。
+@_cdecl("ryLiveActivityTouch")
+public func ryLiveActivityTouch() -> Int32 {
+    if #available(iOS 17.0, *) {
+        RYLiveActivityManager.shared.update(hits: -1, peer: "")
+        return 1
+    }
+    return 0
+}
+
+/// 清扫上次进程残留的活动（强杀后灵动岛不消失的补救）。App 启动时调用一次。
+/// - Returns: 清掉的个数
+@_cdecl("ryLiveActivitySweep")
+public func ryLiveActivitySweep() -> Int32 {
+    if #available(iOS 17.0, *) {
+        return Int32(RYLiveActivityManager.shared.sweepOrphans())
     }
     return 0
 }
