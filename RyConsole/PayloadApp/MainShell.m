@@ -728,7 +728,10 @@ static void ryScrollToBottom(UITextView *tv) {
     title.frame = CGRectMake(16.0f, 22.0f, kSidebarW - 32.0f, 18.0f);
     [self.sidebar addSubview:title];
 
-    UILabel *sub = ryLabel(@"v1.1 · 研究控制台", 10.5f, RY_MUTED, YES);
+    // ★ 版本号改从 Bundle 读（单一事实源 = project.yml 的 CFBundleShortVersionString）。
+    //   旧版这里硬编码 @"v1.1"，导致升到 V2.2.x 左上角仍显示 v1.1（用户 2026-09-19 实测报的）。
+    NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+    UILabel *sub = ryLabel([NSString stringWithFormat:@"v%@ · 研究控制台", appVer], 10.5f, RY_MUTED, YES);
     sub.tag = 8091;
     sub.frame = CGRectMake(16.0f, 42.0f, kSidebarW - 32.0f, 14.0f);
     [self.sidebar addSubview:sub];
