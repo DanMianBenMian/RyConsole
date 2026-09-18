@@ -26,10 +26,51 @@
 
 #define RY_DEFAULT_PORT   8899
 #define RY_MAX_LOG        400
-#define RY_MAX_JOBS       40
+#define RY_MAX_JOBS       60       // 上限（按时间清更优先，见下）
+#define RY_JOB_TTL        300.0    // 单个 job 保留秒数：≥ maxPolls×pollIntervalMs(36s) 的一倍多
 #define RY_DEFAULT_TIMEOUT 15000   // ms
 
 #pragma mark - 小工具
+
+// 会话前缀：让 job id 跨进程重启不复用旧语义（Bug 2：重启后 j1 与旧 j1 撞车）
+static NSString *rySessionTag(void) {
+    static NSString *tag = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        tag = [NSString stringWithFormat:@"%04x", arc4random_uniform(0x10000)];
+    });
+    return tag;
+}
+
+// form-urlencoded 取值 + **完整 percent-decode**（Bug 1）
+//  修的是这个坑：以前直接把 "code=%22a%22" 当 JS 执行 → SyntaxError，
+//  而且这段原始串还会显示在 App 的「收到的代码」里（用户看到一堆 code=... 乱码）。
+static NSString *ryFormValue(NSString *body, NSString *key) {
+    if (body.length == 0 || key.length == 0) return nil;
+    NSString *prefix = [key stringByAppendingString:@"="];
+    for (NSString *kv in [body componentsSeparatedByString:@"&"]) {
+        if (![kv hasPrefix:prefix]) continue;
+        NSString *raw = [kv substringFromIndex:prefix.length];
+        raw = [raw stringByReplacingOccurrencesOfString:@"+" withString:@" "];   // form 语义：+ 即空格
+        NSString *dec = [raw stringByRemovingPercentEncoding];                   // 按 UTF-8 解 %XX
+        return dec ? dec : raw;
+    }
+    return nil;
+}
+
+// 从请求头块里取某个头的值（大小写不敏感）
+static NSString *ryHeader(NSString *head, NSString *name) {
+    if (head.length == 0 || name.length == 0) return nil;
+    NSString *want = [[name lowercaseString] stringByAppendingString:@":"];
+    for (NSString *ln in [head componentsSeparatedByString:@"\r\n"]) {
+        NSString *low = [ln lowercaseString];
+        if ([low hasPrefix:want]) {
+            return [[ln substringFromIndex:want.length]
+                    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        }
+    }
+    return nil;
+}
 
 static NSString *ryStamp(void) {
     NSDateFormatter *f = [[NSDateFormatter alloc] init];
@@ -122,6 +163,7 @@ static void rySendAll(int fd, NSData *data) {
 @property (nonatomic, strong) NSMutableDictionary *lastResult;
 @property (nonatomic, copy)   NSString *peer;
 @property (nonatomic, strong) NSMutableArray *observers;   // 支持多个观察者（面板 + 侧栏）
+@property (nonatomic, strong) NSMutableArray *expiredJobs;   // 已过期的 job id（用于区分 expired / unknown）
 // 全部先声明：未先声明时 clang 会把参数当 id，ARC 下传标量(int)会直接报错
 - (void)notify;
 - (void)logLine:(NSString *)s;
@@ -157,6 +199,7 @@ static void rySendAll(int fd, NSData *data) {
         _lastResult = [NSMutableDictionary dictionaryWithObject:@"idle" forKey:@"status"];
         _peer = @"";
         _observers = [NSMutableArray array];
+        _expiredJobs = [NSMutableArray array];
     }
     return self;
 }
@@ -375,17 +418,28 @@ static void rySendAll(int fd, NSData *data) {
     if ([route isEqualToString:@"/result"]) {
         NSString *jid = nil;
         for (NSString *kv in [query componentsSeparatedByString:@"&"]) {
-            if ([kv hasPrefix:@"id="]) jid = [kv substringFromIndex:3];
+            if ([kv hasPrefix:@"id="]) {
+                NSString *v = [kv substringFromIndex:3];
+                jid = [v stringByRemovingPercentEncoding] ?: v;   // id 也解一下编码
+            }
         }
-        if (jid == nil) {
+        if (jid == nil || jid.length == 0) {
             rySendAll(cfd, ryHttpResponse(400, @"{\"ok\":false,\"error\":\"missing id\"}"));
             return;
         }
         [self.lock lock];
         NSDictionary *job = self.jobs[jid];
+        BOOL wasExpired = [self.expiredJobs containsObject:jid];
         [self.lock unlock];
         if (job == nil) {
-            rySendAll(cfd, ryHttpResponse(404, @"{\"ok\":false,\"error\":\"unknown job\"}"));
+            // Bug 2：区分「过期了」和「压根没这个 id」，都返回 200 + 明确错误码，
+            // 免得客户端只看到裸 404 猜不出原因。
+            NSString *err = wasExpired
+                ? [NSString stringWithFormat:@"{\"ok\":false,\"error\":\"job_expired\",\"id\":\"%@\","
+                   @"\"hint\":\"job 保留 %d 秒，请缩短轮询或改大间隔后重提\"}", jid, (int)RY_JOB_TTL]
+                : [NSString stringWithFormat:@"{\"ok\":false,\"error\":\"unknown_job\",\"id\":\"%@\","
+                   @"\"hint\":\"本进程没见过这个 id（服务重启过？id 带会话前缀）\"}", jid];
+            rySendAll(cfd, ryHttpResponse(200, err));
             return;
         }
         rySendAll(cfd, ryHttpResponse(200, [self jsonFrom:job]));
@@ -393,8 +447,29 @@ static void rySendAll(int fd, NSData *data) {
     }
 
     if ([route isEqualToString:@"/submit"] || [route isEqualToString:@"/eval"]) {
+        // ---- 取代码：支持三种 body 形态 ----
+        //   ① JSON  {"code":"..."}      ← 推荐
+        //   ② form  code=...            ← ★ Bug 1 修复：必须 percent-decode
+        //   ③ 裸 JS（整个 body 就是代码）← 兼容老客户端
         NSString *code = inJSON[@"code"];
-        if (code == nil) code = body;   // 容错：直接把 body 当代码
+        NSString *srcKind = @"json";
+        if (code == nil) {
+            NSString *ct = [ryHeader(head, @"content-type") lowercaseString] ?: @"";
+            BOOL looksForm = [body hasPrefix:@"code="] || [ct containsString:@"x-www-form-urlencoded"];
+            if (looksForm) {
+                code = ryFormValue(body, @"code");
+                srcKind = @"form";
+                if (code == nil) {
+                    rySendAll(cfd, ryHttpResponse(400,
+                        @"{\"ok\":false,\"error\":\"missing_code_field\","
+                        @"\"hint\":\"form body 里没有 code= 字段（要么字段名不对，要么没编码）\"}"));
+                    return;
+                }
+            } else {
+                code = body;
+                srcKind = @"raw";
+            }
+        }
         if (code == nil || code.length == 0) {
             rySendAll(cfd, ryHttpResponse(400, @"{\"ok\":false,\"error\":\"missing code\"}"));
             return;
@@ -403,9 +478,20 @@ static void rySendAll(int fd, NSData *data) {
         id t = inJSON[@"timeoutMs"];
         if ([t respondsToSelector:@selector(intValue)]) timeoutMs = [t intValue];
 
+        // Bug 4：/eval 是同步执行，同一时刻只能跑一个。忙时给明确 429，
+        // 别让第二个客户端干等或被断连（客户端报 RemoteDisconnected 多源于此）。
+        if ([route isEqualToString:@"/eval"] && self.busy) {
+            rySendAll(cfd, ryHttpResponse(429,
+                @"{\"ok\":false,\"error\":\"busy\",\"retryAfterMs\":1500,"
+                @"\"hint\":\"/eval 同步执行，上一个请求还没跑完；长任务请用 /submit + /result 轮询，"
+                @"或先 GET /ping 看 busy\"}"));
+            return;
+        }
+
         // 记录"本轮在跑什么"——UI 要显示收到的代码与回传状态
         self.lastCode = code;
         [self.lastResult setObject:@"running" forKey:@"status"];
+        [self.lastResult setObject:srcKind forKey:@"srcKind"];   // 便于排查"body 是怎么被解析的"
         [self.lastResult removeObjectForKey:@"ok"];
         [self.lastResult removeObjectForKey:@"output"];
         [self.lastResult removeObjectForKey:@"result"];
@@ -422,24 +508,49 @@ static void rySendAll(int fd, NSData *data) {
         }
 
         // /submit —— 异步
+        // Bug 2 修复：① 按时间（RY_JOB_TTL）优先清理，保证 ≥ 承诺的轮询窗口；
+        //             ② 被清掉的 id 记进 expiredJobs，之后查它返回 job_expired 而不是裸 404；
+        //             ③ id 带会话前缀，重启后不会和上一进程的 j1 混淆。
         [self.lock lock];
+        NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
+        NSMutableArray *dead = [NSMutableArray array];
+        for (NSString *k in [self.jobs allKeys]) {
+            double ts = [self.jobs[k][@"ts"] doubleValue];
+            if (ts > 0 && nowTs - ts > RY_JOB_TTL) [dead addObject:k];
+        }
+        for (NSString *k in dead) {
+            [self.jobs removeObjectForKey:k];
+            [self.expiredJobs addObject:k];
+        }
+        while (self.expiredJobs.count > 64) [self.expiredJobs removeObjectAtIndex:0];
+
+        if (self.jobs.count >= RY_MAX_JOBS) {   // 容量兜底：丢 ts 最老的
+            NSArray *sorted = [[self.jobs allKeys] sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+                double ta = [self.jobs[a][@"ts"] doubleValue], tb = [self.jobs[b][@"ts"] doubleValue];
+                return (ta < tb) ? NSOrderedAscending : ((ta > tb) ? NSOrderedDescending : NSOrderedSame);
+            }];
+            NSUInteger drop = self.jobs.count - RY_MAX_JOBS + 1;
+            for (NSUInteger i = 0; i < drop && i < sorted.count; i++) {
+                [self.jobs removeObjectForKey:sorted[i]];
+                [self.expiredJobs addObject:sorted[i]];
+            }
+        }
+
         self.jobSeq = self.jobSeq + 1;
-        NSString *jid = [NSString stringWithFormat:@"j%d", self.jobSeq];
+        NSString *jid = [NSString stringWithFormat:@"j%@-%d", rySessionTag(), self.jobSeq];
         NSMutableDictionary *job = [NSMutableDictionary dictionary];
         job[@"id"] = jid;
         job[@"status"] = @"running";
         job[@"codeLen"] = @(code.length);
+        job[@"srcKind"] = srcKind;
+        job[@"ts"] = @(nowTs);
         self.jobs[jid] = job;
-        if (self.jobs.count > RY_MAX_JOBS) {
-            NSArray *keys = [self.jobs allKeys];
-            for (NSUInteger i = 0; i + RY_MAX_JOBS < keys.count; i++) {
-                [self.jobs removeObjectForKey:keys[i]];
-            }
-        }
         [self.lock unlock];
 
+        // 承诺的轮询窗口必须小于服务端保留时间，这里把两者都摊开给客户端看
         NSString *accepted = [NSString stringWithFormat:
-            @"{\"ok\":true,\"id\":\"%@\",\"status\":\"accepted\",\"pollIntervalMs\":3000,\"maxPolls\":12}", jid];
+            @"{\"ok\":true,\"id\":\"%@\",\"status\":\"accepted\",\"pollIntervalMs\":3000,"
+            @"\"maxPolls\":12,\"jobTtlSec\":%d,\"srcKind\":\"%@\"}", jid, (int)RY_JOB_TTL, srcKind];
         rySendAll(cfd, ryHttpResponse(200, accepted));
 
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -531,15 +642,30 @@ static void rySendAll(int fd, NSData *data) {
 }
 
 - (NSString *)statusJSON {
+    // 电脑端只靠这一个接口判断"服务端真实状态"，所以把排查用的字段都摊开：
+    //   hits        = 累计连接数（灵动岛那个数字的服务端真值）
+    //   lastCodeLen = 服务端实际收到的代码长度（对照你发出去的长度，一眼看出 body 有没有被截断/误解码）
+    //   lastCodeHead= 收到的代码开头 120 字符（Bug 1 那类"body 没 decode"问题一望即知）
+    //   session     = 本进程会话前缀（job id 前缀；重启后会变，可据此判断服务是否重启过）
+    //   pid         = 进程号（判断是否发生过崩溃重启）
+    NSString *head120 = self.lastCode.length > 120 ? [self.lastCode substringToIndex:120] : (self.lastCode ?: @"");
     NSDictionary *d = @{
         @"ok": @YES,
         @"name": @"RyConsole-Autorun",
-        @"version": @"1.0",
+        @"version": @"1.1",
         @"running": @(self.running),
         @"port": @(self.port),
         @"lanIP": ryLANAddress(),
         @"busy": @(self.busy),
-        @"jobs": @(self.jobs.count)
+        @"jobs": @(self.jobs.count),
+        @"hits": @(self.liveHits),
+        @"lastCodeLen": @(self.lastCode.length),
+        @"lastCodeHead": [head120 stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"],
+        @"lastSrcKind": self.lastResult[@"srcKind"] ?: @"",
+        @"lastPrim": @(RYLastPrimitive()),          // 最近调用的原语（崩溃定位）
+        @"session": rySessionTag(),
+        @"pid": @(getpid()),
+        @"jobTtlSec": @((int)RY_JOB_TTL)
     };
     return [self jsonFrom:d];
 }
@@ -735,10 +861,25 @@ void RYAutorunSetEval(RYEvalBlock eval) {
 }
 
 NSString *RYAutorunOpenPanel(void) {
-    UIViewController *top = ryTopVC();
-    if (top == nil) return @"ERROR:no key window";
-    RYAutorunVC *vc = [[RYAutorunVC alloc] init];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    [top presentViewController:nav animated:YES completion:nil];
-    return @"OK";
+    // ★★ 崩溃修复（2026-09-18 真机复现，SIGSEGV，7 次栈完全一致）：
+    //   本函数会被 **Autorun 的连接线程**（后台 dispatch queue）调用 —— 而它要读 keyWindow、
+    //   遍历视图层级、presentViewController，全是主线程专属操作。
+    //   在后台线程碰 UI 会直接段错误（栈顶就是调用它的那个原语 block，下面紧跟 CoreFoundation
+    //   帧 —— UIApplication/keyWindow 内部就是 CF）。
+    //   修法：一律切主线程；调用方立即拿到"已入队"，不阻塞。
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ (void)RYAutorunOpenPanel(); });
+        return @"OK:queued-on-main";
+    }
+    @try {
+        UIViewController *top = ryTopVC();
+        if (top == nil) return @"ERROR:no key window";
+        if (top.presentedViewController != nil) return @"OK:already-presenting";   // 避免重复叠面板
+        RYAutorunVC *vc = [[RYAutorunVC alloc] init];
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+        [top presentViewController:nav animated:YES completion:nil];
+        return @"OK";
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"[openAutorunPanel error] %@", e.reason];
+    }
 }
