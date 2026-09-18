@@ -29,6 +29,8 @@ final class RYLiveActivityManager {
     private var port = 0
     private var hits = 0
     private var peer = ""
+    /// V2.4：待确认的权限请求文案（空 = 无）
+    private var alertText = ""
     private var startedAt = Date()
 
     /// 活动「保鲜期」。监听期间由保活脉冲定期 touch（见 KeepAlive.pulseOnce）；
@@ -55,7 +57,8 @@ final class RYLiveActivityManager {
 
         let attrs = RYListenAttributes(title: "RyConsole · Autorun")
         let state = RYListenAttributes.ContentState(port: port, hits: 0,
-                                                    lastPeer: "", startedAt: startedAt)
+                                                    lastPeer: "", startedAt: startedAt,
+                                                    alert: alertText)
         // pushType: nil = 只由本 App 更新；staleDate = 保鲜期（由保活脉冲续）
         let content = ActivityContent(state: state,
                                       staleDate: Date().addingTimeInterval(Self.staleWindow))
@@ -67,6 +70,27 @@ final class RYLiveActivityManager {
             NSLog("[LiveActivity] 启动失败: %@", error.localizedDescription)
             return false
         }
+    }
+
+    /// V2.4：弹出/更新"权限请求提醒"（后台禁用命令被调用时用）。
+    /// 传空串 = 清除提醒。没有活动在跑时会自动起一个（port 传 0）。
+    @discardableResult
+    func alert(_ text: String) -> Bool {
+        if activity == nil { _ = start(port: 0) }
+        alertText = text
+        refresh()
+        return activity != nil
+    }
+
+    /// 用当前字段重推一次内容
+    func refresh() {
+        guard let a = activity else { return }
+        let state = RYListenAttributes.ContentState(port: port, hits: hits,
+                                                    lastPeer: peer, startedAt: startedAt,
+                                                    alert: alertText)
+        let content = ActivityContent(state: state,
+                                      staleDate: Date().addingTimeInterval(Self.staleWindow))
+        Task { await a.update(content) }
     }
 
     /// 刷新活动内容。
@@ -85,7 +109,8 @@ final class RYLiveActivityManager {
         if !newPeer.isEmpty { self.peer = newPeer }
         guard let a = activity else { return }
         let state = RYListenAttributes.ContentState(port: port, hits: hits,
-                                                    lastPeer: peer, startedAt: startedAt)
+                                                    lastPeer: peer, startedAt: startedAt,
+                                                    alert: alertText)
         let content = ActivityContent(state: state,
                                       staleDate: Date().addingTimeInterval(Self.staleWindow))
         Task { await a.update(content) }
@@ -96,7 +121,8 @@ final class RYLiveActivityManager {
         guard let a = activity else { return }
         activity = nil
         let state = RYListenAttributes.ContentState(port: port, hits: hits,
-                                                    lastPeer: peer, startedAt: startedAt)
+                                                    lastPeer: peer, startedAt: startedAt,
+                                                    alert: alertText)
         let content = ActivityContent(state: state, staleDate: Date())
         Task { await a.end(content, dismissalPolicy: .immediate) }
     }
@@ -162,6 +188,19 @@ public func ryLiveActivityStop() -> Int32 {
     if #available(iOS 17.0, *) {
         RYLiveActivityManager.shared.stop()
         return 1
+    }
+    return 0
+}
+
+/// V2.4：权限请求提醒（后台调用被禁命令时，用灵动岛/锁屏顶出来）。
+/// title/sub 拼成一行文案；传空 title 表示清除提醒。
+@_cdecl("ryLiveActivityAlert")
+public func ryLiveActivityAlert(_ title: UnsafePointer<CChar>?, _ sub: UnsafePointer<CChar>?) -> Int32 {
+    if #available(iOS 17.0, *) {
+        let t = title.map { String(cString: $0) } ?? ""
+        let u = sub.map { String(cString: $0) } ?? ""
+        let text = t.isEmpty ? "" : (u.isEmpty ? t : "\(t)：\(u)")
+        return RYLiveActivityManager.shared.alert(text) ? 1 : 0
     }
     return 0
 }
