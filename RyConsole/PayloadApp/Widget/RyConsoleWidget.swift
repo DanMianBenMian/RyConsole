@@ -1,0 +1,119 @@
+//
+//  RyConsoleWidget.swift
+//  RyConsoleWidget —— Widget Extension（只做实时活动：锁屏胶囊 + 灵动岛）
+//
+//  这里是唯一能"画"灵动岛的地方：主 App 无法自行绘制，只能 request/update 一个
+//  Activity，真正的呈现由本扩展完成。
+//
+//  呈现形态：
+//   · 灵动岛紧凑态：天线/信号图标（绿） + 已连接次数
+//   · 灵动岛展开态："监听中" + 端口 + 连接数 + 已运行时长
+//   · 锁屏 / 通知中心横幅：图标 + "监听中" + 端口 / 连接数
+//
+//  最低 iOS 16.1（ActivityKit 起始版本），本 target 的 deploymentTarget 已设为 16.1，
+//  所以无需 @available 标注。
+//
+
+import ActivityKit
+import SwiftUI
+import WidgetKit
+
+private let kAccent = Color(red: 0.20, green: 0.90, blue: 0.62)   // 与 App 的 RY_GREEN 同色系
+
+@main
+struct RyConsoleWidgetBundle: WidgetBundle {
+    var body: some Widget {
+        RYListenLiveActivity()
+    }
+}
+
+struct RYListenLiveActivity: Widget {
+
+    var body: some WidgetConfiguration {
+        ActivityConfiguration(for: RYListenAttributes.self) { context in
+
+            // ---- 锁屏 / 通知中心 ----
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle().fill(kAccent.opacity(0.18)).frame(width: 40, height: 40)
+                    Image(systemName: "antenna.radiowaves.left.and.right")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(kAccent)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("监听中")
+                        .font(.system(size: 15, weight: .semibold))
+                    HStack(spacing: 8) {
+                        Label(":\(context.state.port)", systemImage: "network")
+                        Label("\(context.state.hits)", systemImage: "arrow.down.circle")
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(context.state.startedAt, style: .timer)
+                    .font(.system(size: 13, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .padding(14)
+            .activityBackgroundTint(Color.black.opacity(0.72))
+            .activitySystemActionForegroundColor(kAccent)
+
+        } dynamicIsland: { context in
+
+            DynamicIsland {
+                // ---- 展开态 ----
+                DynamicIslandExpandedRegion(.leading) {
+                    Image(systemName: "antenna.radiowaves.left.and.right")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(kAccent)
+                        .padding(.leading, 4)
+                }
+                DynamicIslandExpandedRegion(.trailing) {
+                    Text(":\(context.state.port)")
+                        .font(.system(size: 13, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(kAccent)
+                        .padding(.trailing, 4)
+                }
+                DynamicIslandExpandedRegion(.center) {
+                    Text("监听中")
+                        .font(.system(size: 15, weight: .semibold))
+                }
+                DynamicIslandExpandedRegion(.bottom) {
+                    HStack(spacing: 10) {
+                        Label("\(context.state.hits) 次连接", systemImage: "arrow.down.circle")
+                        Text(context.state.startedAt, style: .timer)
+                            .monospacedDigit()
+                        if !context.state.lastPeer.isEmpty {
+                            Label(context.state.lastPeer, systemImage: "laptopcomputer")
+                        }
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 2)
+                }
+            } compactLeading: {
+                // ---- 紧凑态（左）：数据/信号图标 ----
+                Image(systemName: "antenna.radiowaves.left.and.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(kAccent)
+
+            } compactTrailing: {
+                // ---- 紧凑态（右）：连接数 ----
+                Text("\(context.state.hits)")
+                    .font(.system(size: 13, weight: .semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(kAccent)
+
+            } minimal: {
+                Image(systemName: "antenna.radiowaves.left.and.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(kAccent)
+            }
+            .keylineTint(kAccent)
+            .widgetURL(URL(string: "ryconsole://listen"))
+        }
+    }
+}
