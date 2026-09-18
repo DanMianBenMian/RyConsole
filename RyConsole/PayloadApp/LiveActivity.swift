@@ -8,8 +8,11 @@
 //    这里改成导出 4 个 C ABI 函数，ObjC 侧只声明 extern 原型，最稳。
 //
 //  API 面：只用 iOS 17+ 的新式 ActivityKit 调用
-//    （request(attributes:content:pushType:) / update(_:) / end(_:dismissalPolicy:)）
-//    避开 16.1→16.2 那批已废弃的老签名，编译期不会踩 deprecated。
+//    · Activity.request(attributes:content:pushType:)   ← content 必须是 ActivityContent 包装
+//    · activity.update(content)                          ← 无标签，同样吃 ActivityContent
+//    · activity.end(content, dismissalPolicy:)           ← 同上
+//    注意别用 16.1 那套 update(using:) / end(using:dismissalPolicy:)：那些吃裸 ContentState，
+//    在 16.2 已废弃，且**不能结束用新 API 起出来的活动**（会静默失败）。
 //
 //  线程：ActivityKit 的 async 接口自己会切，ObjC 侧从任意线程调都安全。
 //
@@ -48,8 +51,10 @@ final class RYLiveActivityManager {
         let attrs = RYListenAttributes(title: "RyConsole · Autorun")
         let state = RYListenAttributes.ContentState(port: port, hits: 0,
                                                     lastPeer: "", startedAt: startedAt)
+        // staleDate: nil = 不设过期（监听期间一直有效）；nil 的 pushType = 只由本 App 更新
+        let content = ActivityContent(state: state, staleDate: nil)
         do {
-            activity = try Activity.request(attributes: attrs, content: state, pushType: nil)
+            activity = try Activity.request(attributes: attrs, content: content, pushType: nil)
             NSLog("[LiveActivity] 已启动 id=%@", activity?.id ?? "-")
             return true
         } catch {
@@ -65,7 +70,8 @@ final class RYLiveActivityManager {
         guard let a = activity else { return }
         let state = RYListenAttributes.ContentState(port: port, hits: hits,
                                                     lastPeer: peer, startedAt: startedAt)
-        Task { await a.update(state) }
+        let content = ActivityContent(state: state, staleDate: nil)
+        Task { await a.update(content) }
     }
 
     /// 结束并立刻移除。
@@ -74,7 +80,8 @@ final class RYLiveActivityManager {
         activity = nil
         let state = RYListenAttributes.ContentState(port: port, hits: hits,
                                                     lastPeer: peer, startedAt: startedAt)
-        Task { await a.end(state, dismissalPolicy: .immediate) }
+        let content = ActivityContent(state: state, staleDate: Date())
+        Task { await a.end(content, dismissalPolicy: .immediate) }
     }
 }
 
