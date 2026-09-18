@@ -109,7 +109,8 @@ def _request(host, port, path, method="GET", payload=None, timeout=HTTP_TIMEOUT)
             raise RyError("HTTP %s：%s" % (e.code, raw[:400] or "(空响应)"))
     except urllib.error.URLError as e:
         raise RyError("连不上 %s：%s\n  ─ 确认：①iPad 上 Autorun 已启动 ②同一局域网 "
-                      "③App 保持前台 ④端口一致" % (url, e.reason))
+                      "③面板点过「启动监听」（V2.2 起监听期自动保活，可切后台/锁屏）④端口一致；"
+                      "若刚崩过，重开 App 再点启动" % (url, e.reason))
     except Exception as e:
         raise RyError("请求失败 %s：%r" % (url, e))
     try:
