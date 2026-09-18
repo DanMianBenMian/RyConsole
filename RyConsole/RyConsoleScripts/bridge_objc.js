@@ -11,6 +11,9 @@
 //   · 全部改走 `objc_msgSendSafe`（结构化错误），任何一步失败都带进度信息返回，不再"崩了啥也没有"。
 //   · lsAppList() 返回值仍保持 **字符串数组**（向后兼容老探针）；要总量/错误明细用 lsAppListInfo()。
 var SCRIPT_VERSION = "bridge_objc v1.1 (build 2026-09-18)";
+var BRIDGE_VERSION = "v1.1 (build 2026-09-18)";
+if (typeof RYC_BRIDGES === "undefined") { var RYC_BRIDGES = {}; }
+RYC_BRIDGES["bridge_objc"] = BRIDGE_VERSION;
 
 var LS_APP_PAGE_DEFAULT = 120;
 var LS_APP_PAGE_MAX = 200;
