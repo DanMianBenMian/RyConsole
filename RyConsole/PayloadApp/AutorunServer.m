@@ -653,7 +653,10 @@ static void rySendAll(int fd, NSData *data) {
     NSDictionary *d = @{
         @"ok": @YES,
         @"name": @"RyConsole-Autorun",
-        @"version": @"1.1",
+        // 版本号从 Bundle 读（单一事实源 = project.yml 的 CFBundleShortVersionString；旧版硬编码 1.1 永远不变）
+        @"version": [NSString stringWithFormat:@"v%@",
+                     [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?"],
+        @"serverProto": @"1.1",     // 服务端字段契约版本（与 App 版本解耦，PC 端按这个判断能力）
         @"running": @(self.running),
         @"port": @(self.port),
         @"lanIP": ryLANAddress(),
