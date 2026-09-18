@@ -30,6 +30,7 @@
 #import "KeepAlive.h"
 #import "LiveActivityBridge.h"
 #import "RyExec.h"
+#import "RYPermLog.h"
 #import "MainShell.h"
 #import "RyShellBridge.h"
 // iOS SDK 不提供 IOSurface 的 umbrella 头(IOSurface.h 是 macOS 布局)，
@@ -1644,6 +1645,8 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
 
             // ---- 崩溃定位：登记"最后调用的原语"（见 RYNotePrimitive 注释）----
             ctx[@"__ry_note"]=^BOOL(NSString *n){ RYNotePrimitive([n UTF8String]); return YES; };
+            // V2.4 权限闸门：命令被禁用 → 向用户确认（后台先弹灵动岛），驳回则把错误串直接回给调用方
+            ctx[@"__ry_gate"]=^NSDictionary *(NSString *n){ return [[RYPermLog shared] gateCommand:n]; };
 
             // 给所有原生原语套一层"点名"包装。
             //   · 跳过 __ry_* 自身、跳过 print（print 调用太频繁，会把真正的凶手冲掉）
@@ -1655,7 +1658,7 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
                 @"if(k==='__ry_note'||k==='print'||k.indexOf('__ry_')===0)continue;"
                 @"var f=g[k];"
                 @"if(typeof f!=='function')continue;"
-                @"g[k]=(function(n,fn){return function(){try{__ry_note(n);}catch(e){}return fn.apply(this,arguments);};})(k,f);"
+                @"g[k]=(function(n,fn){return function(){try{var r=__ry_gate(n);if(r&&r.ok===false)return r.error;}catch(e){}try{__ry_note(n);}catch(e){}return fn.apply(this,arguments);};})(k,f);"
                 @"}})();"];
 }
 
