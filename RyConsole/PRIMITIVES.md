@@ -354,3 +354,29 @@ if (typeof RYC_BRIDGES === "undefined") { var RYC_BRIDGES = {}; }   // 各桥自
 RYC_BRIDGES["bridge_x"] = BRIDGE_VERSION;
 print("[bridge_x] 已加载: … (" + BRIDGE_VERSION + ")");
 ```
+
+## 14. 崩溃兜底（V2.2.6）★
+
+探针把 App 打崩 → 现在**不再重启进程**，而是这次执行以「触发崩溃，已兜底」返回。
+
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| `crashGuardStatus` | `() → string` | JSON：`enabled / hits / lastSignal / lastAddr / lastPrim / degraded` + 能兜/不能兜清单 |
+| `crashGuardSet` | `(0或1) → string` | **关掉 = 恢复真崩**。想在探针里用 pid 差分定位崩溃时，先 `crashGuardSet(0)` |
+
+**机制**：每次执行前在**调用线程**布 `sigsetjmp` 检查点（Terminal / 资源管理器 / Autorun 三条路都套）；
+本线程发生 SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP → 信号处理器写崩溃日志 → `siglongjmp` 回检查点 →
+本次执行返回「已兜底」，进程存活。装了 `sigaltstack`，爆栈也能兜。
+
+| | |
+|---|---|
+| ✅ 能兜 | 用户态信号类崩溃：野指针 / 空函数指针 / `objc_msgSend` 打空 / 越界读 / JSC 深递归爆栈 |
+| ❌ 不能兜 | **内核 panic**（驱动/IOKit 内核侧触发 → 设备重启）、看门狗卡死（0x8badf00d）、**非布点线程上的崩溃**、外部 kill |
+
+**★ 对调用方（AI）的影响 —— 必读**
+1. **兜底开着时，被拦下的崩溃不改 pid** → **pid 差分法失效**。改看：`/eval` 返回的 `guarded:true` +
+   `guardSignal/guardAddr/guardPrim`，或 `/ping` 的 `guardHits/guardLastPrim/guardDegraded`。
+2. `guarded:true` 的语义是"**这条代码确实会把 App 打崩**"，只是被拦了 —— **别当成普通失败去重试**。
+3. 被拦下的那次执行是**被掀栈**结束的，锁/内存/JSC 状态可能不干净（`guardDegraded:true`）——
+   若后续行为诡异，**重启 App 复位**再继续。
+4. 想要"真崩"（验证崩溃本身、测 pid 变化）：探针第一行 `crashGuardSet(0)`，跑完 `crashGuardSet(1)` 恢复。
