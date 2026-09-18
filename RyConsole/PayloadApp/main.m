@@ -22,6 +22,8 @@
 #import <spawn.h>
 #import <sys/wait.h>
 #import <unistd.h>
+#import <execinfo.h>
+#import <signal.h>
 #import "AutorunServer.h"
 #import "KeepAlive.h"
 #import "LiveActivityBridge.h"
@@ -1578,39 +1580,101 @@ static NSString *RYAutorunRunCapture(NSString *code) {
 @end
 
 // ---- 资源管理器（2 分类：脚本 / 桥；修补模块已于 V2.2 移除）----
+//  同一份实现支持两种呈现：
+//   · embedded = YES → 外壳的第 4 个面板，**内嵌整页显示**（深色现代样式，无导航栏）
+//   · embedded = NO  → 「设置 → 经典界面」里的旧入口，**模态弹出**（保留导航栏 + 关闭按钮）
+//  配色对齐外壳（MainShell 的 RY_* 宏），那套是文件内宏，这里复制一份 RM_* 保持视觉一致。
+#define RM_BG      [UIColor colorWithRed:0.051f green:0.067f blue:0.090f alpha:1.0f]  // #0d1117
+#define RM_PANEL   [UIColor colorWithRed:0.086f green:0.106f blue:0.133f alpha:1.0f]  // #161b22
+#define RM_BORDER  [UIColor colorWithRed:0.188f green:0.212f blue:0.239f alpha:1.0f]  // #30363d
+#define RM_TEXT    [UIColor colorWithRed:0.788f green:0.820f blue:0.851f alpha:1.0f]  // #c9d1d9
+#define RM_MUTED   [UIColor colorWithRed:0.545f green:0.580f blue:0.620f alpha:1.0f]  // #8b949e
+#define RM_ACCENT  [UIColor colorWithRed:0.184f green:0.506f blue:0.969f alpha:1.0f]  // #2f81f7
+
 @class ResourceManagerVC;
 @interface ResourceManagerVC : UIViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UISegmentedControl *seg;
 @property (nonatomic, strong) UITableView *table;
+@property (nonatomic, strong) UILabel *hintLabel;
+@property (nonatomic, strong) UIButton *addBtn;
 @property (nonatomic, strong) NSArray *scripts;
 @property (nonatomic, strong) NSArray *bridges;
 @property (nonatomic, assign) BOOL lpAdded;
+@property (nonatomic, assign) BOOL embedded;      // YES = 外壳内嵌面板
 @end
 @implementation ResourceManagerVC
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    BOOL emb = self.embedded;
+    self.view.backgroundColor = emb ? RM_BG : [UIColor systemBackgroundColor];
     self.title = @"资源管理器";
-    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(close)];
+    if (!emb) {
+        // 模态弹出（经典界面入口）才需要"关闭"；内嵌面板由外壳的导航项切换
+        self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+                                                                                style:UIBarButtonItemStylePlain
+                                                                               target:self action:@selector(close)];
+    }
+    CGFloat pad = emb ? 16.0f : 12.0f;
+
     _seg = [[UISegmentedControl alloc] initWithItems:@[@"脚本", @"桥"]];
     _seg.translatesAutoresizingMaskIntoConstraints = NO; _seg.selectedSegmentIndex = 0;
     [_seg addTarget:self action:@selector(segChanged) forControlEvents:UIControlEventValueChanged];
+    if (emb) {                                  // 深色现代样式，跟外壳同一套配色
+        _seg.selectedSegmentTintColor = RM_ACCENT;
+        _seg.backgroundColor = RM_PANEL;
+        [_seg setTitleTextAttributes:@{NSForegroundColorAttributeName: RM_TEXT} forState:UIControlStateNormal];
+        [_seg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor]} forState:UIControlStateSelected];
+    }
     [self.view addSubview:_seg];
-    _table = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
-    _table.translatesAutoresizingMaskIntoConstraints = NO;     _table.delegate = self; _table.dataSource = self;
+
+    // 「新建」按钮做成面板内的圆形/圆角按钮（不再依赖导航栏 rightBarButtonItem，
+    // 因为内嵌模式下没有导航栏 —— 这正是上一版加不了东西的原因）
+    _addBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    _addBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [_addBtn setImage:[UIImage systemImageNamed:@"plus"] forState:UIControlStateNormal];
+    _addBtn.tintColor = emb ? RM_ACCENT : [UIColor systemBlueColor];
+    _addBtn.backgroundColor = emb ? RM_PANEL : [UIColor secondarySystemBackgroundColor];
+    _addBtn.layer.cornerRadius = 8.0f;
+    _addBtn.layer.borderWidth = 0.5f;
+    _addBtn.layer.borderColor = (emb ? RM_BORDER : [UIColor separatorColor]).CGColor;
+    [_addBtn addTarget:self action:@selector(addCurrent) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_addBtn];
+
+    _hintLabel = [[UILabel alloc] init];
+    _hintLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _hintLabel.font = [UIFont systemFontOfSize:11.0f];
+    _hintLabel.textColor = emb ? RM_MUTED : [UIColor secondaryLabelColor];
+    _hintLabel.text = @"点脚本 = 立即运行 · 长按 = 运行/编辑/删除 · 桥右侧开关控制启用";
+    [self.view addSubview:_hintLabel];
+
+    // 内嵌模式用 insetGrouped：圆角卡片行，现代观感；模态模式保持原来的 plain
+    _table = [[UITableView alloc] initWithFrame:CGRectZero
+                                          style:(emb ? UITableViewStyleInsetGrouped : UITableViewStylePlain)];
+    _table.translatesAutoresizingMaskIntoConstraints = NO;
+    _table.delegate = self; _table.dataSource = self;
+    if (emb) {
+        _table.backgroundColor = RM_BG;
+        _table.indicatorStyle = UIScrollViewIndicatorStyleWhite;
+    }
     [self.view addSubview:_table];
     _lpAdded = NO;
-    // 修补模块已移除（V2.2）：引擎/桥逻辑改回走 require() 动态加载，不再内置编辑器
+
     [NSLayoutConstraint activateConstraints:@[
-        [_seg.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8],
-        [_seg.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
-        [_seg.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
-        [_table.topAnchor constraintEqualToAnchor:_seg.bottomAnchor constant:8],
+        [_seg.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:10],
+        [_seg.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:pad],
+        [_addBtn.leadingAnchor constraintEqualToAnchor:_seg.trailingAnchor constant:8],
+        [_addBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-pad],
+        [_addBtn.centerYAnchor constraintEqualToAnchor:_seg.centerYAnchor],
+        [_addBtn.widthAnchor constraintEqualToConstant:40],
+        [_addBtn.heightAnchor constraintEqualToConstant:32],
+        [_hintLabel.topAnchor constraintEqualToAnchor:_seg.bottomAnchor constant:8],
+        [_hintLabel.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:pad + 2],
+        [_hintLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-(pad + 2)],
+        [_table.topAnchor constraintEqualToAnchor:_hintLabel.bottomAnchor constant:4],
         [_table.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:0],
         [_table.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:0],
         [_table.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:0],
     ]];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(addCurrent)];
     [self refreshRM];
 }
 - (void)refreshRM {
@@ -1637,13 +1701,23 @@ static NSString *RYAutorunRunCapture(NSString *code) {
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return _seg.selectedSegmentIndex == 0 ? _scripts.count : _bridges.count; }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"c"] ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"c"];
+    if (self.embedded) {                     // 深色卡片行（配色对齐外壳）
+        c.backgroundColor = RM_PANEL;
+        c.textLabel.textColor = RM_TEXT;
+        c.detailTextLabel.textColor = RM_MUTED;
+        UIView *sel = [[UIView alloc] init];
+        sel.backgroundColor = [UIColor colorWithWhite:1.0f alpha:0.06f];
+        c.selectedBackgroundView = sel;
+    }
     if (_seg.selectedSegmentIndex == 0) { NSString *n = _scripts[ip.row]; c.textLabel.text = n; c.detailTextLabel.text = @"脚本（点击运行）"; c.accessoryType = UITableViewCellAccessoryNone; c.accessoryView = nil; }
     else { NSString *n = _bridges[ip.row]; c.textLabel.text = n; BOOL en = bridgeIsEnabled(n);
         BOOL isOverride = [[NSFileManager defaultManager] fileExistsAtPath:[docsDir() stringByAppendingPathComponent:n]] && [bundledScripts() containsObject:n];
         NSString *detail = en ? @"已开启" : @"已关闭";
         if (isOverride) detail = [detail stringByAppendingString:@" · 覆盖版(重置内置桥可还原)"];
         c.detailTextLabel.text = detail;
-        UISwitch *sw = [[UISwitch alloc] init]; sw.on = en; sw.tag = ip.row; [sw addTarget:self action:@selector(toggleBridge:) forControlEvents:UIControlEventValueChanged]; c.accessoryView = sw; }
+        UISwitch *sw = [[UISwitch alloc] init]; sw.on = en; sw.tag = ip.row;
+        if (self.embedded) sw.onTintColor = RM_ACCENT;
+        [sw addTarget:self action:@selector(toggleBridge:) forControlEvents:UIControlEventValueChanged]; c.accessoryView = sw; }
     return c;
 }
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
@@ -1690,8 +1764,20 @@ static NSString *RYAutorunRunCapture(NSString *code) {
 - (void)alert:(NSString*)msg { UIAlertController *a = [UIAlertController alertControllerWithTitle:nil message:msg preferredStyle:UIAlertControllerStyleAlert]; [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]]; [self presentViewController:a animated:YES completion:nil]; }
 @end
 
-// 资源管理器工厂：外壳（MainShell）通过它弹出本 VC，不必看到 main.m 内部的 @interface。
-UIViewController *RYMakeResourceManagerVC(void) { return [[ResourceManagerVC alloc] init]; }
+// 资源管理器工厂：外壳（MainShell）通过它拿本 VC，不必看到 main.m 内部的 @interface。
+// RYMakeResourceManagerVC  = 模态弹出用（经典界面入口，带导航栏 + 关闭）
+// RYMakeResourceManagerPane = 外壳内嵌面板用（现代深色样式，整页显示，不是弹窗）
+UIViewController *RYMakeResourceManagerVC(void) {
+    return [[ResourceManagerVC alloc] init];
+}
+UIViewController *RYMakeResourceManagerPane(void) {
+    ResourceManagerVC *r = [[ResourceManagerVC alloc] init];
+    r.embedded = YES;
+    return r;
+}
+void RYResourceManagerRefresh(UIViewController *vc) {
+    if ([vc isKindOfClass:[ResourceManagerVC class]]) [(ResourceManagerVC *)vc refreshRM];
+}
 
 // ---- LocalSend（局域网服务端投喂：Update / Code / UpdateIPA 三 head）----
 @interface LocalSendDetailVC : UIViewController <NSURLSessionDelegate>
@@ -2023,6 +2109,70 @@ UIViewController *RYMakeResourceManagerVC(void) { return [[ResourceManagerVC all
 }
 @end
 
+// ============================================================
+//  崩溃日志（V2.2）：把崩溃现场落到 Documents/ryconsole_crash.log
+//  目的：本机没有 Mac / 没有调试器，真机崩了只能靠这个文件定位。
+//  覆盖：未捕获 ObjC 异常（含完整符号栈）+ SIGSEGV/SIGBUS/SIGABRT/… 信号（含回溯地址）
+//  读取：文件 App → 我的 iPad 上 → RyConsole → ryconsole_crash.log
+//       （也能在被弹出的 RyConsole 面板里用 readFile("ryconsole_crash.log") 拿）
+// ============================================================
+static int ryCrashFd = -1;
+
+static void ryCrashWrite(const char *s, size_t n) {
+    if (ryCrashFd >= 0 && s && n) { ssize_t _ = write(ryCrashFd, s, n); (void)_; }
+}
+
+static void ryCrashLog(NSString *s) {
+    if (!s) return;
+    const char *c = [s UTF8String];
+    if (c) ryCrashWrite(c, strlen(c));
+}
+
+static void ryUncaughtExceptionHandler(NSException *e) {
+    NSMutableString *m = [NSMutableString string];
+    [m appendFormat:@"\n==== RyConsole 未捕获异常 @ %@ ====\n", [NSDate date]];
+    [m appendFormat:@"name   : %@\nreason : %@\n", e.name, e.reason];
+    [m appendString:@"userInfo:\n"];
+    [m appendFormat:@"  %@\n", e.userInfo];
+    [m appendString:@"callStackSymbols:\n"];
+    for (NSString *l in e.callStackSymbols) [m appendFormat:@"  %@\n", l];
+    [m appendString:@"==== end ====\n\n"];
+    ryCrashLog(m);
+}
+
+// 信号处理里只允许 async-signal-safe 调用：纯 write / snprintf / backtrace_symbols_fd，**不碰 ObjC**
+static void rySignalHandler(int sig) {
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf), "\n==== RyConsole 收到信号 %d（%s）====\n", sig, strsignal(sig));
+    if (n > 0) ryCrashWrite(buf, (size_t)n);
+    void *bt[64];
+    int frames = backtrace(bt, 64);
+    if (ryCrashFd >= 0 && frames > 0) backtrace_symbols_fd(bt, frames, ryCrashFd);
+    // 还原默认处理再重抛：保留系统侧的崩溃上报/看门狗行为
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void RYInstallCrashLogger(void) {
+    if (ryCrashFd >= 0) return;
+    @try {
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *dir = paths.count ? paths.firstObject : NSTemporaryDirectory();
+        NSString *path = [dir stringByAppendingPathComponent:@"ryconsole_crash.log"];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
+        }
+        ryCrashFd = open([path fileSystemRepresentation], O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (ryCrashFd < 0) return;
+        ryCrashLog([NSString stringWithFormat:@"\n######## RyConsole 启动 @ %@ ########\n", [NSDate date]]);
+        NSSetUncaughtExceptionHandler(&ryUncaughtExceptionHandler);
+        int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE };
+        for (int i = 0; i < 6; i++) signal(sigs[i], rySignalHandler);
+    } @catch (NSException *e) {
+        NSLog(@"[RyCrash] 安装失败: %@", e.reason);
+    }
+}
+
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
 @property (nonatomic, strong) UIWindow *window;
 @end
@@ -2035,6 +2185,12 @@ UIViewController *RYMakeLegacyConsoleVC(void) {
 
 @implementation AppDelegate
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)opts {
+    RYInstallCrashLogger();          // 第一件事：装崩溃捕获（后面任何崩溃都留证据）
+
+    // 清掉"上次进程被强杀"残留的灵动岛：强杀不会给我们任何回调，只能在下次启动补刀
+    int32_t swept = ryLiveActivitySweep();
+    if (swept > 0) NSLog(@"[LiveActivity] 启动时清掉 %d 个残留活动", (int)swept);
+
     // Autorun 执行器提前注册：这样面板直接点「启动」也能工作（不必先跑过一段 JS）
     RYAutorunSetEval(^NSString*(NSString *js){ return RYAutorunRunCapture(js); });
     _window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
@@ -2043,6 +2199,19 @@ UIViewController *RYMakeLegacyConsoleVC(void) {
     _window.rootViewController = shell;
     [_window makeKeyAndVisible];
     return YES;
+}
+
+// 正常终止（系统回收 / 用户主动退出 App）：保活 + 灵动岛一起收掉。
+// 注意：从后台把 App **划掉**属于强杀（SIGKILL），这里不会触发 —— 那种情况靠
+//       下次启动的 ryLiveActivitySweep() 兜底，另外活动的 staleDate 也会让它自动变陈旧。
+- (void)applicationWillTerminate:(UIApplication *)application {
+    @try {
+        ryLiveActivityStop();
+        [[RYKeepAlive shared] end];
+        NSLog(@"[RyConsole] willTerminate：保活与实时活动已收尾");
+    } @catch (NSException *e) {
+        NSLog(@"[RyConsole] willTerminate 异常（已吞）: %@", e.reason);
+    }
 }
 @end
 
