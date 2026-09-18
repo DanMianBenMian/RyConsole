@@ -13,6 +13,9 @@
 // 顺序：本文件在 installPrimitives 之后加载（桥都在之后），所以包装到的是已带 __ry_note 的函数，
 //       崩溃点名的行为不受影响。
 var BRIDGE_VERSION = "v1.0 (build 2026-09-18)";
+// 自报版本：加载后可在设备上一次性查"每个桥跑的是哪版" —— return JSON.stringify(RYC_BRIDGES)
+if (typeof RYC_BRIDGES === "undefined") { var RYC_BRIDGES = {}; }
+RYC_BRIDGES["bridge_guard"] = BRIDGE_VERSION;
 var SCRIPT_VERSION = "bridge_guard " + BRIDGE_VERSION;
 
 // 期望类型 → 人话
