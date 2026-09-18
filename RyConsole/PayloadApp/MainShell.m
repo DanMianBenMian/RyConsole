@@ -8,6 +8,7 @@
 //
 
 #import "MainShell.h"
+#import "RySecurityPane.h"
 #import "AutorunServer.h"
 #import "RyExec.h"
 #import "RyShellBridge.h"
@@ -739,8 +740,9 @@ static void ryScrollToBottom(UITextView *tv) {
     NSArray *items = @[@[@"terminal", @"终端"],
                        @[@"antenna.radiowaves.left.and.right", @"Autorun"],
                        @[@"gearshape", @"设置"],
-                       @[@"folder", @"资源管理器"]];
-    self.navTitles = @[@"终端", @"Autorun", @"设置", @"资源管理器"];
+                       @[@"folder", @"资源管理器"],
+                       @[@"lock.shield", @"权限与安全"]];
+    self.navTitles = @[@"终端", @"Autorun", @"设置", @"资源管理器", @"权限与安全"];
     for (NSInteger i = 0; i < (NSInteger)items.count; i++) {
         CGFloat y = 76.0f + i * 48.0f;
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -883,7 +885,7 @@ static void ryScrollToBottom(UITextView *tv) {
 }
 
 - (void)select:(NSInteger)idx {
-    if (idx < 0 || idx > 3) idx = 0;
+    if (idx < 0 || idx > 4) idx = 0;
     self.current = idx;
     for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++) {
         UIButton *b = self.navButtons[i];
@@ -906,10 +908,24 @@ static void ryScrollToBottom(UITextView *tv) {
         RYResourceManagerRefresh(self.resourcePane);   // 每次进来重扫 Documents（可能刚丢过脚本进来）
     }
 
+    // 第 5 个面板：权限与安全（诊断 / 安全开关 / 日志），同样内嵌整页、首次进入才创建
+    if (idx == 4) {
+        if (!self.securityPane) {
+            self.securityPane = RYMakeSecurityPane();
+            [self addChildViewController:self.securityPane];
+            self.securityPane.view.frame = self.content.bounds;
+            self.securityPane.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            [self.content addSubview:self.securityPane.view];
+            [self.securityPane didMoveToParentViewController:self];
+        }
+        RYSecurityPaneRefresh(self.securityPane);
+    }
+
     self.terminalPane.hidden = (idx != 0);
     self.autorunPane.hidden = (idx != 1);
     self.settingsPane.hidden = (idx != 2);
     self.resourcePane.view.hidden = (idx != 3);
+    self.securityPane.view.hidden = (idx != 4);
     [self layoutIndicator];
     if (idx == 1) [self.autorunPane refresh];
 }
