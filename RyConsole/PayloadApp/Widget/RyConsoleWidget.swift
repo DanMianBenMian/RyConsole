@@ -50,8 +50,14 @@ struct RYListenLiveActivity: Widget {
                         .foregroundStyle(kAccent)
                 }
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("监听中")
+                    Text(context.state.alert.isEmpty ? "监听中" : "⚠️ 请求权限")
                         .font(.system(size: 15, weight: .semibold))
+                    if !context.state.alert.isEmpty {
+                        Text(context.state.alert)
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(.orange)
+                            .lineLimit(2)
+                    }
                     HStack(spacing: 8) {
                         Label(":\(context.state.port)", systemImage: "network")
                         Label("\(context.state.hits)", systemImage: "arrow.down.circle")
