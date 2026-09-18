@@ -13,6 +13,7 @@
 
 #import "AutorunServer.h"
 #import "KeepAlive.h"
+#import "LiveActivityBridge.h"
 
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -110,6 +111,7 @@ static void rySendAll(int fd, NSData *data) {
 @property (nonatomic, assign) BOOL running;
 @property (nonatomic, assign) BOOL busy;
 @property (nonatomic, assign) int jobSeq;
+@property (nonatomic, assign) int liveHits;      // 实时活动里的「连接次数」
 @property (nonatomic, copy)   RYEvalBlock evalBlock;
 @property (nonatomic, copy)   RYLogBlock logger;
 @property (nonatomic, strong) NSMutableArray *logs;
@@ -225,6 +227,14 @@ static void rySendAll(int fd, NSData *data) {
     // 监听开始 → 进入后台保活（静音音频 + 后台任务续期），App 退到后台也不会被挂起
     [[RYKeepAlive shared] begin:@"autorun"];
 
+    // 顺手点亮灵动岛 / 锁屏「监听中」（系统关了实时活动就静默跳过，不影响监听）
+    self.liveHits = 0;
+    if (ryLiveActivityStart((int32_t)port)) {
+        [self logLine:@"实时活动已点亮（灵动岛 / 锁屏显示「监听中」）"];
+    } else if (!ryLiveActivityAvailable()) {
+        [self logLine:@"实时活动不可用（系统设置里未允许 RyConsole 使用实时活动）"];
+    }
+
     [self logLine:[NSString stringWithFormat:@"Autorun 已启动 · 端口 %d · 本机 %@，电脑端连 http://%@:%d/ping",
                    port, ryLANAddress(), ryLANAddress(), port]];
     [self logLine:[[RYKeepAlive shared] statusLine]];
@@ -246,6 +256,7 @@ static void rySendAll(int fd, NSData *data) {
     }
     // 监听停止 → 立刻释放保活（音频/后台任务全关，不做后台偷跑）
     [[RYKeepAlive shared] end];
+    ryLiveActivityStop();          // 灵动岛同时熄掉
     [self logLine:@"Autorun 已停止"];
     [self logLine:[[RYKeepAlive shared] statusLine]];
     return @"OK:stopped";
@@ -299,6 +310,10 @@ static void rySendAll(int fd, NSData *data) {
 }
 
 - (void)handleConnection:(int)cfd fromIP:(NSString *)ip {
+    // 实时活动的「数据」指标：连接数 + 最近来源（后台线程调用，ActivityKit 自己会切）
+    self.liveHits++;
+    ryLiveActivityUpdate((int32_t)self.liveHits, ip.length ? ip.UTF8String : NULL);
+
     struct timeval rtv;
     rtv.tv_sec = 5;
     rtv.tv_usec = 0;
