@@ -2,7 +2,7 @@
 
 > 由 `main.m` 的 `installPrimitives(ctx)` 注册，JS 侧**直接当全局函数调用**。
 > 每次执行都是**全新 JSContext**（原语会重新注册），所以跨轮次状态必须落盘（见 §6 文件 IO）。
-> 共 **68 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 8 个 JS 桥库文件。
+> 共 **69 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 8 个 JS 桥库文件。
 >
 > | 批次 | 新增 |
 > |---|---|
@@ -10,6 +10,7 @@
 > | V2.1 | ObjC runtime：`objc_getClass` / `sel_registerName` / `objc_msgSend` / `objcDesc` |
 > | V2.2 | `objc_msgSendSafe`（结构化错误 + 参数上限）、`memRead`（映射内存 dump）、`keepAliveStatus` / `keepAliveInfo`、`liveActivityStatus` |
 > | V2.2.4 | **Bug6 自解释错误**：失败一律给「参数名 + 合法范围」；`iokitMapTry`、`krWhy/machKrWhy`、`primHelp/primErrors/primMissing`（详见「通用约定 → 错误约定」） |
+> | **V2.3.0** | **`callPtr`（C 函数指针调用/FFI）**——补齐 dlopen/dlsym 之后最后一环；规格见 `RYCONSOLE_CALLPTR_SPEC.md`（§14 有完整说明） |
 
 ## 通用约定
 
@@ -380,3 +381,41 @@ print("[bridge_x] 已加载: … (" + BRIDGE_VERSION + ")");
 3. 被拦下的那次执行是**被掀栈**结束的，锁/内存/JSC 状态可能不干净（`guardDegraded:true`）——
    若后续行为诡异，**重启 App 复位**再继续。
 4. 想要"真崩"（验证崩溃本身、测 pid 变化）：探针第一行 `crashGuardSet(0)`，跑完 `crashGuardSet(1)` 恢复。
+
+## 15. callPtr —— C 函数指针调用（V2.3.0）★
+
+规格：`RYCONSOLE_CALLPTR_SPEC.md`（研究侧 2026-09-19）。补齐 `dlopenFW` → `dlsymAddr` → **调用** 的最后一环。
+
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| `callPtr` | `(addrHex, args?, opts?) → {ok, value, out?, error?, hint?}` | 调用 `dlsymAddr`/`symResolve` 拿到的 C 函数地址 |
+
+**实参打包**（≤8 个；与 objc_msgSend 位槽规则同源）：
+
+| JS 传入 | 打包为 |
+|---|---|
+| `number` | `unsigned long long` 位槽 |
+| `string` | **C 字符串** `const char *`（★ 与 objc_msgSend 不同，不是 NSString 对象） |
+| `{hex:"0x…"}` | 原始指针 |
+| `{buf:<n>}` / `{buf:true}` | 分配 n 字节可写缓冲（calloc 零填充），**调用后内容按 base64 回传 `out.bufN`** |
+| `{str:"…"}` | 可写 C 字符串（char* 输出参数用） |
+| `null` / 缺省 | `NULL` |
+
+**返回**：统一取 x0（uintptr_t）转 hex 串。整型 `parseInt(v,16)`；指针可喂 `memRead`/`objcDesc`。
+`opts.bufSize` 设 `{buf:true}` 未指大小时的默认（1024，上限 65536）。
+
+**安全网**（构建侧在规格之上加的两道）：
+1. 函数地址先 `vm_read` 体检 → 垃圾地址返回 `[callPtr error] 地址 0x… 不可读`，不靠崩溃兜底硬扛；
+2. 调用坏函数真正崩了 → crashGuard 拦成 `guarded:true`（内核 panic 除外）。
+
+**红线**：只支持**整型/指针**返回；float/struct 返回不适用（同 `objc_msgSend` 限制）。
+
+```js
+// 验收（研究侧 §五）
+var a = dlsymAddr(0, 'strlen');
+JSON.stringify(callPtr(a.addr, ['hello']));      // 期望 {"ok":true,"value":"0x5"}
+var b = dlsymAddr(0, 'strcmp');
+JSON.stringify([callPtr(b.addr,['abc','abc']), callPtr(b.addr,['abc','abd'])]);  // 0x0 / 非0
+var c = dlsymAddr(0, 'getcwd');
+JSON.stringify(callPtr(c.addr, [{ buf: 1024 }]));  // value=缓冲地址, out.buf0=base64(工作目录)
+```
