@@ -1,0 +1,260 @@
+// bridge_help.js — 原语自解释手册（Bug6 的推广形态，2026-09-18）
+// 目的：把 Bug6 报告里"别的桥该照 memRead 的格式给出参数名 + 合法范围"做成可执行文档 ——
+//       不用查源码、不用问人，在设备上直接敲 primHelp() 就能知道每个桥该怎么传参、错了看哪里。
+//
+// 用法：
+//   primHelp()                → 全部桥的一行速查表（按分类）
+//   primHelp("iokit")         → 名字含 iokit 的桥详表（子串匹配，不区分大小写）
+//   primHelp("iokitMap")      → 单个桥完整说明（含参数范围/返回/常见错误）
+//   primErrors()              → 错误约定总说明（返回值形态 / 错误串格式 / kr 怎么读）
+//   primMissing()             → 还没做成自解释错误的桥（诚实清单）
+var HELP_VERSION = "bridge_help v1.0 (build 2026-09-18)";
+
+// err: "self" = 失败返回 "[桥名 error] 参数名 + 合法范围"（memRead 风格，自解释）
+//      "code" = 返回数字/裸码，需用 krName/krWhy/machKrWhy 解码
+//      "ok"   = 基本不会因参数失败
+var PRIM_DOC = [
+  // ---------- IOKit UserClient（V3 主战场）----------
+  { cat: "IOKit", name: "iokitOpen", sig: "iokitOpen(cls, type)", err: "code",
+    args: [{ n: "cls", t: "string", r: "非空；必须是 IORegistry 里真实注册的类名（可用 iokitEnum() 查）" },
+           { n: "type", t: "uint32", r: "UserClient 类型，常见 0..5" }],
+    ret: ">0 = io_connect_t 句柄（沙盒可达，V3 命中）",
+    errs: "-2 类不存在；-3 类名为空（参数错，不是类不存在）；-536870174 = 0xe00002e2 NotPermitted（沙盒门禁）；-9999 原生抛异常；其它负值 = kr",
+    hint: "拿到的 conn 是**本进程**的 Mach port name，跨执行/重启即失效" },
+  { cat: "IOKit", name: "iokitCall", sig: "iokitCall(conn, sel, inputs)", err: "self",
+    args: [{ n: "conn", t: "number", r: "iokitOpen() 返回的句柄，必须 >0" },
+           { n: "sel", t: "uint32", r: "externalMethod selector 编号" },
+           { n: "inputs", t: "number[]", r: "标量输入，最多 16 个（非数字项会被忽略并在 note 里点名）" }],
+    ret: "{ret, outputs:[…], inCount, ok}   ret=0 即方法可调成功",
+    errs: "conn 非法/失效 → {ok:false, error:\"[iokitCall error] conn …\"}；拿不到 struct 输入时改用 iokitCallStruct",
+    hint: "ret=0xe00002c2(BadArgument) 说明 selector 存在但 check* 拒绝了这个输入形状 → 换标量个数/结构体" },
+  { cat: "IOKit", name: "iokitCallStruct", sig: "iokitCallStruct(conn, sel, scalarInputs, structB64, outSize)", err: "self",
+    args: [{ n: "conn", t: "number", r: ">0" }, { n: "sel", t: "uint32", r: "selector" },
+           { n: "scalarInputs", t: "number[]", r: "≤16 个标量" },
+           { n: "structB64", t: "string", r: "inputStruct 的 base64（可空串 = 不传结构体）" },
+           { n: "outSize", t: "number", r: "输出 struct 缓冲 1..65536（传 0/超界会兜底 4096 并在 note 说明）" }],
+    ret: "{ret, outputs, outStruct(base64), outStructSize, ok}",
+    errs: "参数错 → {ok:false, error:\"[iokitCallStruct error] …\"}；内核要更大缓冲时（kIOReturnNoSpace 0xe00002db）会自动按回报值重试一次",
+    hint: "这是打 struct/OOL 型 externalMethod 的正路（iokitCall 把 inputStruct 传 NULL）" },
+  { cat: "IOKit", name: "iokitMap", sig: "iokitMap(conn, memType)", err: "self",
+    args: [{ n: "conn", t: "number", r: ">0" },
+           { n: "memType", t: "uint32", r: "内存类型编号，常见 0..15" }],
+    ret: "{ret:0, ok:true, addr, size}",
+    errs: "{ok:false, error:\"[iokitMap error] …\", hint:\"…\"}；kr=0xe00002c2 时多为该 UserClient 未实现 clientMemoryForType",
+    hint: "不确定 memType 时先 iokitMapTry(conn) 扫 0..15；IOSurface 不必 map，直接 IOSurfaceGetBaseAddress" },
+  { cat: "IOKit", name: "iokitMapTry", sig: "iokitMapTry(conn, types?)   [桥]", err: "self",
+    args: [{ n: "conn", t: "number", r: ">0" }, { n: "types", t: "number[]", r: "可选，默认 [0..15]" }],
+    ret: "{ok, tried, hits:[{memType,addr,size}], verdict, lastError}",
+    errs: "参数错 → {ok:false, error:\"[iokitMapTry error] …\"}",
+    hint: "诊断用：一次扫完所有 memType 并给结论；扫中会留下映射（原生未暴露 Unmap），别在循环里反复跑" },
+  { cat: "IOKit", name: "iokitClose", sig: "iokitClose(conn)", err: "code",
+    args: [{ n: "conn", t: "number", r: ">0" }], ret: "0 = 成功", errs: "返回 kr", hint: "探针后应归还连接，否则句柄泄漏" },
+  { cat: "IOKit", name: "iokitEnum", sig: "iokitEnum()", err: "ok",
+    args: [], ret: "string[]（IORegistry 全部类名，去重）", errs: "一般不会失败", hint: "攻击面地图：先看有哪些类，再挑候选 open" },
+  { cat: "IOKit", name: "krName / krWhy / krHint", sig: "krWhy(kr)   [桥]", err: "ok",
+    args: [{ n: "kr", t: "number", r: "有符号/无符号 kr 均可（内部按 >>>0 处理）" }],
+    ret: "字符串，如 \"kIOReturnBadArgument (0xe00002c2) — 参数形状被拒…\"",
+    errs: "未收录码返回 \"未收录码 <hex>\"（不会抛）", hint: "所有裸 kr 都该用这个转成人话，别再贴数字给用户" },
+
+  // ---------- IOSurface ----------
+  { cat: "IOSurface", name: "iosurfaceProbe", sig: "iosurfaceProbe()", err: "ok",
+    args: [], ret: "文本报告（CREATE_OK / MAP_OK / CREATE_FAILED + 原因）", errs: "失败时文本里带 [iosurfaceProbe error]", hint: "最省事的「内核相邻面是否可用」一枪测" },
+  { cat: "IOSurface", name: "iosurfaceCreate", sig: "iosurfaceCreate(props)", err: "self",
+    args: [{ n: "props", t: "object", r: "可省略；最小可用集 {IOSurfaceWidth:4, IOSurfaceHeight:4, IOSurfaceBytesPerElement:4, IOSurfaceBytesPerRow:16}" }],
+    ret: ">0 = 句柄（本进程内有效）", errs: "失败返回 \"[iosurfaceCreate error] …\" 字符串（不是 -1）",
+    hint: "句柄跨调用存活（原生注册表持有），用完 iosurfaceRelease" },
+  { cat: "IOSurface", name: "iosurfaceGetID", sig: "iosurfaceGetID(handle)", err: "self",
+    args: [{ n: "handle", t: "number", r: "iosurfaceCreate/Lookup 返回的句柄" }],
+    ret: "uint32 surface id（可跨进程 lookup 的凭据）", errs: "句柄无效 → \"[iosurfaceGetID error] unknown handle N…\"" },
+  { cat: "IOSurface", name: "iosurfaceSetValue / GetValue", sig: "iosurfaceSetValue(handle, key, value) / iosurfaceGetValue(handle, key)", err: "self",
+    args: [{ n: "handle", t: "number", r: "有效句柄" }, { n: "key", t: "string", r: "属性名，空串按 \"k\" 处理" },
+           { n: "value", t: "string", r: "base64 会被当 CFData 存，其它按 CFString" }],
+    ret: "\"[set] ok\" / 属性描述；key 不存在返回 \"[get] key \\\"x\\\" 不存在（不是错误）\"", errs: "句柄无效 → \"[…] error] unknown handle N…\"" },
+  { cat: "IOSurface", name: "iosurfaceRelease", sig: "iosurfaceRelease(handle)", err: "self",
+    args: [{ n: "handle", t: "number", r: "有效句柄" }], ret: "\"[release] ok\"", errs: "重复 release / 未创建 → \"[iosurfaceRelease error] …\"" },
+  { cat: "IOSurface", name: "iosurfaceLookup", sig: "iosurfaceLookup(cid)", err: "self",
+    args: [{ n: "cid", t: "uint32", r: "本机当前活着的 surface id" }], ret: ">0 = 新句柄",
+    errs: "查不到 → \"[iosurfaceLookup error] IOSurfaceLookup(N) 返回 NULL…\"" },
+
+  // ---------- 内存 / ObjC runtime ----------
+  { cat: "内存", name: "memRead", sig: "memRead(hex, len)", err: "self",
+    args: [{ n: "hex", t: "string", r: "地址，\"0x…\" 或纯 hex" }, { n: "len", t: "number", r: "1..65536" }],
+    ret: "十六进制串", errs: "\"[memRead error] null address\" / \"len must be 1..65536\" / \"vm_read kr=N\"",
+    hint: "★ 自解释错误的标杆（Bug6 就是照它推广的）" },
+  { cat: "内存", name: "objc_getClass / sel_registerName", sig: "objc_getClass(name) / sel_registerName(name)", err: "ok",
+    args: [{ n: "name", t: "string", r: "类名 / selector 名" }], ret: "指针串（\"0x…\"），失败 \"0x0\"" },
+  { cat: "内存", name: "objc_msgSend / objc_msgSendSafe", sig: "objc_msgSend(recv, sel, args)", err: "code",
+    args: [{ n: "recv", t: "指针串/对象", r: "来自 objc_getClass 或 objc_msgSend 返回" },
+           { n: "sel", t: "string", r: "selector 名" }, { n: "args", t: "array", r: "≤7 个参数（超出被拒）" }],
+    ret: "{\"ok\":true,\"value\":\"0x…\"}",
+    errs: "**红线**：返回值必须按标量/对象区分 —— 返回整数的 selector（count/length/BOOL）会崩（ARC 把整数当对象 retain，已改 __unsafe_unretained 修复）；仍建议：只对「确定返回对象 id」的 selector 用 msgSend，标量用 objc_msgSendSafe",
+    hint: "objcDesc(hex) 可把指针转成对象描述（带体检，标量不会崩）" },
+  { cat: "内存", name: "objcDesc", sig: "objcDesc(hex)", err: "ok",
+    args: [{ n: "hex", t: "string", r: "指针串" }], ret: "对象 description / \"(nil)\" / 标量提示串" },
+
+  // ---------- XPC / dyld ----------
+  { cat: "XPC", name: "xpcConn / xpcSendMsg / xpcClose", sig: "xpcConn(svc) → {h} / xpcSendMsg(h, msg, timeoutSec) / xpcClose(h)", err: "code",
+    args: [{ n: "svc", t: "string", r: "服务名，如 com.apple.securityd（先 machScan 验证可见）" },
+           { n: "msg", t: "object", r: "可 JSON 化嵌套对象" }, { n: "timeoutSec", t: "number", r: "默认 2.5；≤0 = 只发不收" }],
+    ret: "连接 {h} / 回传对象", errs: "{err:\"…\"}；常见事件名见 XPC_ERR（connection-invalid / peer-terminated / timed-out）",
+    hint: "一次性调用直接用 xpcCall(svc, msg, timeoutSec)" },
+  { cat: "XPC", name: "machScan", sig: "machScan(svcNames)   [桥]", err: "self",
+    args: [{ n: "svcNames", t: "string[]", r: "非空数组；元素须为非空服务名字符串" }],
+    ret: "{服务名: {kr, port, reason?}}（保持旧形状）",
+    errs: "参数错 → {error:\"[machScan error] svcNames must be a non-empty array of service-name strings…\"}；单项失败不报错，在 reason 里给 machKrWhy",
+    hint: "kr=5 多为沙盒挡了 mach-lookup；kr=1102 = 服务未注册/看不见" },
+  { cat: "XPC", name: "symResolve", sig: "symResolve(fwPath, symNames)   [桥]", err: "self",
+    args: [{ n: "fwPath", t: "string", r: "**必须以 / 开头的绝对路径，且指向 .framework 里的可执行文件**（不是 .framework 目录）" },
+           { n: "symNames", t: "string[]", r: "非空数组；符号名（C 符号带下划线前缀，C++ 是 _ZN…）" }],
+    ret: "{fw, h, syms:{名:地址或说明}, notFound:[…]}",
+    errs: "参数错/dlopen 失败 → {stage:\"arg\"|\"dlopen\", error:\"[symResolve error] …\"}",
+    hint: "dlsym 返回 NULL 时 syms 里直接写上原因串，不再是裸 0x0" },
+  { cat: "XPC", name: "dlopenFW / dlsymAddr", sig: "dlopenFW(path, mode) / dlsymAddr(handle, name)", err: "code",
+    args: [{ n: "path", t: "string", r: "框架可执行文件的绝对路径" }, { n: "mode", t: "int", r: "dlopen flag，一般 0（RTLD_LAZY 见 dlfcn.h）" },
+           { n: "handle", t: "number", r: "dlopenFW 返回的 h" }, { n: "name", t: "string", r: "符号名" }],
+    ret: "{h}/{err} ; 地址（0 = 找不到）" },
+
+  // ---------- 沙盒 / 钥匙串 / 进程 ----------
+  { cat: "沙盒", name: "sandboxCheck", sig: "sandboxCheck(operation)", err: "code",
+    args: [{ n: "operation", t: "string", r: "如 file-read-data / file-write-data / mach-lookup / process-exec / network-outbound" }],
+    ret: "原始 ret（0 前后语义自行比对）", hint: "批量用 sandboxScan([…])" },
+  { cat: "沙盒", name: "keychainProbe", sig: "keychainProbe(cls, service, account)", err: "code",
+    args: [{ n: "cls", t: "string", r: "钥匙串类，常用 \"genp\"" }, { n: "service", t: "string", r: "服务名" },
+           { n: "account", t: "string", r: "账户名（可 null）" }],
+    ret: "{status}  ；-25300 = not found，0 = 存在且可读", hint: "批量用 keychainScan([…])" },
+  { cat: "进程", name: "procListPids", sig: "procListPids()", err: "code",
+    args: [], ret: "{err?, n}  —— 沙盒下通常 n=0（列不到别的进程，属预期）" },
+  { cat: "进程", name: "posixSpawn", sig: "posixSpawn(path, argv, timeoutMs)", err: "code",
+    args: [{ n: "path", t: "string", r: "可执行文件绝对路径" }, { n: "argv", t: "string[]", r: "参数数组（argv[0] 一般是文件名）" },
+           { n: "timeoutMs", t: "number", r: "等待上限，毫秒" }],
+    ret: "{…}", hint: "沙盒内多半被 process-exec 挡住，返回码就是证据" },
+
+  // ---------- 文件 ----------
+  { cat: "文件", name: "readFile / writeFile", sig: "readFile(path) / writeFile(path, content)", err: "ok",
+    args: [{ n: "path", t: "string", r: "**相对 Documents 的路径**（不是绝对路径）" }, { n: "content", t: "string", r: "文本内容（write 会整文件覆盖，追加用 fileAppend）" }],
+    ret: "文本 / \"ok\"" },
+  { cat: "文件", name: "listDir / mkdir / fileExists / fileSize / fileDelete / fileAppend", sig: "listDir(path) / mkdir(name) / …", err: "ok",
+    args: [{ n: "path/name", t: "string", r: "相对 Documents 的路径/目录名（空串是错的）" }],
+    ret: "清单 / \"ok\" / bool / 字节数(-1 不存在)", errs: "mkdir 失败带原因；fileAppend 断开会回 \"cannot open\"" },
+  { cat: "文件", name: "bytesB64 / b64Bytes", sig: "bytesB64(number[]) / b64Bytes(base64)", err: "ok",
+    args: [{ n: "number[]", t: "number[]", r: "0..255 字节数组" }, { n: "base64", t: "string", r: "标准 base64" }] },
+
+  // ---------- 系统信息 / 时间 / 网络 ----------
+  { cat: "系统", name: "sysctlGet", sig: "sysctlGet(name)", err: "self",
+    args: [{ n: "name", t: "string", r: "非空，必须真实存在，如 kern.version / kern.bootargs / hw.memsize" }],
+    ret: "字符串 或 数字",
+    errs: "\"[sysctlGet error] unknown name \\\"x\\\" (errno 2 ENOENT 无此名字)…\"（旧版只回 <sysctl err 2>）" },
+  { cat: "系统", name: "appInfo / getPid / getEntitlements / now", sig: "appInfo() / getPid() / getEntitlements() / now()", err: "ok",
+    args: [], ret: "文本 / 数字 / entitlements plist 文本 / {wall, mono（秒）}" },
+  { cat: "系统", name: "sleep", sig: "sleep(ms)", err: "ok",
+    args: [{ n: "ms", t: "number", r: "1..120000（超界不生效，防呆）" }], ret: "传入值",
+    hint: "JavaScriptCore 没有 setTimeout，只能阻塞 sleep —— 探针要短" },
+  { cat: "网络", name: "tcpConnect / tcpSend / tcpScan", sig: "tcpConnect(host, port) / tcpSend(host, port, hex) / tcpScan(host, startPort, endPort)", err: "code",
+    args: [{ n: "host", t: "string", r: "IP 或域名" }, { n: "port", t: "number", r: "1..65535" }, { n: "hex", t: "string", r: "要发送的字节的 hex" }],
+    ret: "可达性/响应" },
+  { cat: "网络", name: "httpRequest", sig: "httpRequest(opts)", err: "code",
+    args: [{ n: "opts", t: "object", r: "见源码（url/method/headers/body 等）" }], ret: "响应文本" },
+  { cat: "网络", name: "canOpenURL / openURL / installIPA / getPasteboard / setPasteboard", sig: "canOpenURL(scheme) / openURL(url) / …", err: "code",
+    args: [{ n: "scheme/url", t: "string", r: "如 \"cydia\" / \"https://…\"" }, { n: "text", t: "string", r: "剪贴板文本" }],
+    ret: "bool / 结果串" },
+
+  // ---------- Autorun / 保活 ----------
+  { cat: "Autorun", name: "autorunStart / Stop / Status / Log", sig: "autorunStart(port) / autorunStop() / autorunStatus() / autorunLog()", err: "ok",
+    args: [{ n: "port", t: "number", r: "1..65535（默认 8899）" }], ret: "状态文本 / 日志文本",
+    hint: "监听期间才有保活（切后台/锁屏也能收码）；日志尾部是 crash log 之外的最近活动" },
+  { cat: "Autorun", name: "autorunStatus / keepAliveInfo / liveActivityStatus", sig: "autorunStatus() / keepAliveInfo() / liveActivityStatus()", err: "ok",
+    args: [], ret: "JSON 文本（含 pid / hits / lastPrim 崩溃点名 / 保活态 / 灵动岛态）",
+    hint: "**崩溃后先看 /ping 的 lastPrim** —— 它会点名最后执行的原语（Bug6 之后新增的仪表）" },
+  { cat: "桥", name: "require", sig: "require(\"名字\")", err: "ok",
+    args: [{ n: "名字", t: "string", r: "脚本/桥名（可省 .js）" }], ret: "加载结果文本；找不到回 \"[require] not found: x\"" },
+  { cat: "桥", name: "primHelp / primErrors / primMissing", sig: "primHelp(过滤词?) / primErrors() / primMissing()", err: "ok",
+    args: [{ n: "过滤词", t: "string", r: "可选；子串匹配（不区分大小写），如 \"iokit\" / \"surface\"" }],
+    ret: "本文档（字符串）", hint: "这就是你现在看的这份东西 —— 桥自带的说明书" }
+];
+
+function _hpMatch(e, f) {
+  if (!f) return true;
+  f = String(f).toLowerCase();
+  return e.name.toLowerCase().indexOf(f) >= 0 || e.cat.toLowerCase().indexOf(f) >= 0;
+}
+
+function primHelp(filter) {
+  var hits = PRIM_DOC.filter(function (e) { return _hpMatch(e, filter); });
+  if (!hits.length)
+    return "[primHelp] 没有匹配 \"" + filter + "\" 的原语。试试 primHelp()（全部）或 primHelp(\"iokit\")。";
+  if (hits.length === 1) return _hpDetail(hits[0]);
+  var out = "[primHelp] " + (filter ? ("匹配 \"" + filter + "\" 的 ") : "") + hits.length + " 个原语：\n";
+  var cat = "";
+  hits.forEach(function (e) {
+    if (e.cat !== cat) { cat = e.cat; out += "\n── " + cat + " ──\n"; }
+    var mark = e.err === "self" ? "✅自解释" : (e.err === "code" ? "⚠裸码" : "  ok  ");
+    out += "  " + mark + "  " + e.sig + "\n";
+    if (e.ret) out += "            → " + e.ret + "\n";
+  });
+  out += "\n提示：primHelp(\"<名字片段>\") 看单个的完整说明；primErrors() 看错误约定；primMissing() 看还欠自解释的桥。";
+  return out;
+}
+
+function _hpDetail(e) {
+  var out = "【" + e.name + "】" + e.cat + "\n";
+  out += "  签名   : " + e.sig + "\n";
+  if (e.args && e.args.length) {
+    out += "  参数   :\n";
+    e.args.forEach(function (a) {
+      out += "    - " + a.n + " : " + a.t + " —— " + (a.r || "(未注明)") + "\n";
+    });
+  } else {
+    out += "  参数   : 无\n";
+  }
+  if (e.ret) out += "  返回   : " + e.ret + "\n";
+  if (e.errs) out += "  错误   : " + e.errs + "\n";
+  out += "  错误风格: " + (e.err === "self" ? "失败返回 \"[" + e.name + " error] 参数名 + 合法范围\"（memRead 风格，自解释）"
+                                          : (e.err === "code" ? "返回数字/裸码 —— 用 krWhy(kr) 或 machKrWhy(kr) 解码再看" : "参数基本不会导致失败")) + "\n";
+  if (e.hint) out += "  要点   : " + e.hint + "\n";
+  return out;
+}
+
+// 错误约定总说明：拿到一个返回值先判断"它属于哪种形态"
+function primErrors() {
+  return [
+    "[错误约定] RyConsole 原语返回值分四种形态，先分类再解读：",
+    "",
+    " 1) 自解释错误串（✅ 自解释，Bug6 目标形态）",
+    "     形态:  \"[<桥名> error] <参数名> + <合法范围/原因>\"",
+    "     例:    memRead(h, 0)   → \"[memRead error] len must be 1..65536\"",
+    "            iokitMap(1, 0) → {ok:false, error:\"[iokitMap error] …\", hint:\"…\"}",
+    "     ★ 判据: 字符串里出现 \"] error]\" 就是错误，不用猜。",
+    "",
+    " 2) 结构化结果（dict）",
+    "     形态:  {ret/kr, ok, outputs, error?, hint?, note?}",
+    "     ★ ok:false + error 必备；hint 是「下一步该怎么办」。",
+    "",
+    " 3) 裸数字 / 裸码（⚠ 需解码，不是错误信息不全就是内核只给了码）",
+    "     例:    iokitOpen(\"Foo\") → -2 / -536870174 / -3",
+    "            iokitCall(...).ret → 0xe00002c2 之类",
+    "     ★ 一律先过 krWhy(kr)（IOKit）或 machKrWhy(kr)（Mach/bootstrap）再判断。",
+    "       别把 -536870206 直接贴给人看。",
+    "",
+    " 4) 单例哨兵（-1 / -2 / -3 / 0x0 / \"\"）",
+    "     ★ -1 常见于\"操作失败但原因在内核里\"; -3 = 参数错(空类名); 0x0 = 类/符号不存在。",
+    "",
+    " 通用排查顺序：",
+    "   ① 是不是参数错 → 看有没有 \"] error]\" 或 ok:false",
+    "   ② 是不是句柄错 → iokitMap/iokitCall 会明说 conn 不是有效 send right",
+    "   ③ 是不是门禁   → kr=0xe00002e2(kIOReturnNotPermitted)=沙盒/entitlement，纯用户态无解",
+    "   ④ 是不是形状错 → kr=0xe00002c2(BadArgument)=驱动的 check* 拒了 (selector,标量数,struct 大小) 组合",
+    "   ⑤ 是不是不存在 → kr=0xe00002c6(BadMessageID)=selector 没注册；-2 = 类名错",
+    "",
+    " 崩溃后定位：/ping 与 autorunStatus() 里的 lastPrim 会点名「最后执行的原语」，配合 crash log 用。"
+  ].join("\n");
+}
+
+// 诚实清单：还没做成自解释错误的桥（Bug6 只覆盖了报告点名的 + V3 主线）
+function primMissing() {
+  var pending = PRIM_DOC.filter(function (e) { return e.err === "code"; }).map(function (e) { return e.name; });
+  return "[primMissing] 仍是裸码风格（失败只给数字，需自行 krWhy 解码）的原语：\n  "
+    + pending.join("\n  ")
+    + "\n\n这些不是「坏」，只是错误信息还没做到 memRead 那样自解释。要推进就照 primHelp(\"memRead\") 的格式改。";
+}
+
+print("[bridge_help] 已加载: primHelp / primErrors / primMissing / krName(krWhy 见 bridge_iokit) (" + HELP_VERSION + ")");
