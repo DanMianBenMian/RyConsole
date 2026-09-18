@@ -2,13 +2,14 @@
 
 > 由 `main.m` 的 `installPrimitives(ctx)` 注册，JS 侧**直接当全局函数调用**。
 > 每次执行都是**全新 JSContext**（原语会重新注册），所以跨轮次状态必须落盘（见 §6 文件 IO）。
-> 共 **68 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 7 个 JS 桥库文件。
+> 共 **68 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 8 个 JS 桥库文件。
 >
 > | 批次 | 新增 |
 > |---|---|
 > | V2 | 结构化 XPC（`xpcConn`/`xpcSendMsg`/`xpcClose`）、`machLookUp`、dyld（`dlopenFW`/`dlsymAddr`）、`sandboxCheck`、`keychainProbe`、`procListPids`、`posixSpawn` |
 > | V2.1 | ObjC runtime：`objc_getClass` / `sel_registerName` / `objc_msgSend` / `objcDesc` |
-> | V2.2 | `objc_msgSendSafe`（结构化错误 + 参数上限）、`memRead`（映射内存 dump）、`keepAliveStatus` / `keepAliveInfo` |
+> | V2.2 | `objc_msgSendSafe`（结构化错误 + 参数上限）、`memRead`（映射内存 dump）、`keepAliveStatus` / `keepAliveInfo`、`liveActivityStatus` |
+> | V2.2.4 | **Bug6 自解释错误**：失败一律给「参数名 + 合法范围」；`iokitMapTry`、`krWhy/machKrWhy`、`primHelp/primErrors/primMissing`（详见「通用约定 → 错误约定」） |
 
 ## 通用约定
 
@@ -17,17 +18,40 @@
 - `print()` 是回传通道（Autorun 下收进 `output`）；`return` 的值进 `result`。
 - 安全分级：🟢只读 / 🟡状态影响 / 🔴高危（需人工确认）
 
+### 错误约定（v2.2.4 起强制，Bug6）
+
+**判据只有一句：字符串里出现 `] error]` 就是错误。** 调用方不用猜。
+
+| 形态 | 样子 | 怎么读 |
+|---|---|---|
+| ① 自解释错误串 | `"[<桥名> error] <参数名> + <合法范围>"`<br>例：`memRead(h,0)` → `[memRead error] len must be 1..65536` | 直接照它改参数 |
+| ② 结构化结果 | `{ret/kr, ok, outputs, error?, hint?, note?}` | `ok:false` 时看 `error`（是什么）+ `hint`（下一步怎么办） |
+| ③ 裸数字/裸码 | `iokitOpen("Foo")` → `-2`；`iokitCall(...).ret` → `0xe00002c2` | **先过 `krWhy(kr)`（IOKit）或 `machKrWhy(kr)`（Mach/bootstrap）**，别把数字贴给人看 |
+| ④ 单例哨兵 | `-1` / `-2` / `-3` / `0x0` | `-2`=类不存在、`-3`=类名为空（参数错）、`0x0`=类/符号不存在 |
+
+**排查顺序**：① 有 `] error]`/`ok:false` → 参数错；② conn 报"不是有效 send right" → 句柄失效；③ `kr=0xe00002e2` → 沙盒/entitlement 门禁（用户态无解）；④ `kr=0xe00002c2` → 驱动的 check* 拒了 (selector, 标量数, struct 大小) 组合，换形状；⑤ `kr=0xe00002c6` → selector 没注册。
+
+**在设备上查文档**（不用翻这份文件）：
+```js
+primHelp()              // 全部原语速查（标 ✅自解释 / ⚠裸码）
+primHelp("iokit")       // 过滤
+primHelp("iokitMap")    // 单个完整说明：参数名/类型/合法范围/返回/错误
+primErrors()            // 上面这套错误约定的机读版
+primMissing()           // 还欠自解释的桥（诚实清单）
+krWhy(-536870206)       // "kIOReturnBadArgument (0xe00002c2) — 参数形状被拒…"
+```
+
 ---
 
 ## 1. IOKit / 内核接口（核心）🟢
 
 | 原语 | 签名 | 说明 |
 |---|---|---|
-| `iokitEnum` | `() → string` | 枚举 IORegistry 服务（JSON） |
-| `iokitOpen` | `(cls: string, type: number) → number` | 打开 IOService，返回 conn；**>0 成功** |
-| `iokitCall` | `(conn, sel, inputs: array) → string` | 标量入参调用，返回结果描述 |
-| `iokitCallStruct` | `(conn, sel, scalarInputs, structB64, outSize) → string` | 带 inputStruct/OOL 输出（struct 以 base64） |
-| `iokitMap` | `(conn, mapType) → string` | 映射内存 |
+| `iokitEnum` | `() → string[]` | 枚举 IORegistry 服务类名（去重，攻击面地图） |
+| `iokitOpen` | `(cls: string, type: number) → number` | 打开 IOService，返回 conn；**>0 成功**。`-2` 类不存在 / `-3` 类名为空 / `-536870174` NotPermitted / `-9999` 抛异常 |
+| `iokitCall` | `(conn, sel, inputs: number[]) → {ret, outputs, inCount, ok, error?}` | 标量入参调用（≤16 个；非数字项被忽略并在 `note` 点名，不再静默占位） |
+| `iokitCallStruct` | `(conn, sel, scalarInputs, structB64, outSize) → {ret, outputs, outStruct, outStructSize, ok}` | 带 inputStruct/OOL 输出（struct 以 base64）。`outSize` 合法 1..65536，超界会兜底 4096 并在 `note` 说明 |
+| `iokitMap` | `(conn, mapType) → {ret, ok, addr?, size?, error?, hint?}` | 映射内存。失败**不再只回裸 kr**：给 `error`（是什么）+ `hint`（怎么办） |
 | `iokitClose` | `(conn) → number` | 关闭 |
 | `bytesB64` | `(arr: number[]) → string` | 字节数组 → base64 |
 | `b64Bytes` | `(b64: string) → array` | base64 → 字节数组 |
@@ -37,10 +61,13 @@
 ```js
 var conn = iokitOpen("IOSurfaceRoot", 0);
 if (conn > 0) {
-  print("selector 0 -> " + iokitCall(conn, 0, []));
+  var r = iokitCall(conn, 0, []);
+  if (!r.ok) print("失败 " + krWhy(r.ret) + " / " + (r.error || ""));   // 别贴裸数字
+  var m = iokitMapTry(conn);                                            // memType 不确定就先扫
+  print(m.verdict);
   iokitClose(conn);
 } else {
-  print("打开失败 conn=" + conn);   // 0 常见于 NotPermitted / NotFound
+  print("打开失败: " + krWhy(conn));   // -2 类名错 / -3 类名为空 / 0xe00002e2 沙盒门禁
 }
 ```
 
@@ -217,44 +244,65 @@ print(r);
 
 | 文件 | 函数 |
 |---|---|
-| `bridge_iokit.js` | `jbIokitEnum()`、`jbProbeIOKit(...)`、`jbIokitVerdict(...)`、`jbV3Battery()`、`jbV3Report()`、`jbV3MethodCall(...)` |
+| `bridge_iokit.js` | `jbIokitEnum()`、`jbProbeIOKit(...)`、`jbIokitVerdict(...)`、`jbV3Battery()`、`jbV3Report()`、`jbV3MethodCall(...)`、**`iokitMapTry(conn, types?)`**、**`krName/krHex/krWhy/krHint`** |
+| `bridge_help.js` ★v2.2.4 新增 | **`primHelp(过滤词?)`**（原语自解释手册）、**`primErrors()`**（错误约定）、**`primMissing()`**（还欠自解释的桥清单） |
 | `bridge_info.js` | `dumpIdentity()`、`dumpEntitlements()` |
 | `bridge_net.js` | `scanCommonPorts(host)`、`httpGet(host, port, path)`、`hexEncode(str)` |
 | `bridge_ui.js` | `enumSchemes()` |
-| `bridge_xpc.js` | 结构化 XPC 封装（`xpcConn`/`xpcSendMsg` 的字典构造） |
-| `bridge_objc.js` | `objPtr`、`lsWorkspace`、`lsAppList`、`lsAppInfo`、`lsOpenURL`、`lsOpenApp`、`objCall` |
+| `bridge_xpc.js` | `xpcCall/machScan/symResolve/keychainScan/sandboxScan` + **`machKrWhy(kr)`** |
+| `bridge_objc.js` | `objPtr`、`lsWorkspace`、`lsAppList(offset,limit)`、`lsAppListInfo`、`lsAppCount`、`lsAppInfo`、`lsOpenURL`、`lsOpenApp`、`objCall` |
 | `engine.js` | `RYC_RUN(code)`（可热重载；改它不用重编） |
 
 ## 11. IOReturn 错误码字典（回喂给 AI 用，必需）🟢
 
+> **v2.2.4 勘误**：本节旧表**整张都是错的**（名字与 hex 全错位，如把 `-536870163` 标成 Unsupported、把 `0xe00002c7` 标成 BadArgument）。
+> 下表按 `IOKit/IOKitReturn.h` 的 `iokit_common_err(0x2xx)` 重新生成，并用真机实测的 3 个码交叉验证过：
+> `-536870206`=BadArgument、`-536870202`=BadMessageID、`-536870174`=NotPermitted。
+
 ```js
-var IORETURN = {
-  "0":            "kIOReturnSuccess",
-  "-536870174":   "kIOReturnNotPermitted",     // 0xe00002e2 —— 权限门禁，换策略而不是重试
-  "-536870163":   "kIOReturnUnsupported",      // 0xe00002bc
-  "-536870206":   "kIOReturnBadArgument",      // 0xe00002c7
-  "-536870203":   "kIOReturnNotOpen",          // 0xe00002c2
-  "-536870195":   "kIOReturnNotFound",         // 0xe00002ca
-  "-536870187":   "kIOReturnNotReady",         // 0xe00002d5
-  "-536870201":   "kIOReturnNoResources",      // 0xe00002a7
-  "-536870208":   "kIOReturnIPCError",         // 0xe00002c8
-  "-536870211":   "kIOReturnTimeout",          // 0xe00002d2
-  "-536870212":   "kIOReturnNotPrivileged",    // 0xe00002d3
-  "-536870165":   "kIOReturnVMError",          // 0xe00002ba
-  "-536870199":   "kIOReturnExclusiveAccess",  // 0xe00002c5
-  "-536870207":   "kIOReturnAborted"           // 0xe00002c9
+// 建议直接用桥里的：krWhy(kr) / krName(kr) / krHint(kr)（bridge_iokit.js），下面是同源数据
+var IOKIT_KR_HEX = {
+  "e00002bc": "kIOReturnError",            "e00002bd": "kIOReturnNoMemory",
+  "e00002be": "kIOReturnNoResources",      "e00002bf": "kIOReturnIPCError",
+  "e00002c0": "kIOReturnNoDevice",         "e00002c1": "kIOReturnNotPrivileged",
+  "e00002c2": "kIOReturnBadArgument",      "e00002c3": "kIOReturnLockedRead",
+  "e00002c4": "kIOReturnLockedWrite",      "e00002c5": "kIOReturnExclusiveAccess",
+  "e00002c6": "kIOReturnBadMessageID",     "e00002c7": "kIOReturnUnsupported",
+  "e00002c8": "kIOReturnVMError",          "e00002c9": "kIOReturnInternalError",
+  "e00002ca": "kIOReturnIOError",          "e00002cc": "kIOReturnCannotLock",
+  "e00002cd": "kIOReturnNotOpen",          "e00002ce": "kIOReturnNotReadable",
+  "e00002cf": "kIOReturnNotWritable",      "e00002d0": "kIOReturnNotAligned",
+  "e00002d1": "kIOReturnBadMedia",         "e00002d2": "kIOReturnStillOpen",
+  "e00002d5": "kIOReturnBusy",             "e00002d6": "kIOReturnTimeout",
+  "e00002d8": "kIOReturnNotReady",         "e00002da": "kIOReturnNoChannels",
+  "e00002db": "kIOReturnNoSpace",          "e00002e2": "kIOReturnNotPermitted",
+  "e00002e6": "kIOReturnUnsupportedMode",  "e00002eb": "kIOReturnAborted",
+  "e00002f0": "kIOReturnNotFound"
 };
-function kr(code) {
+function kr(code) {                       // 传有符号数或 0x… 都行
   var n = (typeof code === "string" && /^0x/i.test(code)) ? parseInt(code, 16) : Number(code);
-  return IORETURN[String(n)] || ("unknown (" + code + ")");
+  return IOKIT_KR_HEX[((n >>> 0).toString(16)).padStart(8, "0")] || ("unknown (" + code + " / 0x" + ((n >>> 0).toString(16)) + ")");
 }
 ```
 
+**有符号 ↔ hex 对照（只列常用的，完整见上表）**
+
+| 有符号 | hex | 名字 | 判读 |
+|---|---|---|---|
+| -536870206 | 0xe00002c2 | kIOReturnBadArgument | 驱动的 check* 拒了参数形状 → 换标量个数/struct 大小 |
+| -536870202 | 0xe00002c6 | kIOReturnBadMessageID | selector 没注册 → 换 selector |
+| -536870201 | 0xe00002c7 | kIOReturnUnsupported | 该 UserClient 不提供这条路径 → 别重试，换类/换路线 |
+| -536870207 | 0xe00002c1 | kIOReturnNotPrivileged | 缺 entitlement |
+| -536870174 | 0xe00002e2 | kIOReturnNotPermitted | 沙盒/entitlement 门禁，**用户态无解** |
+| -536870195 | 0xe00002cd | kIOReturnNotOpen | conn 已关闭 → 重新 iokitOpen |
+| -536870203 | 0xe00002c5 | kIOReturnExclusiveAccess | 设备被别的连接独占 |
+| -536870181 | 0xe00002db | kIOReturnNoSpace | 输出/映射缓冲太小 |
+
 **判读要点**
-- `kIOReturnNotPermitted` → **不是你写错了**，是门禁。应当停止重试，改为记录结论 / 换服务 / 换类型。
-- `kIOReturnUnsupported` → 该 selector 不存在，换 selector。
-- `kIOReturnBadArgument` → 入参结构/标量不对，调整参数。
-- `kIOReturnNotPrivileged` → 缺 entitlement。
+- `kIOReturnNotPermitted` → **不是你写错了**，是门禁。停止重试，改记录结论 / 换服务 / 换类型。
+- `kIOReturnUnsupported` → 这条路该 UserClient 根本没有，换路线（重试无用）。
+- `kIOReturnBadArgument` → 参数形状不对：先试空输入，再按 selector 声明逐步加结构体（`iokitCallStruct`）。
+- `kIOReturnBadMessageID` → selector 无效，不是参数问题。
 
 ## 12. 已知没有的能力（别浪费时间找）
 
