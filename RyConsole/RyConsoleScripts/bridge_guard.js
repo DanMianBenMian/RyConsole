@@ -12,7 +12,7 @@
 //
 // 顺序：本文件在 installPrimitives 之后加载（桥都在之后），所以包装到的是已带 __ry_note 的函数，
 //       崩溃点名的行为不受影响。
-var BRIDGE_VERSION = "v1.0 (build 2026-09-18)";
+var BRIDGE_VERSION = "v1.1 (build 2026-09-19)";
 // 自报版本：加载后可在设备上一次性查"每个桥跑的是哪版" —— return JSON.stringify(RYC_BRIDGES)
 if (typeof RYC_BRIDGES === "undefined") { var RYC_BRIDGES = {}; }
 RYC_BRIDGES["bridge_guard"] = BRIDGE_VERSION;
@@ -97,6 +97,8 @@ var GUARDS = [
     args: [{ n: "conn", k: "num" }, { n: "sel", k: "u32" }, { n: "scalarInputs", k: "arrNum", opt: true },
            { n: "structB64", k: "strOpt", opt: true }, { n: "outSize", k: "numOpt", opt: true }] },
 
+  { p: "callPtr", sig: "callPtr(addrHex, args?, opts?)",
+    args: [{ n: "addrHex", k: "strNe" }, { n: "args", k: "arr", opt: true }, { n: "opts", k: "obj", opt: true }] },
   { p: "memRead", sig: "memRead(hexAddr, len)",
     args: [{ n: "hexAddr", k: "strNe" }, { n: "len", k: "num" }] },
   { p: "sysctlGet", sig: "sysctlGet(name)",
