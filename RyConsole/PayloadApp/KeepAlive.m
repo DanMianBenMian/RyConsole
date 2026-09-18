@@ -19,6 +19,7 @@
 //
 
 #import "KeepAlive.h"
+#import "LiveActivityBridge.h"   // 脉冲里给灵动岛续保鲜期（ryLiveActivityTouch）
 
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
@@ -74,6 +75,12 @@ static NSData *ryKeepAliveWavData(void) {
 @property (nonatomic, strong) AVAudioPlayer *player;
 @property (nonatomic, strong) NSTimer *pulse;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
+/// 是否"确实持有"一个有效的后台任务。
+/// ★ 不能只靠 bgTask != UIBackgroundTaskInvalid 判断：任务被系统回收/过期后，
+///   标识符本身不会变 0，重复对它调 endBackgroundTask: 会让系统抛异常 → App 崩。
+///   之前"从灵动岛切回 App 就崩"就是这个竞态（onBecomeActive 收尾时重复 end）。
+@property (nonatomic, assign) BOOL hasBgTask;
+@property (nonatomic, assign) BOOL pulsing;
 @property (nonatomic, assign) NSInteger pulseCount;
 @property (nonatomic, assign) NSInteger audioRestarts;
 @end
@@ -93,6 +100,8 @@ static NSData *ryKeepAliveWavData(void) {
         _active = NO;
         _reason = @"";
         _bgTask = UIBackgroundTaskInvalid;
+        _hasBgTask = NO;
+        _pulsing = NO;
         _pulseCount = 0;
         _audioRestarts = 0;
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -197,83 +206,141 @@ static NSData *ryKeepAliveWavData(void) {
     return [self.player play];
 }
 
+#pragma mark - 后台任务（★ 全部在主线程串行处理，绝不允许重复 end）
+
 - (void)beginBgTask {
-    UIApplication *app = [UIApplication sharedApplication];
-    if (self.bgTask != UIBackgroundTaskInvalid) {
-        [app endBackgroundTask:self.bgTask];
-        self.bgTask = UIBackgroundTaskInvalid;
+    if (![NSThread isMainThread]) {
+        __weak RYKeepAlive *ws = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [ws beginBgTask]; });
+        return;
     }
+    [self endBgTask];                       // 先安全收尾旧的（内部自带有效性判断）
+
+    UIApplication *app = [UIApplication sharedApplication];
     __weak RYKeepAlive *ws = self;
-    self.bgTask = [app beginBackgroundTaskWithName:@"RyConsole.AutorunKeepAlive"
-                                 expirationHandler:^{
-        // 到期立刻换一个新的（无限续期；系统最终仍可能强收，音频才是主路径）
-        RYKeepAlive *ss = ws;
-        if (!ss) return;
-        [ss beginBgTask];
+    UIBackgroundTaskIdentifier tid =
+        [app beginBackgroundTaskWithName:@"RyConsole.AutorunKeepAlive"
+                       expirationHandler:^{
+        // 到期回调跑在系统线程。★ 绝不在回调里直接 end/begin（会重复 end 已失效的 task → 抛异常）。
+        // 只把状态交给主线程，由主线程决定是否再要一个。
+        dispatch_async(dispatch_get_main_queue(), ^{
+            RYKeepAlive *ss = ws;
+            if (!ss) return;
+            ss.hasBgTask = NO;              // 系统已收走它，flag 先清（关键：防止之后重复 end）
+            ss.bgTask = UIBackgroundTaskInvalid;
+            if (ss.active) [ss beginBgTask];  // 还在监听就无限续期
+        });
     }];
+
+    if (tid == UIBackgroundTaskInvalid) {
+        self.hasBgTask = NO;
+        self.bgTask = UIBackgroundTaskInvalid;
+    } else {
+        self.hasBgTask = YES;
+        self.bgTask = tid;
+    }
 }
 
 - (void)endBgTask {
-    if (self.bgTask == UIBackgroundTaskInvalid) return;
-    [[UIApplication sharedApplication] endBackgroundTask:self.bgTask];
+    if (![NSThread isMainThread]) {
+        __weak RYKeepAlive *ws = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [ws endBgTask]; });
+        return;
+    }
+    // 先清 flag 再调 end：保证任何重入路径都不会对同一个 task end 两次
+    if (!self.hasBgTask || self.bgTask == UIBackgroundTaskInvalid) {
+        self.hasBgTask = NO;
+        self.bgTask = UIBackgroundTaskInvalid;
+        return;
+    }
+    UIBackgroundTaskIdentifier tid = self.bgTask;
+    self.hasBgTask = NO;
     self.bgTask = UIBackgroundTaskInvalid;
+    @try {
+        [[UIApplication sharedApplication] endBackgroundTask:tid];
+    } @catch (NSException *e) {
+        NSLog(@"[KeepAlive] endBackgroundTask 异常（已吞）: %@", e.reason);
+    }
 }
 
 #pragma mark - 兜底脉冲
 
 - (void)pulseOnce {
-    if (!self.active) return;
-    self.pulseCount++;
+    if (![NSThread isMainThread]) {
+        __weak RYKeepAlive *ws = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [ws pulseOnce]; });
+        return;
+    }
+    if (!self.active || self.pulsing) return;   // pulsing：防重入（音频重建可能触发通知回调）
+    self.pulsing = YES;
+    @try {
+        self.pulseCount++;
 
-    NSError *err = nil;
-    AVAudioSession *s = [AVAudioSession sharedInstance];
-    [s setActive:YES error:&err];              // 被通话/录音抢走后重新要回
+        NSError *err = nil;
+        AVAudioSession *s = [AVAudioSession sharedInstance];
+        [s setActive:YES error:&err];           // 被通话/录音抢走后重新要回
 
-    if (!self.player.isPlaying) {
-        self.audioRestarts++;
-        NSLog(@"[KeepAlive] 音频已停，重新拉起（第 %ld 次）", (long)self.audioRestarts);
-        if (![self.player play]) {             // player 彻底废了就重建
-            [self startAudio];
+        if (!self.player.isPlaying) {
+            self.audioRestarts++;
+            NSLog(@"[KeepAlive] 音频已停，重新拉起（第 %ld 次）", (long)self.audioRestarts);
+            if (![self.player play]) {          // player 彻底废了就重建
+                [self startAudio];
+            }
         }
+        if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground) {
+            [self beginBgTask];
+        }
+        // 每 ~6 分钟给灵动岛续一次保鲜期（数字不动），避免"还在监听却被标成陈旧"
+        if (self.pulseCount % 45 == 0) ryLiveActivityTouch();
+    } @catch (NSException *e) {
+        NSLog(@"[KeepAlive] pulse 异常（已吞）: %@", e.reason);
     }
-    if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground) {
-        [self beginBgTask];
-    }
+    self.pulsing = NO;
 }
 
 #pragma mark - 系统通知
 
+// ★ 这些通知可能来自任意线程、且可能在 App 状态切换的中间态触发；
+//   一律 @try 兜底 + 状态校验，绝不让它把 App 带崩。
 - (void)onAudioInterruption:(NSNotification *)n {
     if (!self.active) return;
-    NSInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] integerValue];
-    if (type == AVAudioSessionInterruptionTypeEnded) {
-        NSError *err = nil;
-        [[AVAudioSession sharedInstance] setActive:YES error:&err];
-        if (!self.player.isPlaying) [self.player play];
-        NSLog(@"[KeepAlive] 音频中断结束，已恢复");
-    }
+    @try {
+        NSInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] integerValue];
+        if (type == AVAudioSessionInterruptionTypeEnded) {
+            NSError *err = nil;
+            [[AVAudioSession sharedInstance] setActive:YES error:&err];
+            if (!self.player.isPlaying) [self.player play];
+            NSLog(@"[KeepAlive] 音频中断结束，已恢复");
+        }
+    } @catch (NSException *e) { NSLog(@"[KeepAlive] interruption 异常（已吞）: %@", e.reason); }
 }
 
 - (void)onAudioRouteChange:(NSNotification *)n {
     if (!self.active) return;
-    NSInteger why = [n.userInfo[AVAudioSessionRouteChangeReasonKey] integerValue];
-    if (why == AVAudioSessionRouteChangeReasonOldDeviceUnavailable) {   // 拔耳机等
-        NSError *err = nil;
-        [[AVAudioSession sharedInstance] setActive:YES error:&err];
-        if (!self.player.isPlaying) [self.player play];
-    }
+    @try {
+        NSInteger why = [n.userInfo[AVAudioSessionRouteChangeReasonKey] integerValue];
+        if (why == AVAudioSessionRouteChangeReasonOldDeviceUnavailable) {   // 拔耳机等
+            NSError *err = nil;
+            [[AVAudioSession sharedInstance] setActive:YES error:&err];
+            if (!self.player.isPlaying) [self.player play];
+        }
+    } @catch (NSException *e) { NSLog(@"[KeepAlive] routeChange 异常（已吞）: %@", e.reason); }
 }
 
 - (void)onEnterBackground:(NSNotification *)n {
     if (!self.active) return;
-    [self beginBgTask];
-    NSLog(@"[KeepAlive] 进入后台，保活态: %@", [self statusLine]);
+    @try {
+        [self beginBgTask];
+        NSLog(@"[KeepAlive] 进入后台，保活态: %@", [self statusLine]);
+    } @catch (NSException *e) { NSLog(@"[KeepAlive] enterBackground 异常（已吞）: %@", e.reason); }
 }
 
 - (void)onBecomeActive:(NSNotification *)n {
     if (!self.active) return;
-    [self endBgTask];                       // 前台不需要续期，别白占
-    if (!self.player.isPlaying) [self.player play];
+    @try {
+        [self endBgTask];                   // 前台不需要续期，别白占
+        if (!self.player.isPlaying) [self.player play];
+    } @catch (NSException *e) { NSLog(@"[KeepAlive] becomeActive 异常（已吞）: %@", e.reason); }
 }
 
 @end
