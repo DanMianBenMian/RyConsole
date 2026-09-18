@@ -271,13 +271,11 @@ static NSArray *RYManagedNormal(void) {
 
 // 读主程序 Mach-O 的 __entitlements 段（与 getEntitlements 同源思路）
 static NSString *RYEmbeddedEntitlementsString(void) {
-    const struct mach_header_64 *h = (const struct mach_header_64 *)dlsym(RTLD_MAIN_ONLY, MH_EXECUTE_SYM);
-    if (!h) {
-        // 回退：遍历 image，找主可执行文件
-        for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-            const struct mach_header *mh = _dyld_get_image_header(i);
-            if (mh && mh->filetype == MH_EXECUTE) { h = (const struct mach_header_64 *)mh; break; }
-        }
+    // iOS 没有 MH_EXECUTE_SYM → 遍历已加载 image，找 filetype == MH_EXECUTE 的主可执行
+    const struct mach_header_64 *h = NULL;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (mh && mh->filetype == MH_EXECUTE) { h = (const struct mach_header_64 *)mh; break; }
     }
     if (!h) return nil;
     unsigned long size = 0;
@@ -320,21 +318,17 @@ static NSString *RYEmbeddedEntitlementsString(void) {
                 ok = (v >= 0);
                 detail = [NSString stringWithFormat:@"sandbox_check = %d（errno %d）", v, errno];
             } else if ([key isEqualToString:@"cap:iokit"]) {
-                mach_port_t bp = MACH_PORT_NULL;
-                task_get_bootstrap_port(mach_task_self(), &bp);
-                mach_port_t master = 0;
-                kern_return_t kr = IOMasterPort(bp, &master);
-                if (kr == KERN_SUCCESS && master) {
-                    CFMutableDictionaryRef m = IOServiceMatching("IOSurfaceRoot");
-                    io_service_t svc = m ? IOServiceGetMatchingService(master, m) : 0;
+                // iOS 没有 IOMasterPort → 直接用 kIOMasterPortDefault（IOKit 在 iOS 上的标准入口）
+                CFMutableDictionaryRef m = IOServiceMatching("IOSurfaceRoot");
+                io_service_t svc = m ? IOServiceGetMatchingService(kIOMasterPortDefault, m) : 0;
+                {
+                    kern_return_t kr = svc ? KERN_SUCCESS : KERN_FAILURE;
                     io_connect_t conn = 0;
                     kern_return_t okr = svc ? IOServiceOpen(svc, mach_task_self(), 0, &conn) : -1;
                     ok = (okr == KERN_SUCCESS && conn != 0);
                     detail = [NSString stringWithFormat:@"IOServiceOpen kr=0x%x conn=%u", okr, (unsigned)conn];
                     if (conn) IOServiceClose(conn);
                     if (svc) IOObjectRelease(svc);
-                } else {
-                    detail = [NSString stringWithFormat:@"IOMasterPort kr=0x%x", kr];
                 }
             } else if ([key isEqualToString:@"cap:mach"]) {
                 // iOS 不暴露 <servers/bootstrap.h> → 运行时 dlsym 取符号，取不到就明确说不可用
