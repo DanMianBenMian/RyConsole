@@ -38,6 +38,40 @@ import argparse
 import json
 import os
 import sys
+
+
+def _setup_console():
+    """★ 2026-09-18 修复：程序"莫名崩溃"的真凶就在这里。
+
+    中文 Windows 控制台默认代码页是 936(GBK)，而本脚本会打印 ✅/❌ 这类字符。
+    Python 往 GBK 流写 UTF-8 无法表示的字符 → 抛 UnicodeEncodeError
+    → PyInstaller 打包的程序没有兜底 → **整个进程直接退出**（命令行看到的
+    "Failed to execute script" 就是这个）。
+
+    这里做两件事：
+      ① 把控制台输出代码页切成 65001(UTF-8)，让 cmd 能正常渲染 emoji/中文；
+      ② 把 stdout/stderr 强制成 utf-8 + errors="replace" —— 万一还有编码问题，
+         也只会显示成 ? 而**不会再把程序打死**。
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+    except Exception:
+        pass
+    for name in ("stdout", "stderr"):
+        s = getattr(sys, name, None)
+        if s is None:
+            continue
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_setup_console()
+
 import time
 import urllib.error
 import urllib.request
@@ -114,7 +148,12 @@ def cmd_ping(args):
              "  服务    : %s %s" % (r.get("name", "?"), r.get("version", "")),
              "  监听    : %s (端口 %s)" % ("是" if r.get("running") else "否", r.get("port")),
              "  iPad IP : %s" % r.get("lanIP", "?"),
-             "  忙      : %s   任务数: %s" % (r.get("busy"), r.get("jobs"))]
+             "  忙      : %s   任务数: %s" % (r.get("busy"), r.get("jobs")),
+             # ★ 以下几项是 2026-09-18 新增的诊断字段：一眼看出"服务是否重启过 / 收到的代码对不对"
+             "  进程 pid: %s   会话: %s" % (r.get("pid"), r.get("session")),
+             "  累计连接: %s" % r.get("hits"),
+             "  上次收码: %s 字节 (来源 %s)" % (r.get("lastCodeLen"), r.get("lastSrcKind")),
+             "  上次原语: %s" % r.get("lastPrim")]
     _emit(r, args.json, lines)
     return 0 if ok else 1
 
@@ -179,6 +218,17 @@ def cmd_run(args):
         if not args.quiet and not args.json:
             print("  第 %d 次轮询：%s" % (i, st))
         if st == "done":
+            break
+        # ★ 2026-09-18：服务端明确告知"任务被清理/没这个 id"时立刻停止轮询并说明原因，
+        #   不再傻等满 12 次（老版本只会打印裸 JSON，看起来像"结果丢了"）。
+        if last.get("error") in ("job_expired", "unknown_job"):
+            if not args.quiet and not args.json:
+                print("  服务端已清理该任务：%s" % last.get("error"))
+                if last.get("hint"):
+                    print("  提示：%s" % last["hint"])
+                if last.get("error") == "unknown_job":
+                    print("  多半是 iPad 上 RyConsole 崩溃/重开过（job 表随进程消失）——"
+                          "用 `ping` 看 pid 是否变了。")
             break
 
     if last is None:
