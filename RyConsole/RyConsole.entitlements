@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ===== 调试 / task port（研究侧载用；免费自签 profile 自带 get-task-allow）===== -->
+    <key>get-task-allow</key>
+    <true/>
+    <key>task_for_pid-allow</key>
+    <true/>
+    <key>run-unsigned-code</key>
+    <true/>
+    <key>com.apple.system-task-ports</key>
+    <true/>
+
+    <!-- ===== 沙箱例外（声明层面；私有项能否真正生效取决于 AMFI / 安装方式）===== -->
+    <key>com.apple.private.mobilehousearrest</key>
+    <true/>
+    <key>com.apple.private.containermanager</key>
+    <true/>
+    <key>com.apple.security.exception.mach-lookup.global-name</key>
+    <array>
+        <string>com.apple.securityd</string>
+        <string>com.apple.cfprefsd.daemon</string>
+        <string>com.apple.frontboard.systemappservices</string>
+    </array>
+    <key>com.apple.security.exception.files.absolute-path.read-only</key>
+    <true/>
+    <key>com.apple.security.exception.files.absolute-path.read-write</key>
+    <true/>
+    <key>com.apple.security.exception.iokit-user-client-class</key>
+    <array>
+        <string>IOSurfaceRootUserClient</string>
+    </array>
+
+    <!-- ===== 代码签名放宽（标准项，自签通常可被内核接受）===== -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.cs.debugger</key>
+    <true/>
+
+    <!-- ===== 钥匙串（声明分组，已可用）===== -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>com.research.ryconsole</string>
+    </array>
+</dict>
+</plist>
