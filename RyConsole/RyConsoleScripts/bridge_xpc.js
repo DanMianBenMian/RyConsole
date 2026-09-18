@@ -3,6 +3,9 @@
 //                       sandboxCheck/keychainProbe/procListPids/posixSpawn
 // 原生侧错误码/原始返回值原样回传；本桥做便捷封装 + 参数校验 + 语义命名。
 var BRIDGE_VERSION = "v1.1 (build 2026-09-18)";
+// 自报版本：加载后可在设备上一次性查"每个桥跑的是哪版" —— return JSON.stringify(RYC_BRIDGES)
+if (typeof RYC_BRIDGES === "undefined") { var RYC_BRIDGES = {}; }
+RYC_BRIDGES["bridge_xpc"] = BRIDGE_VERSION;
 var SCRIPT_VERSION = "bridge_xpc " + BRIDGE_VERSION;
 
 // 常见 XPC 错误事件 → 语义名（对端崩溃/拒绝/超时时 reply 会是 "<error>" 类字符串）
