@@ -6,4 +6,6 @@
 #import <UIKit/UIKit.h>
 
 @interface RYShellVC : UIViewController
+@property (nonatomic, strong) UIView *bottomBar;
+@property (nonatomic, assign) BOOL bottomMode;
 @end
