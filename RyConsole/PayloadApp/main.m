@@ -75,6 +75,8 @@ static void installPrimitives(JSContext *ctx);
 // ---- Stage2 竞态 harness（RACE_plan_v2 · 方案A）前向声明（实现在本文件后部）----
 static NSString *raceThreadSpawnNative(NSString *body, NSNumber *nw);
 static NSString *raceThreadJoinNative(NSNumber *timeoutMs, NSNumber *batchId);
+static NSString *raceThreadBatchesNative(void);
+static NSString *memWriteNative(NSString *addrHex, id data);
 static NSString *raceBarrierNative(NSNumber *n);
 static NSString *raceProgressNative(NSDictionary *obj);
 static NSString *raceSharedSetNative(NSString *key, id val);
@@ -115,6 +117,7 @@ typedef struct {
 } RYRaceBatch;
 static RYRaceBatch gBatches[RY_RACE_MAXBATCH];
 static int gBatchSeq = 0;
+static __thread int gTlsInWorker = 0;   // V2.4.12：当前线程是否 raceWorker（worker 内禁 threadJoin，防抢收批次表）
 typedef struct { RYRaceBatch *b; int idx; __strong NSString *body; } RYRaceArg;
 static _Atomic unsigned long long gRaceSlots[16];   // 共享原子槽（跨批次保留）
 static NSString *RYAutorunRunCapture(NSString *code);   // Autorun: 独立 ctx 执行并捕获输出
@@ -1105,6 +1108,58 @@ static NSString *memReadNative(NSString *hex, NSNumber *lenN) {
 }
 
 // ============================================================
+//  V2.4.12 写内存桥（memWrite）：向本任务地址空间写二进制（mach_vm_write_overwrite）
+//   用途：mach_msg 构造 / 结构体打补丁——callPtr 前把消息体写进缓冲区（测试清单 #2 硬前提）
+//   data 三种形态：① hex 串（偶数长度，可含空格/0x 前缀）② "b64:…" 前缀 ③ {b64:"…"} 字典
+//   安全：kr 干净返回（未映射=2 / 页只读=4），不崩；只对可写页生效（__TEXT 改不了，
+//         要改代码页请走 vm_protect 路线）；上限 64KB，与 memRead 对称。
+// ============================================================
+static NSString *memWriteNative(NSString *addrHex, id data) {
+    uintptr_t addr = objcHexToPtr(addrHex);
+    if (!addr) return @"[memWrite error] null address (addrHex 形如 0x...)  |  签名: memWrite(addrHex, data)  |  查参数: primHelp(\"memWrite\")";
+    NSData *bytes = nil;
+    if ([data isKindOfClass:[NSDictionary class]]) {
+        NSString *b64 = [(NSDictionary *)data objectForKey:@"b64"];
+        if (![b64 isKindOfClass:[NSString class]])
+            return @"[memWrite error] {b64:...} 形态缺 b64 字符串字段";
+        bytes = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+    } else if ([data isKindOfClass:[NSString class]]) {
+        NSString *sv = (NSString *)data;
+        if ([sv hasPrefix:@"b64:"]) {
+            bytes = [[NSData alloc] initWithBase64EncodedString:[sv substringFromIndex:4] options:0];
+        } else {
+            NSString *clean = [[[sv stringByReplacingOccurrencesOfString:@" " withString:@""]
+                                stringByReplacingOccurrencesOfString:@"\n" withString:@""]
+                               stringByReplacingOccurrencesOfString:@"0x" withString:@""];
+            if (clean.length < 2 || (clean.length % 2) != 0)
+                return @"[memWrite error] hex data 必须是偶数长度（每字节两个 hex 字符）；真二进制用 \"b64:…\" 或 {b64:\"…\"}";
+            NSMutableData *md = [NSMutableData dataWithCapacity:clean.length / 2];
+            for (NSUInteger i = 0; i + 1 < clean.length; i += 2) {
+                unsigned int b = 0;
+                if (![[NSScanner scannerWithString:[clean substringWithRange:NSMakeRange(i, 2)]] scanHexInt:&b])
+                    return @"[memWrite error] hex data 含非 hex 字符";
+                unsigned char c = (unsigned char)b; [md appendBytes:&c length:1];
+            }
+            bytes = md;
+        }
+    }
+    if (!bytes || bytes.length == 0)
+        return @"[memWrite error] data 必须是 hex 串 / \"b64:…\" / {b64:\"…\"}（mach_msg 构造传二进制请用 b64）";
+    if (bytes.length > 65536)
+        return @"[memWrite error] len must be 1..65536";
+    mach_vm_address_t outAddr = (mach_vm_address_t)addr;
+    kern_return_t kr = mach_vm_write_overwrite(mach_task_self(), (mach_vm_address_t)addr,
+                                               (mach_vm_offset_t)[bytes bytes],
+                                               (mach_msg_type_number_t)[bytes length],
+                                               &outAddr);
+    if (kr != KERN_SUCCESS)
+        return [NSString stringWithFormat:
+            @"[memWrite error] vm_write_overwrite kr=%d（2=KERN_INVALID_ADDRESS 未映射；4=KERN_PROTECTION_FAILURE 页只读，__TEXT 改不了）", (int)kr];
+    return [NSString stringWithFormat:@"{\"ok\":true,\"written\":%lu,\"addr\":\"0x%llx\"}",
+            (unsigned long)[bytes length], (unsigned long long)addr];
+}
+
+// ============================================================
 //  V2.2 objc_msgSend 安全封装（objc_msgSendSafe）：与原 objc_msgSend 区别
 //   ① nil recv/sel 返回结构化错误而非静默 0x0
 //   ② 参数 >7 直接拒绝（arm64 msgSend 无 stret，多传即崩）
@@ -1639,6 +1694,8 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             //   memRead：给定 objc_msgSend 返回的指针(句柄)，把那块映射内存 dump 成 hex
             ctx[@"objc_msgSendSafe"]=^(id recv, NSString *sel, NSArray *args){ return objcMsgSendSafeNative(recv, sel, args); };
             ctx[@"memRead"]=^(NSString *hex, NSNumber *len){ return memReadNative(hex, len); };
+            ctx[@"memWrite"]=^(NSString *addrHex, id data){ return memWriteNative(addrHex, data); };
+            ctx[@"threadBatches"]=^{ return raceThreadBatchesNative(); };
 
             // ---- V2.3 callPtr：C 函数指针调用（FFI）—— 补齐 dlopen/dlsym 之后的最后一环 ----
             //   规格：RYCONSOLE_CALLPTR_SPEC.md。只支持整型/指针返回；函数地址会先做可读性体检。
@@ -1840,6 +1897,7 @@ static void raceGateReleaseAll(RYRaceBatch *b) {
 }
 
 static void *raceWorker(void *p) {
+    gTlsInWorker = 1;                   // V2.4.12：worker 内禁 threadJoin（见 raceThreadJoinNative）
     RYRaceArg *arg = (RYRaceArg *)p;
     RYRaceBatch *b = arg->b;
     int idx = arg->idx;
@@ -1978,6 +2036,8 @@ static NSString *raceThreadSpawnNative(NSString *body, NSNumber *nw) {
 }
 
 static NSString *raceThreadJoinNative(NSNumber *timeoutMs, NSNumber *batchId) {
+    if (gTlsInWorker)
+        return @"{\"ok\":false,\"error\":\"[threadJoin error] 不能在 worker 内调用：会把批次表整批收割+回收，主脚本就再也 join 不到（V2.4.12 起 worker 内直接拒绝）。worker 的结果由主脚本 threadJoin 收割\"}";
     double tmo = [timeoutMs isKindOfClass:[NSNumber class]] ? [timeoutMs doubleValue] : 60000;
     if (tmo <= 0 || tmo > 600000) tmo = 60000;   // 上限 10 分钟防呆
     int wantBatch = [batchId isKindOfClass:[NSNumber class]] ? (int)[batchId intValue] : -1;  // -1 = 全部未收割批次
@@ -2037,11 +2097,50 @@ static NSString *raceThreadJoinNative(NSNumber *timeoutMs, NSNumber *batchId) {
             b->used = 0;             // 槽位回收，供下次 spawn 复用
         }
     }
+    if (nBatches == 0) {
+        // V2.4.12：空结果不再静默——之前 {done:0,batches:0} 完全看不出原因（threadJoin 回归的盲区）
+        if (wantBatch >= 0) {
+            NSMutableString *act = [NSMutableString string];
+            for (int i = 0; i < RY_RACE_MAXBATCH; i++) {
+                RYRaceBatch *b2 = &gBatches[i];
+                if (b2->used && !b2->joined)
+                    [act appendFormat:@"%@%d", (act.length ? @"," : @""), b2->id];
+            }
+            if (!act.length) [act appendString:@"（无活跃批次）"];
+            return [NSString stringWithFormat:
+                @"{\"ok\":false,\"error\":\"[threadJoin error] 没有批次号为 %d 的活跃批次——当前活跃: %@。检查参数序（正确: threadJoin(timeoutMs, batchId)，别把 batch 放第一位）或用 threadBatches() 对表\",\"seq\":%d}",
+                wantBatch, act, gBatchSeq];
+        }
+        return @"{\"ok\":false,\"batches\":0,\"done\":0,\"hint\":\"没有活跃批次（已全部收割或从未 spawn）——用 threadBatches() 对表；若 worker 内调过 threadJoin 会被拒绝并留错误在 worker 结果里\"}";
+    }
     NSDictionary *d = @{@"ok": @YES, @"batches": @(nBatches), @"done": @(doneCnt),
                         @"stillRunning": running, @"results": results};
     NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
     return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding]
               : @"{\"ok\":false,\"error\":\"serialize failed\"}";
+}
+
+// V2.4.12 调试原语（threadBatches）：dump 批次注册表原始状态
+//   用途：spawn 返回的 batch 在 join 侧"看不到"时当场对账（used/joined/id/n/ready/done/taken 逐槽列出）
+static NSString *raceThreadBatchesNative(void) {
+    NSMutableString *s = [NSMutableString stringWithString:@"{\"ok\":true,\"seq\":"];
+    [s appendFormat:@"%d,\"batches\":[", gBatchSeq];
+    int first = 1;
+    for (int i = 0; i < RY_RACE_MAXBATCH; i++) {
+        RYRaceBatch *b = &gBatches[i];
+        int doneCnt = 0, takenCnt = 0;
+        for (int k = 0; k < RY_RACE_MAXW; k++) {
+            if (atomic_load(&b->done[k])) doneCnt++;
+            if (atomic_load(&b->taken[k])) takenCnt++;
+        }
+        if (!first) [s appendString:@","];
+        first = 0;
+        [s appendFormat:@"{\"slot\":%d,\"used\":%d,\"joined\":%d,\"id\":%d,\"n\":%d,\"ready\":%d,\"done\":%d,\"taken\":%d}",
+            i, b->used, b->joined, b->id, b->n,
+            atomic_load(&b->ready), doneCnt, takenCnt];
+    }
+    [s appendString:@"]}"];
+    return s;
 }
 
 // 通用会合点（worker 体里用）：n 个参与者全到齐才一起放行（sense-reversing，可多轮）
