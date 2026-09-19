@@ -51,7 +51,9 @@ var IOKIT_KR = {
   "e00002d2": "kIOReturnStillOpen",
   "e00002d5": "kIOReturnBusy",
   "e00002d6": "kIOReturnTimeout",
+  "e00002d7": "kIOReturnOffline",
   "e00002d8": "kIOReturnNotReady",
+  "e00002d9": "kIOReturnNotAttached",
   "e00002da": "kIOReturnNoChannels",
   "e00002db": "kIOReturnNoSpace",
   "e00002e2": "kIOReturnNotPermitted",
@@ -67,6 +69,7 @@ var IOKIT_KR_HINT = {
   "e00002c6": "selector 无效（该方法不存在）→ 换 selector",
   "e00002c7": "该 UserClient 根本不提供这条路径（disabled/stub）→ 别重试，换类或换路线",
   "e00002cd": "连接已关闭：conn 已 iokitClose，或服务被回收 → 重新 iokitOpen",
+  "e00002d9": "未附着态（close 交界过渡码）：close 释放与引用清算交界的正常返回，竞态 harness 高频 open/close 下常见，通常不是漏洞证据",
   "e00002db": "输出缓冲太小 → 传更大的 outSize（iokitCallStruct 已会自动按内核回报值重试一次）",
   "e00002e2": "沙盒/entitlement 门禁挡死（kIOReturnNotPermitted）",
   "e00002f0": "句柄/程序不存在（可能已释放）"
