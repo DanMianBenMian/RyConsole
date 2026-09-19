@@ -269,7 +269,9 @@ static NSArray *RYManagedNormal(void) {
     ];
 }
 
-// 读主程序 Mach-O 的 __entitlements 段（与 getEntitlements 同源思路）
+// 读主程序嵌入的 entitlements（XML plist 文本）。
+// iOS 无 SecCode 公共 API；codesign 把 entitlements 放进 __LINKEDIT 的签名 blob 里
+// （magic 0xfade7171），早期无签名导出则完全没有。两种都覆盖。
 static NSString *RYEmbeddedEntitlementsString(void) {
     // iOS 没有 MH_EXECUTE_SYM → 遍历已加载 image，找 filetype == MH_EXECUTE 的主可执行
     const struct mach_header_64 *h = NULL;
@@ -278,11 +280,25 @@ static NSString *RYEmbeddedEntitlementsString(void) {
         if (mh && mh->filetype == MH_EXECUTE) { h = (const struct mach_header_64 *)mh; break; }
     }
     if (!h) return nil;
+    // 1) 命名段（部分工具 / 无签名导出会有）
     unsigned long size = 0;
     char *ptr = getsectdatafromheader_64(h, "__TEXT", "__entitlements", &size);
-    if (!ptr || size == 0) return nil;
-    NSData *d = [NSData dataWithBytes:ptr length:size];
-    return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (ptr && size > 0)
+        return [[NSString alloc] initWithBytes:ptr length:size encoding:NSUTF8StringEncoding];
+    // 2) codesign 真正的位置：__LINKEDIT 签名 blob（magic 0xfade7171，后跟 4 字节长度 + plist）
+    unsigned long lsz = 0;
+    char *ld = getsegmentdata((const struct mach_header *)h, "__LINKEDIT", &lsz);
+    if (ld && lsz > 8) {
+        const uint8_t *b = (const uint8_t *)ld;
+        for (unsigned long off = 0; off + 8 <= lsz; off++) {
+            if (b[off]==0x71 && b[off+1]==0x71 && b[off+2]==0xde && b[off+3]==0xfa) {
+                uint32_t blen = ((uint32_t)b[off+4]<<24)|((uint32_t)b[off+5]<<16)|((uint32_t)b[off+6]<<8)|b[off+7];
+                if (blen > 8 && off + blen <= lsz)
+                    return [[NSString alloc] initWithBytes:(b + off + 8) length:(blen - 8) encoding:NSUTF8StringEncoding];
+            }
+        }
+    }
+    return nil;
 }
 
 - (void)runDiagnostics:(void (^)(NSArray<NSDictionary *> *))done {
