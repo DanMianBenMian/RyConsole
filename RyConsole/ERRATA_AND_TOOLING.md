@@ -1,6 +1,6 @@
 # 勘误与桥工具（安全测试交接）
 
-更新时间 **2026-09-19** ｜ 对应发布 **V2.4.3**（Release tag `RyConsole-iPad-v1`）
+更新时间 **2026-09-19** ｜ 对应发布 **V2.4.5**（Release tag `RyConsole-iPad-v1`）
 
 ---
 
@@ -110,6 +110,7 @@ crashGuardSet(0)     // 关掉 → 恢复"真崩"（需要真崩时用，跑完 
 
 | IPA | 关键内容 |
 |---|---|
+| **V2.4.5** | ★ 竞态 harness 三项扩展（测试 Agent 请求）：① **起跑闸升级**——worker 建好 JSContext/原语后报 ready，最后一名到齐 `pthread_cond_broadcast` 放行全员（旧版创建完即放行，建 context 时差 = 毫秒级起跑偏差；失败路径/join 超时也强制放行防悬挂）；② **共享原子槽** `raceSlotSet/Get/AtomicAdd/AtomicCas`（16×64bit 原生 `_Atomic` 槽，JS number 53 位精度 → 64 位 handle/地址一律 `"0x…"` hex 进出，跨线程 handle 传递不再走字符串/NSNumber 编码；槽跨轮保留可做累计器）；③ **自动多轮** `raceRounds(fnBodyStr, nWorkers, rounds 1..100, timeoutMs)`（逐轮 spawn/join 聚合，纪律内置：超时未完/guarded 命中自动停）。★ krWhy 码表补 `e00002d7 kIOReturnOffline` / `e00002d9 kIOReturnNotAttached`（close 交界过渡码，竞态高频 open/close 常见） |
 | **V2.4.4** | ★ 灵动岛连接次数滞后/回跳修复（LiveActivity.swift 推送管线重写）：① 去掉 update 的主线程绕行（Autorun 连接线程高频轮询时主队列积压 = 滞后根因）；② 推送单飞 + dirty 追赶（Task 完成顺序不定导致旧快照后落 = 回跳根因，现在永远推最新快照）；③ 计数类更新合并进 0.5s 窗口（避开系统对高频 Live Activity 更新的节流）；④ 权限提醒（alert）绕过窗口立即推。行为变化：连接数最多滞后 ~0.5s 但单调递增不回跳 |
 | **V2.4.3** | ★ Stage2 竞态 harness 合入（RACE_plan_v2 方案A，8 原语）：`threadSpawn(fnBodyStr, nWorkers 1..8)`（每 worker 独立 JSContext+全套原语，起跑闸同步）/ `threadJoin(timeoutMs)` / `raceBarrier(n)`（sense-reversing 会合）/ `raceSharedSet/Get`（跨线程传 conn handle）/ `threadProgress`（落盘 race_progress.json 防 panic 丢数据）/ `threadStop/Flag`（协作停）。★ 崩溃兜底状态 `__thread` 化（worker 各布各的检查点；worker 内 SIGSEGV → 该线程 guarded:true，进程存活；主线程布点不再被 worker 覆盖）。M1 探针骨架 `RyConsoleScripts/race_probe_m1.js`（并发版 close-then-use，spawn→barrier→race→join） |
 | **V2.4.2** | ★ callPtr 返回契约钉死（见 §5.1）：闸门驳回从纯文本 `权限请求驳回` 改为统一 JSON `{ok:false,error:"权限请求驳回…",rejected:true,cmd:n}`；验收脚本 `RyConsoleScripts/callptr_acceptance.js`（strlen / getcwd / mach_port_allocate / MCM null 三连）。**MCM SIGSEGV@0x58 定性**：非 callPtr 回归（源码 diff 证明参数侧 V2.3.0→32 零变化，ARC strong 传参推断不成立），根因 = build 29 起嵌入 entitlements 后 MCM 内部 entitlement 检查通过走深路径 → NULL+0x58 解引用；未签名 build 同样调用返 0。兜底会拦成 `guarded:true`（App 存活），属预期行为 |
