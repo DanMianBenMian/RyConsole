@@ -110,6 +110,7 @@ crashGuardSet(0)     // 关掉 → 恢复"真崩"（需要真崩时用，跑完 
 
 | IPA | 关键内容 |
 |---|---|
+| **V2.4.2** | ★ callPtr 返回契约钉死（见 §5.1）：闸门驳回从纯文本 `权限请求驳回` 改为统一 JSON `{ok:false,error:"权限请求驳回…",rejected:true,cmd:n}`；验收脚本 `RyConsoleScripts/callptr_acceptance.js`（strlen / getcwd / mach_port_allocate / MCM null 三连）。**MCM SIGSEGV@0x58 定性**：非 callPtr 回归（源码 diff 证明参数侧 V2.3.0→32 零变化，ARC strong 传参推断不成立），根因 = build 29 起嵌入 entitlements 后 MCM 内部 entitlement 检查通过走深路径 → NULL+0x58 解引用；未签名 build 同样调用返 0。兜底会拦成 `guarded:true`（App 存活），属预期行为 |
 | **V2.4.0** | ★ 新增第5选项卡「权限与安全」：①**权限诊断**（逐项实测 entitlement/能力，可用/禁用各自独立显示）②**安全**（命令可用性开关，默认全启用，高危命令带提示；被禁用的命令调用时请求用户确认——后台优先灵动岛提醒、前台/无岛直接弹窗，主标题「请求权限」、子标题「要调用 xxx、xx 命令」，不同意回 AI「权限请求驳回」）③**日志**（顶层「高危命令 x 次 / 一般命令 n 次」计数 + 可筛选列表，高危红、一般绿）。原语统一经 `__ry_gate` 闸门；灵动岛 `LiveActivity` 加 `alert` 字段承载权限提醒 |
 | **V2.3.0** | ★ **`callPtr`**（C 函数指针调用/FFI，规格 `RYCONSOLE_CALLPTR_SPEC.md`；地址 vm_read 体检 + crashGuard 兜底）+ 版本号显示修复（UI/`/ping` 从 Bundle 读，本版 = 2.3.0）|
 | **V2.2.7** | ★ 修兜底"没拦到"的真 bug（sigsetjmp 返回两次，撤点在正常路径也跑 → 布完即撤）；`objc_msgSendSafe` 加**接收方体检**（vm_read 探 16 字节，垃圾指针 → 结构化错误不崩） |
@@ -119,4 +120,17 @@ crashGuardSet(0)     // 关掉 → 恢复"真崩"（需要真崩时用，跑完 
 | **V2.2.3** | `objc_msgSend` 返回值 ARC 血案修复（`__unsafe_unretained`） |
 | **V2.2.2** | 缺陷报告 5 条 + `lastPrim` 崩溃点名 + `/ping` 诊断字段 |
 | **V2.2.1** | 灵动岛崩溃 / 强杀残留 / 崩溃日志自动记录 |
+
+### 5.1 callPtr 返回契约（钉死 · V2.4.2 起，脚本按此写）
+
+callPtr 自身**永远返回 JSON 字符串**（这个从 V2.3.0 起就没变过），但一次调用有三种可能的落点，脚本必须按序判：
+
+1. **正常返回**：`{"ok":true,"value":"0x…"[,"out":{"buf0":"<base64>",…}]}`（`value`=返回值寄存器 x0；`out.bufK`=第 k 个 `{buf:}`/`{str:}` 缓冲内容）
+2. **崩溃兜底拦截**（调用把进程打出 SIGSEGV/SIGBUS 等）：Autorun 信封整体变为
+   `{"ok":false,"guarded":true,"guardSignal":11,"guardAddr":"0x58","guardPrim":"callPtr","output":…,"result":null,"error":…}`
+   —— **先判 `guarded` 再取 `result`**；`guarded:true` ⇒ 结论是"这调用会崩但 App 还活着"，不要当普通失败重试。@0x58 = NULL+88 解引用（MCM 实测）。
+3. **权限闸门驳回**（命令被禁用且用户拒绝/60s 超时）：V2.4.2 起返回统一 JSON
+   `{"ok":false,"error":"权限请求驳回（<命令名>）","rejected":true,"cmd":"<命令名>"}`（旧版返回纯文本，JSON.parse 会炸——已修）。
+
+**MCM 三函数实测结论（V2.4.x，写脚本时须知）**：对 `MCMGetContainerUrlForIdentifier` 等传 null，在**未签名 build（≤28）返 0**；在**嵌入 entitlements 的 build（≥29）SIGSEGV@0x58（被兜底拦成 guarded）**。这不是 callPtr 的 bug——是 MCM 框架内部 entitlement 检查在声明层通过后走了更深路径。验收标准：**App 存活**（返 0x0 或 guarded:true 均算 PASS）。
 | **V2.2** | 监听期后台保活（静音音频 + bgTask）+ 灵动岛实时活动 |
