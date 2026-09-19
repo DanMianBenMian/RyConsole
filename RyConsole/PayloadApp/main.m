@@ -74,7 +74,7 @@ static NSString *loadEngineSource(void);
 static void installPrimitives(JSContext *ctx);
 // ---- Stage2 竞态 harness（RACE_plan_v2 · 方案A）前向声明（实现在本文件后部）----
 static NSString *raceThreadSpawnNative(NSString *body, NSNumber *nw);
-static NSString *raceThreadJoinNative(NSNumber *timeoutMs);
+static NSString *raceThreadJoinNative(NSNumber *timeoutMs, NSNumber *batchId);
 static NSString *raceBarrierNative(NSNumber *n);
 static NSString *raceProgressNative(NSDictionary *obj);
 static NSString *raceSharedSetNative(NSString *key, id val);
@@ -87,33 +87,36 @@ static NSString *raceAtomicCasNative(NSNumber *idx, id expect, id swap);
 static NSString *raceRoundsNative(NSString *body, NSNumber *nw, NSNumber *rounds, NSNumber *timeoutMs);
 
 // ---- Stage2 竞态 harness 共享状态（★ 必须在 installPrimitives 之前：注册块引用 gRaceStop）----
-static atomic_int gRaceGo = 0;     // 起跑闸
-static atomic_int gRaceStop = 0;   // 协作停止标志
-static atomic_int gRBCount = 0;    // raceBarrier 计数
+static atomic_int gRaceStop = 0;   // 协作停止标志（全局）
+static atomic_int gRBCount = 0;    // raceBarrier 计数（★ 全局单份：多批次并发时仅供单批使用）
 static atomic_int gRBGen = 0;      // raceBarrier 代际（sense-reversing）
-static atomic_int gRaceDone[8];
-static atomic_int gRaceGuarded[8];
-static NSString *gRaceResults[8] = {0};   // worker 写 / join 读（done 标志先行发布）
-static int gRaceN = 0;
-typedef struct { int idx; __strong NSString *body; } RYRaceArg;
 static pthread_mutex_t gSharedLock = PTHREAD_MUTEX_INITIALIZER;
 static NSMutableDictionary *gSharedMap = nil;
 
-// ---- V2.4.5 起跑闸升级：ready 到齐 + cond 广播（消除毫秒级起跑偏差）----
-//   旧版：threadSpawn 创建完线程就置 gRaceGo=1，早创建的 worker 还在建 JSContext，
-//         晚的刚被调度 → 各 worker 实际开跑时刻差毫秒级，竞态窗口没对齐。
-//   新版：worker 装好全套原语后报 ready，最后一名到齐时 cond_broadcast 放行全员
-//         —— 起跑对齐到"全部就绪"之后。失败路径（兜底跳回/setup 异常）也要放行，
-//         否则其他 worker 在 cond_wait 上挂死。
-static pthread_mutex_t gRaceGateLock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  gRaceGateCond = PTHREAD_COND_INITIALIZER;
-static atomic_int gRaceReady = 0;      // 已就绪 worker 数（仅 gate lock 内增减）
-static atomic_int gRaceTarget = 0;     // 本轮目标 N
-
-// ---- V2.4.5 共享原子槽：16 × 64bit，跨线程 handle 传递/无锁协作 ----
-//   JS number 只有 53 位精度（2^53 以上丢失）→ 64 位内核指针/句柄一律走 "0x…" hex 串进出。
-//   threadSpawn 不清槽（跨轮累计器用）；要清就显式 raceSlotSet(i, 0)。
-static _Atomic unsigned long long gRaceSlots[16];
+// ---- V2.4.9 批次注册表：threadSpawn 每次产生一个批次，threadJoin 可按批/全量收割 ----
+//   （修复：旧版 threadJoin 只 join 最后一次 spawn 的批次，更早批次结果直接丢失）
+//   · 每批独立起跑闸（mutex+cond + ready/target/go），互不干扰；
+//   · join 收割完一批即回收槽位（销毁同步对象），8 个槽循环复用；
+//   · spawn 失败的槽位立即标记 done（spawn-failed JSON），保证批次必然可收割、不泄漏；
+//   · spawn 后不 join 的批次一直占槽 → 第 9 次 spawn 报错提示先 join（纪律而非 bug）。
+#define RY_RACE_MAXBATCH 8
+#define RY_RACE_MAXW     8
+typedef struct {
+    int used;                       // 槽位在用
+    int joined;                     // 已收割（冗余，= !used 时销毁完同步对象）
+    int id;                         // 批次号（全seq，汇报/按批 join 用）
+    int n;
+    atomic_int ready, target, go;   // 起跑闸（每批独立）
+    pthread_mutex_t gateLock;
+    pthread_cond_t  gateCond;
+    int gateInited;
+    atomic_int done[RY_RACE_MAXW], guarded[RY_RACE_MAXW], taken[RY_RACE_MAXW];
+    NSString *results[RY_RACE_MAXW];
+} RYRaceBatch;
+static RYRaceBatch gBatches[RY_RACE_MAXBATCH];
+static int gBatchSeq = 0;
+typedef struct { RYRaceBatch *b; int idx; __strong NSString *body; } RYRaceArg;
+static _Atomic unsigned long long gRaceSlots[16];   // 共享原子槽（跨批次保留）
 static NSString *RYAutorunRunCapture(NSString *code);   // Autorun: 独立 ctx 执行并捕获输出
 static void RunCode(UIViewController *from, NSString *code);
 static void (^gRunCompletion)(NSString *output);   // LocalSend Code 头设入：RunCode 执行结束后回传完整输出
@@ -783,8 +786,15 @@ static xpc_object_t xpcFromObj(id obj) {
 // ============================================================
 
 // ---- XPC 持久连接注册表（handle -> xpc_connection_t）----
+// ★ V2.4.9 线程安全修复（P102–P104 SIGSEGV 定性）：注册表字典非线程安全 + close 与
+//   send 并发时的连接生命周期竞争。修复：
+//   ① g_xpcLock 串行化注册表操作（创建/关闭/取回）；
+//   ② send 用强引用（id v）把连接对象保活到发送结束 —— 并发 close 只会 cancel 连接
+//      （send_with_reply 收到 error 事件，xpcToObj 已处理），不会再 use-after-free。
+//   语义：send 不加全局锁 → 跨连接/同连接并发仍可测（libxpc 自身 MT-safe）。
 static NSMutableDictionary<NSNumber *, NSValue *> *g_xpcConns = nil;
 static long g_xpcNextHandle = 1000;
+static pthread_mutex_t g_xpcLock = PTHREAD_MUTEX_INITIALIZER;
 
 // xpc_object_t -> ObjC（递归解析 reply；深度限 6、每层条目限 64 防 reply 轰炸）
 // UINT64 转十六进制字符串回传，避免 JS Number 53 位精度丢失
@@ -825,36 +835,48 @@ static id xpcToObj(xpc_object_t o, int depth) {
 }
 
 static NSDictionary *xpcConnNative(NSString *svc) {
-    if (!g_xpcConns) g_xpcConns = [NSMutableDictionary new];
+    if (![svc isKindOfClass:[NSString class]] || !svc.length) return @{@"err": @"svc-required"};
     xpc_connection_t c = xpc_connection_create([svc UTF8String], NULL);
     if (!c) return @{@"err": @"create-failed"};
     // 事件 handler 必须设（空实现即可）：默认 handler 收到 error 事件会直接 crash 进程
     xpc_connection_set_event_handler(c, ^(xpc_object_t ev) {});
     xpc_connection_resume(c);
+    pthread_mutex_lock(&g_xpcLock);
+    if (!g_xpcConns) g_xpcConns = [NSMutableDictionary new];
     long h = g_xpcNextHandle++;
     g_xpcConns[@(h)] = c; // xpc 对象即 ObjC 对象(NSObject<OS_xpc_object>*), ARC 直接持有
+    pthread_mutex_unlock(&g_xpcLock);
     return @{@"h": @(h)};
 }
 
-static xpc_connection_t xpcConnGet(long h) {
+static id xpcConnGet(long h) {
+    // ★ 只在 g_xpcLock 内做字典读取；返回强引用 id（ARC 保活到调用方作用域结束），
+    //   并发 close 只会 cancel 连接，不会让正在发送的线程拿到悬垂指针。
+    pthread_mutex_lock(&g_xpcLock);
     id v = g_xpcConns[@(h)];
-    return (xpc_connection_t)v; // 同一 ObjC 类型, 直接桥回
+    pthread_mutex_unlock(&g_xpcLock);
+    return v; // 同一 ObjC 类型, 直接桥回
 }
 
 static NSString *xpcCloseNative(long h) {
-    xpc_connection_t c = xpcConnGet(h);
-    if (!c) return @"NOT_FOUND";
+    pthread_mutex_lock(&g_xpcLock);
+    id v = g_xpcConns[@(h)];
+    if (!v) { pthread_mutex_unlock(&g_xpcLock); return @"NOT_FOUND"; }
+    xpc_connection_t c = (xpc_connection_t)v;   // v 强持有：cancel 期间对象不会被释放
     xpc_connection_cancel(c);
     [g_xpcConns removeObjectForKey:@(h)];
+    pthread_mutex_unlock(&g_xpcLock);
     return @"ok";
 }
 
 // 结构化收发: h=连接句柄, msg=任意嵌套 JS 对象(转 xpc_dictionary), timeoutSec<=0 为发射不等待
 // 回传解析后的 reply 对象；超时 {err:timeout}；对端回 ERROR 事件时回传 "<error-type>" 字符串
 static id xpcSendMsgNative(long h, NSDictionary *msg, double timeoutSec) {
-    xpc_connection_t c = xpcConnGet(h);
-    if (!c) return @{@"err": @"bad-handle"};
     if (![msg isKindOfClass:[NSDictionary class]]) return @{@"err": @"msg-not-dict"};
+    // ★ 强引用取出连接（V2.4.9）：并发 close 只 cancel 不释放，发送过程无悬垂指针
+    id v = xpcConnGet(h);
+    if (!v) return @{@"err": @"bad-handle"};
+    xpc_connection_t c = (xpc_connection_t)v;
     xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
     for (NSString *k in msg) xpc_dictionary_set_value(m, [k UTF8String], xpcFromObj(msg[k]));
     if (timeoutSec <= 0) {
@@ -1713,7 +1735,7 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             //     threadStopFlag 协作停；worker 各布检查点（兜底已 __thread 化），崩了返回 guarded。
             //   threadJoin(timeoutMs) -> {ok,threads,done,stillRunning,results:[{thread,guarded,result}]}
             ctx[@"threadSpawn"]   = ^(NSString *body, NSNumber *nw){ return raceThreadSpawnNative(body, nw); };
-            ctx[@"threadJoin"]    = ^(NSNumber *timeoutMs){ return raceThreadJoinNative(timeoutMs); };
+            ctx[@"threadJoin"]    = ^(NSNumber *timeoutMs, NSNumber *batchId){ return raceThreadJoinNative(timeoutMs, batchId); };
             ctx[@"raceBarrier"]   = ^(NSNumber *n){ return raceBarrierNative(n); };
             ctx[@"threadProgress"]= ^(NSDictionary *obj){ return raceProgressNative(obj); };
             ctx[@"threadStop"]    = ^NSString*{ atomic_store(&gRaceStop, 1); return @"{\"ok\":true,\"stopped\":true}"; };
@@ -1793,32 +1815,33 @@ static __thread char gGuardLastPrim[128] = {0};   // 各线程记各线程的（
 #define RY_GUARD_DISARM() do { gGuardArmed = 0; gGuardThread = 0; } while (0)
 
 // ============================================================
-//  V2.4.3 Stage2 竞态 harness（RACE_plan_v2 · 方案A：JS 线程桥）
+//  V2.4.9 Stage2 竞态 harness（RACE_plan_v2 · 方案A：JS 线程桥）—— 批次注册表版
 //  ------------------------------------------------------------
-//  threadSpawn(fnBodyStr, nWorkers) -> {ok,threads,threadIds}
-//    · 每 worker：独立 JSContext + installPrimitives 全套原语（iokit*/callPtr/memRead…）
-//    · 起跑闸：全部 pthread_create 成功后才放行（gRaceGo），保证同时开跑
+//  threadSpawn(fnBodyStr, nWorkers) -> {ok,threads,threadIds,batch}
+//    · 每次 spawn = 一个批次（batch 号全 seq 递增）；每 worker 独立 JSContext + 全套原语
+//    · 起跑闸（每批独立）：worker 就绪报 ready，最后一名 cond_broadcast 放行全员
 //    · worker 各布崩溃检查点（兜底状态已 __thread 化）：
 //      worker 内 SIGSEGV → 该线程返回 {guarded:true,guardSignal,guardAddr}，进程存活
-//    · worker 内可用：raceBarrier(n)（多轮会合）、raceSharedSet/Get（跨线程传 conn handle）、
-//      threadProgress(obj)（进度落盘 Documents/race_progress.json，防 panic 丢数据）、
-//      threadStopFlag()（协作停）
-//  threadJoin(timeoutMs) -> {ok,threads,done,stillRunning,results:[{thread,guarded,result}]}
+//    · worker 内可用：raceBarrier(n)（会合）、raceSharedSet/Get、raceSlotSet/Get、
+//      raceAtomicAdd/Cas、threadProgress(obj)（进度落盘）、threadStopFlag()（协作停）
+//  threadJoin(timeoutMs[, batchId]) -> {ok,batches,done,stillRunning,results:[{batch,thread,guarded,result}]}
+//    · V2.4.9：不传 batchId = 收割**全部**未收割批次（旧版只能 join 最后一批）；
+//      部分收割可再次 join 补收；整批收齐自动回收槽位（8 槽循环复用）
 //  ❌ 兜不住：内核 panic（RACE 计划已接受；autorun 自启恢复机制承接）
-//  ⚠ raceBarrier 是"全员到齐才放行"：计数必须等于同时调用的参与者数，主线程脚本
-//    和 worker 别混着调（主线程阻塞等 worker = 死锁）
+//  ⚠ raceBarrier 是全局单份：多批次并发时仅供其中一批使用（其余批次别调）
 // ============================================================
 
 // 失败路径也放行（否则其他 worker 在 cond_wait 上挂死到 join 超时）
-static void raceGateReleaseAll(void) {
-    pthread_mutex_lock(&gRaceGateLock);
-    atomic_store(&gRaceGo, 1);
-    pthread_cond_broadcast(&gRaceGateCond);
-    pthread_mutex_unlock(&gRaceGateLock);
+static void raceGateReleaseAll(RYRaceBatch *b) {
+    pthread_mutex_lock(&b->gateLock);
+    atomic_store(&b->go, 1);
+    pthread_cond_broadcast(&b->gateCond);
+    pthread_mutex_unlock(&b->gateLock);
 }
 
 static void *raceWorker(void *p) {
     RYRaceArg *arg = (RYRaceArg *)p;
+    RYRaceBatch *b = arg->b;
     int idx = arg->idx;
     NSString *body = arg->body;
     arg->body = nil;                    // ARC 释放结构体里的强引用
@@ -1836,12 +1859,12 @@ static void *raceWorker(void *p) {
         int gsig = 0;
         RY_GUARD_ARM(gsig);             // 线程本地检查点（★ 本帧，宏展开就是本层栈）
         if (gsig != 0) {                // 从信号跳回：worker 被兜底拦下
-            raceGateReleaseAll();       // 没等到起跑就崩了也要放行同伴
-            gRaceResults[idx] = [NSString stringWithFormat:
+            raceGateReleaseAll(b);      // 没等到起跑就崩了也要放行同伴
+            b->results[idx] = [NSString stringWithFormat:
                 @"{\"ok\":false,\"guarded\":true,\"guardSignal\":%d,\"guardAddr\":\"0x%llx\",\"thread\":%d}",
                 gsig, (unsigned long long)RYGuardLastAddr(), idx];
-            atomic_store(&gRaceGuarded[idx], 1);
-            atomic_store(&gRaceDone[idx], 1);
+            atomic_store(&b->guarded[idx], 1);
+            atomic_store(&b->done[idx], 1);
             return NULL;
         }
 
@@ -1849,7 +1872,8 @@ static void *raceWorker(void *p) {
         NSString *ret = nil;
         @try {
             JSContext *ctx = [[JSContext alloc] init];
-            ctx[@"__threadId"] = @(idx);
+            ctx[@"__threadId"] = @(idx);                 // 批内序号 0..n-1（分角色用）
+            ctx[@"__threadBatch"] = @(b->id);            // V2.4.9 批次号
             ctx.exceptionHandler = ^(JSContext *c, JSValue *e) {
                 [out appendFormat:@"[JS Error] %@\n", [e description]];
             };
@@ -1861,30 +1885,30 @@ static void *raceWorker(void *p) {
             };
             installPrimitives(ctx);     // worker 拿全套原语（含闸门包装）
 
-            // ★ 起跑闸（V2.4.5）：context/原语全部就绪后才报 ready；最后一名到齐即
+            // ★ 起跑闸（每批独立）：context/原语全部就绪后才报 ready；最后一名到齐即
             //   cond_broadcast 放行全员 —— 开跑时刻对齐到"全部就绪"之后（毫秒级偏差消除）。
-            pthread_mutex_lock(&gRaceGateLock);
-            int rdy = atomic_fetch_add(&gRaceReady, 1) + 1;
-            if (rdy >= atomic_load(&gRaceTarget)) {
-                atomic_store(&gRaceGo, 1);
-                pthread_cond_broadcast(&gRaceGateCond);
+            pthread_mutex_lock(&b->gateLock);
+            int rdy = atomic_fetch_add(&b->ready, 1) + 1;
+            if (rdy >= atomic_load(&b->target)) {
+                atomic_store(&b->go, 1);
+                pthread_cond_broadcast(&b->gateCond);
             } else {
-                while (!atomic_load(&gRaceGo))
-                    pthread_cond_wait(&gRaceGateCond, &gRaceGateLock);
+                while (!atomic_load(&b->go))
+                    pthread_cond_wait(&b->gateCond, &b->gateLock);
             }
-            pthread_mutex_unlock(&gRaceGateLock);
+            pthread_mutex_unlock(&b->gateLock);
 
             JSValue *res = [ctx evaluateScript:body];
             if (res && ![res isUndefined]) ret = [res description];
         } @catch (NSException *e) {
-            raceGateReleaseAll();       // setup/执行异常同样放行同伴
+            raceGateReleaseAll(b);      // setup/执行异常同样放行同伴
             ret = [NSString stringWithFormat:@"{\"ok\":false,\"error\":\"[thread exception] %@\"}",
                    [e.reason stringByReplacingOccurrencesOfString:@"\"" withString:@"'"]];
         }
         if (!ret) ret = @"null";
         if ([out length]) ret = [ret stringByAppendingFormat:@"\n%@", out];
-        gRaceResults[idx] = ret;
-        atomic_store(&gRaceDone[idx], 1);
+        b->results[idx] = ret;
+        atomic_store(&b->done[idx], 1);
         RY_GUARD_DISARM();
     }
     return NULL;
@@ -1896,65 +1920,124 @@ static NSString *raceThreadSpawnNative(NSString *body, NSNumber *nw) {
     int n = [nw isKindOfClass:[NSNumber class]] ? (int)[nw intValue] : 2;
     if (n < 1) n = 1;
     if (n > 8) n = 8;
-    atomic_store(&gRaceGo, 0);  atomic_store(&gRaceStop, 0);
+    atomic_store(&gRaceStop, 0);
     atomic_store(&gRBCount, 0); atomic_store(&gRBGen, 0);
-    atomic_store(&gRaceReady, 0);
-    atomic_store(&gRaceTarget, n);
-    // ★ 共享原子槽不清（跨轮累计器用）；要清就显式 raceSlotSet(i,0)
-    for (int i = 0; i < 8; i++) {
-        atomic_store(&gRaceDone[i], 0);
-        atomic_store(&gRaceGuarded[i], 0);
-        gRaceResults[i] = nil;
+
+    // 找空闲批次槽（未用即空闲）
+    RYRaceBatch *b = NULL;
+    for (int i = 0; i < RY_RACE_MAXBATCH; i++) {
+        if (!gBatches[i].used) { b = &gBatches[i]; break; }
     }
-    gRaceN = n;
+    if (!b)
+        return @"{\"ok\":false,\"error\":\"[threadSpawn error] 8 个批次槽占满——先 threadJoin 回收旧批次（spawn 后不 join 的批次会一直占槽）\"}";
+
+    // 复用槽：先销毁旧同步对象再重初始化
+    if (b->gateInited) {
+        pthread_mutex_destroy(&b->gateLock);
+        pthread_cond_destroy(&b->gateCond);
+        b->gateInited = 0;
+    }
+    pthread_mutex_init(&b->gateLock, NULL);
+    pthread_cond_init(&b->gateCond, NULL);
+    b->gateInited = 1;
+    b->used = 1; b->joined = 0;
+    b->id = ++gBatchSeq;
+    b->n = n;
+    atomic_store(&b->ready, 0); atomic_store(&b->target, n); atomic_store(&b->go, 0);
+    for (int i = 0; i < RY_RACE_MAXW; i++) {
+        atomic_store(&b->done[i], 0);
+        atomic_store(&b->guarded[i], 0);
+        atomic_store(&b->taken[i], 0);
+        b->results[i] = nil;
+    }
     for (int i = 0; i < n; i++) {
         RYRaceArg *arg = malloc(sizeof(RYRaceArg));
-        if (!arg) return @"{\"ok\":false,\"error\":\"[threadSpawn error] alloc failed\"}";
+        if (!arg) {
+            raceGateReleaseAll(b);   // 放行已创建的同伴，它们正常跑完可收割
+            return [NSString stringWithFormat:
+                @"{\"ok\":false,\"error\":\"[threadSpawn error] alloc failed at %d\",\"batch\":%d}", i, b->id];
+        }
+        arg->b = b;
         arg->idx = i;
         arg->body = body;
         pthread_t t;
         if (pthread_create(&t, NULL, raceWorker, arg) != 0) {
             arg->body = nil; free(arg);
-            return [NSString stringWithFormat:
+            // 槽位标记 spawn-failed：批次保持"必然可收割"，不泄漏
+            b->results[i] = [NSString stringWithFormat:
                 @"{\"ok\":false,\"error\":\"[threadSpawn error] pthread_create failed at %d\"}", i];
+            atomic_store(&b->done[i], 1);
+            continue;
         }
         pthread_detach(t);
     }
-    atomic_store(&gRaceGo, 1);          // 全部创建成功 → 起跑闸放行
     NSMutableString *ids = [NSMutableString string];
     for (int i = 0; i < n; i++) [ids appendFormat:@"%@%d", (i ? @"," : @""), i];
-    return [NSString stringWithFormat:@"{\"ok\":true,\"threads\":%d,\"threadIds\":[%@]}", n, ids];
+    return [NSString stringWithFormat:
+        @"{\"ok\":true,\"threads\":%d,\"threadIds\":[%@],\"batch\":%d}", n, ids, b->id];
 }
 
-static NSString *raceThreadJoinNative(NSNumber *timeoutMs) {
+static NSString *raceThreadJoinNative(NSNumber *timeoutMs, NSNumber *batchId) {
     double tmo = [timeoutMs isKindOfClass:[NSNumber class]] ? [timeoutMs doubleValue] : 60000;
     if (tmo <= 0 || tmo > 600000) tmo = 60000;   // 上限 10 分钟防呆
+    int wantBatch = [batchId isKindOfClass:[NSNumber class]] ? (int)[batchId intValue] : -1;  // -1 = 全部未收割批次
     NSDate *t0 = [NSDate date];
     for (;;) {
         BOOL all = YES;
-        for (int i = 0; i < gRaceN; i++)
-            if (!atomic_load(&gRaceDone[i])) { all = NO; break; }
+        for (int i = 0; i < RY_RACE_MAXBATCH && all; i++) {
+            RYRaceBatch *b = &gBatches[i];
+            if (!b->used || b->joined) continue;
+            if (wantBatch >= 0 && b->id != wantBatch) continue;
+            for (int k = 0; k < b->n; k++)
+                if (!atomic_load(&b->done[k])) { all = NO; break; }
+        }
         if (all) break;
         if (-[t0 timeIntervalSinceNow] * 1000.0 >= tmo) {
-            raceGateReleaseAll();       // 超时兜底：卡在起跑闸上的 worker 一并放行，别悬挂
+            // 超时：把目标批次里还卡在起跑闸上的放行，别悬挂
+            for (int i = 0; i < RY_RACE_MAXBATCH; i++) {
+                RYRaceBatch *b = &gBatches[i];
+                if (b->used && !b->joined && (wantBatch < 0 || b->id == wantBatch))
+                    raceGateReleaseAll(b);
+            }
             break;
         }
         usleep(10000);
     }
-    int doneCnt = 0;
+    // 收割：done 且未 taken 的结果；整批收齐才回收槽位（部分收割可再次 join 补收）
+    int doneCnt = 0, nBatches = 0;
     NSMutableArray *results = [NSMutableArray array];
     NSMutableArray *running = [NSMutableArray array];
-    for (int i = 0; i < gRaceN; i++) {
-        if (atomic_load(&gRaceDone[i])) {
-            doneCnt++;
-            [results addObject:@{@"thread": @(i),
-                                 @"guarded": @(atomic_load(&gRaceGuarded[i]) ? YES : NO),
-                                 @"result": (gRaceResults[i] ?: [NSNull null])}];
-        } else {
-            [running addObject:@(i)];
+    for (int i = 0; i < RY_RACE_MAXBATCH; i++) {
+        RYRaceBatch *b = &gBatches[i];
+        if (!b->used || b->joined) continue;
+        if (wantBatch >= 0 && b->id != wantBatch) continue;
+        nBatches++;
+        BOOL allTaken = YES;
+        for (int k = 0; k < b->n; k++) {
+            if (atomic_load(&b->done[k]) && !atomic_load(&b->taken[k])) {
+                doneCnt++;
+                atomic_store(&b->taken[k], 1);
+                [results addObject:@{@"batch": @(b->id), @"thread": @(k),
+                                     @"guarded": @(atomic_load(&b->guarded[k]) ? YES : NO),
+                                     @"result": (b->results[k] ?: [NSNull null])}];
+            }
+            if (!(atomic_load(&b->done[k]) && atomic_load(&b->taken[k]))) {
+                allTaken = NO;
+                [running addObject:@{@"batch": @(b->id), @"thread": @(k)}];
+            }
+        }
+        if (allTaken) {
+            for (int k = 0; k < RY_RACE_MAXW; k++) b->results[k] = nil;
+            if (b->gateInited) {
+                pthread_mutex_destroy(&b->gateLock);
+                pthread_cond_destroy(&b->gateCond);
+                b->gateInited = 0;
+            }
+            b->joined = 1;
+            b->used = 0;             // 槽位回收，供下次 spawn 复用
         }
     }
-    NSDictionary *d = @{@"ok": @YES, @"threads": @(gRaceN), @"done": @(doneCnt),
+    NSDictionary *d = @{@"ok": @YES, @"batches": @(nBatches), @"done": @(doneCnt),
                         @"stillRunning": running, @"results": results};
     NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
     return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding]
@@ -2097,7 +2180,7 @@ static NSString *raceRoundsNative(NSString *body, NSNumber *nw, NSNumber *rounds
         NSDictionary *spd = [NSJSONSerialization JSONObjectWithData:
                              [(NSString *)sp dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
         if (![spd[@"ok"] boolValue]) { earlyStop = YES; stopReason = sp; break; }
-        NSString *jr = raceThreadJoinNative(@(tmo));
+        NSString *jr = raceThreadJoinNative(@(tmo), nil);   // 收割本轮批次（全量模式即可）
         NSDictionary *jd = [NSJSONSerialization JSONObjectWithData:
                             [(NSString *)jr dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
         if (!jd) { earlyStop = YES; stopReason = @"[raceRounds] join 结果不可解析"; break; }
