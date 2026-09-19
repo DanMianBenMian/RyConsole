@@ -33,6 +33,27 @@ final class RYLiveActivityManager {
     private var alertText = ""
     private var startedAt = Date()
 
+    // ---- V2.4.4 推送管线：串行化 + 合并 + 保序 ----
+    //  真机现象：连接次数显示滞后/回跳。两个叠加根因：
+    //   ① 旧实现每次 update 都 DispatchQueue.main.async 绕主线程 —— Autorun 连接线程
+    //      高频轮询时主队列积压，数字滞后；
+    //   ② 每次 update 起一个 Task 推送 —— Task 完成顺序不定，旧快照可能后落（回跳）；
+    //      且高频 update 会被系统节流合并，越频繁越迟。
+    //  方案：变更全部汇入 pushQ（串行）→ 推送单飞（inFlight + dirty 追赶，永远推最新
+    //        快照）→ 计数类更新合并进 0.5s 窗口（避开系统节流）；提醒类绕过窗口立即推。
+    private let pushQ = DispatchQueue(label: "ry.liveactivity.push")
+    private var pushInFlight = false             // 仅 pushQ 触碰
+    private var pushDirty = false                // 仅 pushQ 触碰
+    private var lastPushAt: TimeInterval = 0     // 仅 pushQ
+    private static let coalesceWindow: TimeInterval = 0.5
+
+    private func makeContent() -> ActivityContent<RYListenAttributes.ContentState> {
+        ActivityContent(state: RYListenAttributes.ContentState(port: port, hits: hits,
+                                                    lastPeer: peer, startedAt: startedAt,
+                                                    alert: alertText),
+                        staleDate: Date().addingTimeInterval(Self.staleWindow))
+    }
+
     /// 活动「保鲜期」。监听期间由保活脉冲定期 touch（见 KeepAlive.pulseOnce）；
     /// 一旦 App 被强杀（强杀没有回调可走），超时后系统会把活动标成 stale（变灰），
     /// 下次打开 RyConsole 再由 sweep 清掉 —— 这是 iOS 允许的唯一"自动过期"表达。
@@ -65,6 +86,12 @@ final class RYLiveActivityManager {
         do {
             activity = try Activity.request(attributes: attrs, content: content, pushType: nil)
             NSLog("[LiveActivity] 已启动 id=%@", activity?.id ?? "-")
+            // 管线复位：start 的起算点也计为"刚推过"（首帧 content 已带全量状态）
+            pushQ.async { [weak self] in
+                self?.pushInFlight = false
+                self?.pushDirty = false
+                self?.lastPushAt = Date().timeIntervalSince1970
+            }
             return true
         } catch {
             NSLog("[LiveActivity] 启动失败: %@", error.localizedDescription)
@@ -77,54 +104,79 @@ final class RYLiveActivityManager {
     @discardableResult
     func alert(_ text: String) -> Bool {
         if activity == nil { _ = start(port: 0) }
-        alertText = text
-        refresh()
+        pushQ.async { [weak self] in
+            guard let self else { return }
+            self.alertText = text
+            self.pushImmediate()          // 提醒类：绕过合并窗口，在推的单落地后立即追最新
+        }
         return activity != nil
     }
 
-    /// 用当前字段重推一次内容
+    /// 推一次当前快照（V2.4.4：绕过合并窗口；保留为兼容入口）
     func refresh() {
-        guard let a = activity else { return }
-        let state = RYListenAttributes.ContentState(port: port, hits: hits,
-                                                    lastPeer: peer, startedAt: startedAt,
-                                                    alert: alertText)
-        let content = ActivityContent(state: state,
-                                      staleDate: Date().addingTimeInterval(Self.staleWindow))
-        Task { await a.update(content) }
+        pushQ.async { [weak self] in self?.pushImmediate() }
     }
 
-    /// 刷新活动内容。
-    /// - hits >= 0：连接计数更新
-    /// - hits <  0：**只续保鲜期**（保活脉冲用，数字不动）
-    func update(hits newHits: Int, peer newPeer: String) {
-        // 调用方可能是 Autorun 的网络线程（handleConnection）→ 统一回主线程改状态，
-        // 避免与保活脉冲/前台切换并发读写同一批字段。
-        if !Thread.isMainThread {
-            DispatchQueue.main.async { [weak self] in
-                self?.update(hits: newHits, peer: newPeer)
+    /// 用当前字段重推一次内容（内部：立即推送，仍受 inFlight/dirty 追赶约束）
+    private func pushImmediate() {
+        if pushInFlight { pushDirty = true; return }
+        doPush()
+    }
+
+    // 计数类：走 0.5s 合并窗口
+    private func pushCount() {
+        if pushInFlight { pushDirty = true; return }
+        let delta = Date().timeIntervalSince1970 - lastPushAt
+        if delta < Self.coalesceWindow {
+            pushInFlight = true           // 占住管道，窗口到点推最新快照
+            pushQ.asyncAfter(deadline: .now() + (Self.coalesceWindow - delta)) { [weak self] in
+                self?.doPush()
             }
             return
         }
-        if newHits >= 0 { self.hits = newHits }
-        if !newPeer.isEmpty { self.peer = newPeer }
-        guard let a = activity else { return }
-        let state = RYListenAttributes.ContentState(port: port, hits: hits,
-                                                    lastPeer: peer, startedAt: startedAt,
-                                                    alert: alertText)
-        let content = ActivityContent(state: state,
-                                      staleDate: Date().addingTimeInterval(Self.staleWindow))
-        Task { await a.update(content) }
+        doPush()
+    }
+
+    private func doPush() {
+        pushInFlight = true
+        lastPushAt = Date().timeIntervalSince1970
+        guard let a = activity else { pushInFlight = false; return }
+        let content = makeContent()
+        Task { [weak self] in
+            await a.update(content)
+            guard let self else { return }
+            self.pushQ.async {                       // 推完回队列收账，追 dirty
+                self.pushInFlight = false
+                if self.pushDirty { self.pushDirty = false; self.pushCount() }
+            }
+        }
+    }
+
+    /// 刷新活动内容。
+    /// - hits >= 0：连接计数更新（走合并窗口）
+    /// - hits <  0：**只续保鲜期**（保活脉冲用，数字不动）
+    func update(hits newHits: Int, peer newPeer: String) {
+        // V2.4.4：不再绕主线程（那是滞后根因之一）。所有字段变更统一汇入 pushQ，
+        // 与推送管线同队列 → 快照一致、顺序有保、主队列零压力。
+        pushQ.async { [weak self] in
+            guard let self else { return }
+            if newHits >= 0 { self.hits = newHits }
+            if !newPeer.isEmpty { self.peer = newPeer }
+            self.pushCount()
+        }
     }
 
     /// 结束并立刻移除。
     func stop() {
-        guard let a = activity else { return }
-        activity = nil
-        let state = RYListenAttributes.ContentState(port: port, hits: hits,
-                                                    lastPeer: peer, startedAt: startedAt,
-                                                    alert: alertText)
-        let content = ActivityContent(state: state, staleDate: Date())
-        Task { await a.end(content, dismissalPolicy: .immediate) }
+        pushQ.async { [weak self] in
+            guard let self, let a = self.activity else { return }
+            self.activity = nil
+            let content = ActivityContent(state: RYListenAttributes.ContentState(
+                port: self.port, hits: self.hits, lastPeer: self.peer,
+                startedAt: self.startedAt, alert: self.alertText),
+                staleDate: Date())
+            Task { await a.end(content, dismissalPolicy: .immediate) }
+        }
     }
 
     /// 清扫"上一个进程残留"的活动。
