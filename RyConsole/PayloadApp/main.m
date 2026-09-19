@@ -1924,7 +1924,9 @@ static NSString *raceProgressNative(NSDictionary *obj) {
     NSDictionary *d = [obj isKindOfClass:[NSDictionary class]] ? obj : @{};
     NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
     if (!jd) return @"{\"ok\":false,\"error\":\"[threadProgress error] obj not serializable\"}";
-    if (![jd writeToFile:docPath(@"race_progress.json") atomically:YES])
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *fp = [(docs.firstObject ?: NSTemporaryDirectory()) stringByAppendingPathComponent:@"race_progress.json"];
+    if (![jd writeToFile:fp atomically:YES])
         return @"{\"ok\":false,\"error\":\"[threadProgress error] write failed\"}";
     return @"{\"ok\":true}";
 }
