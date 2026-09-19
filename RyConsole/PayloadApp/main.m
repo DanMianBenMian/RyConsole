@@ -1084,8 +1084,8 @@ static NSString *callPtrNative(NSString *addrHex, NSArray *args, NSDictionary *o
 
     unsigned long long nums[8] = {0};
     void *slots[8] = {0};
-    NSMutableArray *inbufs = [NSMutableArray array];      // {buf:...} 分配的缓冲
-    NSMutableArray *bufIdx = [NSMutableArray array];      // [槽位, 大小] 成对
+    NSMutableArray *inbufs = [NSMutableArray array];      // {buf:...} 分配的缓冲（按出现顺序）
+    NSMutableArray *bufIdx = [NSMutableArray array];      // [槽位, 大小] 成对；输出 key 取 i/2 顺序号 → buf0/buf1
     int n = 0;
     for (id v in (args ?: @[])) {
         if (n >= 8) return @"{\"ok\":false,\"error\":\"[callPtr error] too many args (>8)\"}";
@@ -1139,14 +1139,15 @@ static NSString *callPtrNative(NSString *addrHex, NSArray *args, NSDictionary *o
         return [NSString stringWithFormat:@"{\"ok\":false,\"error\":\"[callPtr exception] %@\"}", reason];
     }
 
-    // 回传 {buf:} 缓冲内容（base64）
+    // 回传 {buf:} 缓冲内容（base64）。key 用「出现顺序」序号 buf0/buf1…，与参数槽位无关，
+    // 方便后续脚本按固定 key 解析（第 k 个缓冲恒为 out.bufK）。
     NSMutableString *outs = [NSMutableString string];
     for (NSUInteger i = 0; i + 1 < bufIdx.count; i += 2) {
-        NSUInteger bi = (NSUInteger)[bufIdx[i] unsignedIntegerValue];
+        NSUInteger slot = (NSUInteger)[bufIdx[i] unsignedIntegerValue];   // 槽位（仅用于取回指针）
         NSUInteger sz = (NSUInteger)[bufIdx[i + 1] unsignedIntegerValue];
-        void *p = slots[bi];
+        void *p = slots[slot];
         NSData *d = [NSData dataWithBytes:p length:sz];
-        [outs appendFormat:@"%@\"buf%d\":\"%@\"", (outs.length ? @"," : @""), (int)bi,
+        [outs appendFormat:@"%@\"buf%lu\":\"%@\"", (outs.length ? @"," : @""), (unsigned long)(i / 2),
                            [d base64EncodedStringWithOptions:0]];
     }
     for (NSValue *bv in inbufs) free([bv pointerValue]);
@@ -2143,7 +2144,7 @@ static NSString *RYAutorunRunCapture(NSString *code) {
     else { NSString *n = _bridges[ip.row]; c.textLabel.text = n; BOOL en = bridgeIsEnabled(n);
         BOOL isOverride = [[NSFileManager defaultManager] fileExistsAtPath:[docsDir() stringByAppendingPathComponent:n]] && [bundledScripts() containsObject:n];
         NSString *detail = en ? @"已开启" : @"已关闭";
-        if (isOverride) detail = [detail stringByAppendingString:@" · 覆盖版(重置内置桥可还原)"];
+        if (isOverride) detail = [detail stringByAppendingString:@" · 覆盖版(还原=删覆盖回落原版)"];
         c.detailTextLabel.text = detail;
         UISwitch *sw = [[UISwitch alloc] init]; sw.on = en; sw.tag = ip.row;
         if (self.embedded) sw.onTintColor = RM_ACCENT;
@@ -2178,13 +2179,17 @@ static NSString *RYAutorunRunCapture(NSString *code) {
         BOOL isUser = [[NSFileManager defaultManager] fileExistsAtPath:[docsDir() stringByAppendingPathComponent:n]];
         BOOL isBundled = [bundledScripts() containsObject:n];
         NSString *msg;
-        if (isUser && isBundled) msg = @"内置桥覆盖版（重置内置桥可还原为 bundle 原版）";
-        else if (isUser) msg = @"用户桥";
-        else msg = @"内置桥（删除=禁用；恢复初始底层可还原）";
+        if (isUser && isBundled) msg = @"内置桥覆盖版（「还原」= 删覆盖、回落 bundle 原版）";
+        else if (isUser) msg = @"用户桥（「删除」= 永久移除文件）";
+        else msg = @"内置桥（「禁用」= 仅关闭；恢复初始底层走语法修复）";
         UIAlertController *a = [UIAlertController alertControllerWithTitle:n message:msg preferredStyle:UIAlertControllerStyleActionSheet];
         [a addAction:[UIAlertAction actionWithTitle:@"编辑" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) { EditorVC *e = [[EditorVC alloc] init]; e.hostVC = self; e.isBridge = YES; e.isEdit = YES; e.origName = n; UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:e]; nav.modalPresentationStyle = UIModalPresentationFormSheet; [self presentViewController:nav animated:YES completion:nil]; }]];
-        if (isUser) [a addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_) { deleteDocScript(n); [self refreshRM]; }]];
-        else [a addAction:[UIAlertAction actionWithTitle:@"禁用(删除)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_) { setBridgeEnabled(n, NO); [self refreshRM]; }]];
+        if (isUser && isBundled)
+            [a addAction:[UIAlertAction actionWithTitle:@"还原" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_) { deleteDocScript(n); [self refreshRM]; }]];
+        else if (isUser)
+            [a addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_) { deleteDocScript(n); [self refreshRM]; }]];
+        else
+            [a addAction:[UIAlertAction actionWithTitle:@"禁用" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_) { setBridgeEnabled(n, NO); [self refreshRM]; }]];
         [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) { a.popoverPresentationController.sourceView = _table; a.popoverPresentationController.sourceRect = CGRectMake(p.x, p.y, 1, 1); }
         [self presentViewController:a animated:YES completion:nil];
