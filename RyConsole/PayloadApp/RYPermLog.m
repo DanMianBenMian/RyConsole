@@ -166,8 +166,10 @@ static atomic_int gScopeMode = 0;
             granted = ok; dispatch_semaphore_signal(sem);
         }];
     });
-    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC))) != 0)
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC))) != 0) {
         granted = NO;                        // 超时按驳回（与旧语义一致）
+        ryLiveActivityAlert("", NULL);       // 清掉灵动岛/锁屏上的权限提醒
+    }
     atomic_store(&gScopeMode, granted ? 1 : 2);
     [self logCall:@"<脚本作用域>" risk:RYPermRiskNormal allowed:granted
              note:[NSString stringWithFormat:@"一次性确认：%@", [dc componentsJoinedByString:@"、"]]];
@@ -177,9 +179,18 @@ static atomic_int gScopeMode = 0;
     atomic_store(&gScopeMode, 0);
 }
 
-// 一次性确认弹窗：主标题「请求权限」，副标题列出全部被禁但要调用的命令
+// 一次性确认弹窗：主标题「请求权限」，副标题列出全部被禁但要调用的命令。
+// ★ 后台/锁屏（V2.4.7）：先灵动岛+锁屏横幅把提醒顶出来（LiveActivity 的 alert 字段
+//   会渲染在锁屏上），等 App 回前台再弹确认框 —— 用户在 60s 窗口内点开 App 都能确认。
+//   前台直接弹。
 - (void)askUserForCommands:(NSArray<NSString *> *)cmds completion:(void (^)(BOOL granted))cb {
     NSString *list = [cmds componentsJoinedByString:@"、"];
+    BOOL background = ([UIApplication sharedApplication].applicationState != UIApplicationStateActive);
+    BOOL liveOK = ryLiveActivityAvailable();
+
+    if (background && liveOK)
+        ryLiveActivityAlert("⚠️ 请求权限", [[NSString stringWithFormat:@"要调用 %@ 命令，点开确认", list] UTF8String]);
+
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"请求权限"
         message:[NSString stringWithFormat:@"要调用 %@ 命令\n\n允许：本脚本执行期间全部放行（含并发线程）\n不同意：本脚本内这些命令直接驳回",
                  list]
@@ -192,9 +203,35 @@ static atomic_int gScopeMode = 0;
         ryLiveActivityAlert("", NULL);
         if (cb) cb(NO);
     }]];
-    UIViewController *host = [self topViewController];
-    if (!host) { if (cb) cb(NO); return; }
-    [host presentViewController:ac animated:YES completion:nil];
+
+    void (^presentNow)(void) = ^{
+        UIViewController *host = [self topViewController];
+        if (host) {
+            [host presentViewController:ac animated:YES completion:nil];
+        } else {
+            ryLiveActivityAlert("", NULL);
+            if (cb) cb(NO);           // 实在找不到宿主 → 按驳回（不吊死脚本）
+        }
+    };
+
+    if (!background) {
+        dispatch_async(dispatch_get_main_queue(), presentNow);
+        return;
+    }
+
+    // 后台：等 DidBecomeActive 再弹。60s 信号量超时后 beginScriptScope 已走驳回并清
+    // 灵动岛提醒；届时再弹出的框点了也无副作用（cb 只会被有效消费一次）。
+    __block id obs = [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil
+        usingBlock:^(NSNotification *note) {
+            [[NSNotificationCenter defaultCenter] removeObserver:obs];
+            dispatch_async(dispatch_get_main_queue(), presentNow);
+        }];
+    // 防观察者泄漏：120s 后无论如何摘掉
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] removeObserver:obs];
+    });
 }
 
 - (NSDictionary *)gateCommand:(NSString *)cmd {
