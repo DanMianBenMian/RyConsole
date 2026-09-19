@@ -14,6 +14,7 @@
 #import <IOKit/IOKitLib.h>
 #import <dlfcn.h>
 #import <stdatomic.h>                   // V2.4.6 脚本级作用域（gScopeMode 原子读写）
+#import <UserNotifications/UserNotifications.h>   // V2.4.8 无灵动岛后台通道（本地推送）
 #import <mach-o/dyld.h>
 #import <mach-o/getsect.h>
 #import <spawn.h>
@@ -179,6 +180,24 @@ static atomic_int gScopeMode = 0;
     atomic_store(&gScopeMode, 0);
 }
 
+// V2.4.8 无灵动岛/无 Live Activities 的后台通道：本地推送（所有设备都有）。
+// 首次调用会向系统申请通知授权（拒绝则退化为"回 App 才能看到确认框"）。
+// 点通知开 App → DidBecomeActive → askUserForCommands 的确认框弹出（60s 窗口内有效）。
+- (void)postPermNotification:(NSString *)list {
+    UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
+    [c requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
+                     completionHandler:^(BOOL ok, NSError *err) {
+                         if (!ok) return;   // 用户拒了通知授权 → 只能回 App 看
+                         UNMutableNotificationContent *ct = [UNMutableNotificationContent new];
+                         ct.title = @"RyConsole 请求权限";
+                         ct.body  = [NSString stringWithFormat:@"要调用 %@ 命令，点开确认（60 秒内有效）", list];
+                         ct.sound = [UNNotificationSound defaultSound];
+                         UNNotificationRequest *req = [UNNotificationRequest
+                             requestWithIdentifier:@"ryc_perm" content:ct trigger:nil];
+                         [c addNotificationRequest:req withCompletionHandler:nil];
+                     }];
+}
+
 // 一次性确认弹窗：主标题「请求权限」，副标题列出全部被禁但要调用的命令。
 // ★ 后台/锁屏（V2.4.7）：先灵动岛+锁屏横幅把提醒顶出来（LiveActivity 的 alert 字段
 //   会渲染在锁屏上），等 App 回前台再弹确认框 —— 用户在 60s 窗口内点开 App 都能确认。
@@ -190,6 +209,8 @@ static atomic_int gScopeMode = 0;
 
     if (background && liveOK)
         ryLiveActivityAlert("⚠️ 请求权限", [[NSString stringWithFormat:@"要调用 %@ 命令，点开确认", list] UTF8String]);
+    else if (background)
+        [self postPermNotification:list];   // V2.4.8 无灵动岛：本地推送补位
 
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"请求权限"
         message:[NSString stringWithFormat:@"要调用 %@ 命令\n\n允许：本脚本执行期间全部放行（含并发线程）\n不同意：本脚本内这些命令直接驳回",
