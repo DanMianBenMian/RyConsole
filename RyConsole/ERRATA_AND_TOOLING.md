@@ -110,6 +110,7 @@ crashGuardSet(0)     // 关掉 → 恢复"真崩"（需要真崩时用，跑完 
 
 | IPA | 关键内容 |
 |---|---|
+| **V2.4.7** | ★ 权限确认的后台可达性修复：脚本级一次性确认在**后台/锁屏**时先灵动岛+锁屏横幅顶出提醒（LiveActivity alert 字段），等 App 回前台再弹确认框——60s 窗口内点开 App 都能确认；旧实现后台时 topViewController 取不到宿主会**静默驳回**（用户根本看不到）。超时驳回同时清灵动岛提醒；观察者 120s 兜底摘除防泄漏。
 | **V2.4.6** | ★ 权限模型改**脚本级作用域**（用户需求：放行=当前脚本放行全部权限，拒绝=直接驳回）：RYExecStream/终端执行器入口扫描脚本文本里出现过的被禁受管命令 → 非空弹**一次**窗「请求权限：要调用 xx、xxx 命令」——允许=本脚本作用域全放行（进程级，含 race worker 线程）；不同意=作用域内被禁命令直接驳回不再弹窗；扫描为空不弹窗。出口（正常/兜底掀栈）一律 endScriptScope 清作用域。旧逐次弹窗仅保留为作用域外兜底（mode=0）。gScopeMode 为 C11 原子（gateCommand 任意线程读）。
 | **V2.4.5** | ★ 竞态 harness 三项扩展（测试 Agent 请求）：① **起跑闸升级**——worker 建好 JSContext/原语后报 ready，最后一名到齐 `pthread_cond_broadcast` 放行全员（旧版创建完即放行，建 context 时差 = 毫秒级起跑偏差；失败路径/join 超时也强制放行防悬挂）；② **共享原子槽** `raceSlotSet/Get/AtomicAdd/AtomicCas`（16×64bit 原生 `_Atomic` 槽，JS number 53 位精度 → 64 位 handle/地址一律 `"0x…"` hex 进出，跨线程 handle 传递不再走字符串/NSNumber 编码；槽跨轮保留可做累计器）；③ **自动多轮** `raceRounds(fnBodyStr, nWorkers, rounds 1..100, timeoutMs)`（逐轮 spawn/join 聚合，纪律内置：超时未完/guarded 命中自动停）。★ krWhy 码表补 `e00002d7 kIOReturnOffline` / `e00002d9 kIOReturnNotAttached`（close 交界过渡码，竞态高频 open/close 常见） |
 | **V2.4.4** | ★ 灵动岛连接次数滞后/回跳修复（LiveActivity.swift 推送管线重写）：① 去掉 update 的主线程绕行（Autorun 连接线程高频轮询时主队列积压 = 滞后根因）；② 推送单飞 + dirty 追赶（Task 完成顺序不定导致旧快照后落 = 回跳根因，现在永远推最新快照）；③ 计数类更新合并进 0.5s 窗口（避开系统对高频 Live Activity 更新的节流）；④ 权限提醒（alert）绕过窗口立即推。行为变化：连接数最多滞后 ~0.5s 但单调递增不回跳 |
