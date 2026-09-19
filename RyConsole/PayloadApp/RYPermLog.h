@@ -45,6 +45,17 @@ typedef NS_ENUM(NSInteger, RYPermLogFilter) {
 // 返回 {ok:YES} 放行；{ok:NO, error:"[权限] …"} 驳回（调用方直接把 error 当作返回值给 AI）
 - (NSDictionary *)gateCommand:(NSString *)cmd;
 
+#pragma mark - 脚本级权限作用域（V2.4.6）
+// 脚本开始时一次性确认（用户需求：放行 = 当前脚本放行全部权限，拒绝 = 直接驳回）：
+//   · 扫描 code 文本里出现过的**被禁用**受管命令，非空 → 弹一次窗列出「要调用 xx、xxx 命令」
+//     —— 允许   → 本脚本作用域内全部放行（含 race worker 线程，进程级全局）
+//     —— 不同意 → 本脚本作用域内被禁命令一律直接驳回，不再弹窗
+//   · 扫描结果为空 → 不弹窗，直接进入放行作用域
+//   · 脚本结束（RYExecStream/终端执行器出口，含崩溃兜底路径）必须调 endScriptScope 清作用域
++ (NSArray<NSString *> *)disabledCommandsInCode:(NSString *)code;
+- (void)beginScriptScope:(NSString *)code;
+- (void)endScriptScope;
+
 #pragma mark - 日志
 - (NSArray<NSDictionary *> *)entries:(RYPermLogFilter)filter;   // 新→旧，最多 500 条
 - (NSInteger)countHigh;
