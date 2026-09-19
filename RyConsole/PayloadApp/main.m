@@ -481,7 +481,7 @@ static NSString *getEntitlementsStr(void) {
         if (ld && lsz > 8) {
             const uint8_t *b = (const uint8_t *)ld;
             for (unsigned long off = 0; off + 8 <= lsz; off++) {
-                if (b[off]==0x71 && b[off+1]==0x71 && b[off+2]==0xde && b[off+3]==0xfa) {
+                if (b[off]==0xfa && b[off+1]==0xde && b[off+2]==0x71 && b[off+3]==0x71) {
                     uint32_t blen = ((uint32_t)b[off+4]<<24)|((uint32_t)b[off+5]<<16)|((uint32_t)b[off+6]<<8)|b[off+7];
                     if (blen > 8 && off + blen <= lsz) { data = b + off + 8; size = blen - 8; break; }
                 }
