@@ -440,6 +440,49 @@ static NSString *RYEmbeddedEntitlementsString(void) {
     return nil;
 }
 
+// V2.4.11：内嵌/签名 blob 的 entitlements 解析成字典。
+// 全能签等重签工具写的是**二进制 plist**（bplist00）——旧代码按 UTF-8 当文本返回再子串匹配，
+// 二进制时乱码且全部判「未声明」。这里直接用 NSPropertyList/CFPropertyList 解析（二进制 + XML 通吃）。
+static NSDictionary *RYEmbeddedEntitlementsDict(void) {
+    const struct mach_header_64 *h = NULL;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (mh && mh->filetype == MH_EXECUTE) { h = (const struct mach_header_64 *)mh; break; }
+    }
+    if (!h) return nil;
+    const void *data = NULL; unsigned long size = 0;
+    char *ptr = getsectdatafromheader_64(h, "__TEXT", "__entitlements", &size);
+    if (ptr && size > 0) { data = ptr; }
+    if (!data || size == 0) {
+        unsigned long lsz = 0;
+        char *ld = getsegmentdata((const struct mach_header *)h, "__LINKEDIT", &lsz);
+        if (ld && lsz > 8) {
+            const uint8_t *b = (const uint8_t *)ld;
+            for (unsigned long off = 0; off + 8 <= lsz; off++) {
+                if (b[off]==0xfa && b[off+1]==0xde && b[off+2]==0x71 && b[off+3]==0x71) {
+                    uint32_t blen = ((uint32_t)b[off+4]<<24)|((uint32_t)b[off+5]<<16)|((uint32_t)b[off+6]<<8)|b[off+7];
+                    if (blen > 8 && off + blen <= lsz) { data = b + off + 8; size = blen - 8; break; }
+                }
+            }
+        }
+    }
+    if (!data || size == 0) return nil;
+    // blob 头（0xfade7171 + 4 字节长度）在 RYEmbeddedEntitlementsString 的扫描里已剥过；
+    // 这里自己扫的 blob 同样剥 8 字节头；命名段则直接是 plist。
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t magic = (size >= 4) ? ((uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3]) : 0;
+    const uint8_t *pl = p; unsigned long plLen = size;
+    if (magic == 0xfade7171 && size >= 8) { pl = p + 8; plLen = size - 8; }
+    if (plLen == 0) return nil;
+    NSData *pd = [NSData dataWithBytes:pl length:plLen];
+    id obj = nil;
+    // 容量受控（entitlements 不该超过 256KB）
+    if (plLen > 256 * 1024) return nil;
+    obj = [NSPropertyListSerialization propertyListWithData:pd options:NSPropertyListImmutable format:NULL error:NULL];
+    if (![obj isKindOfClass:[NSDictionary class]]) return nil;
+    return obj;
+}
+
 // SecTask 符号是否可用（不可用时面板回退到旧的内嵌段判定语义）
 static BOOL RYSecTaskEntValueAvailable(void) {
     return dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf") &&
@@ -523,6 +566,7 @@ static NSString *RYEntProbeFor(NSString *entKey, BOOL *probeOK) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSMutableArray *out = [NSMutableArray array];
         NSString *entStr = RYEmbeddedEntitlementsString();
+        NSDictionary *embDict = RYEmbeddedEntitlementsDict();   // V2.4.11：二进制/XML 通吃
 
         for (NSDictionary *spec in [RYPermLog diagnosticSpecs]) {
             NSMutableDictionary *r = [spec mutableCopy];
@@ -534,8 +578,8 @@ static NSString *RYEntProbeFor(NSString *entKey, BOOL *probeOK) {
                 NSString *entKey = [key substringFromIndex:4];
                 // ① 签名层（内核视角，主判定）：SecTaskCopyValueForEntitlement
                 NSString *sig = RYSecTaskEntValue(entKey);
-                // ② 内嵌段（声明层，辅助标注）
-                BOOL emb = entStr && ([entStr rangeOfString:entKey].length > 0);
+                // ② 内嵌段（声明层，辅助标注）—— V2.4.11 改字典判定（二进制 plist 不再判失）
+                BOOL emb = (embDict && embDict[entKey] != nil);
                 if (sig) {
                     ok = YES;
                     detail = [NSString stringWithFormat:@"签名层生效：%@", sig];
@@ -636,6 +680,36 @@ static NSString *RYEntProbeFor(NSString *entKey, BOOL *probeOK) {
             r[@"ok"] = @(ok);
             r[@"detail"] = detail;
             [out addObject:r];
+        }
+
+        // ---- V2.4.11 动态行：重签注入的键（固定清单之外）也逐键列出并查签名层 ----
+        // 旧版面板是固定清单（5 个 ent 键），全能签硬写新键时面板根本没行可显示。
+        // 内嵌/签名 blob 里解析出的每个键：不在固定清单 → 追加一行（ok = 签名层有无值）。
+        if (embDict.count) {
+            NSSet *fixed = [NSSet setWithArray:@[
+                @"get-task-allow", @"task_for_pid-allow", @"com.apple.system-task-ports",
+                @"com.apple.private.mobilehousearrest", @"com.apple.private.containermanager"]];
+            NSMutableArray *dynKeys = [NSMutableArray array];
+            for (NSString *k in embDict)
+                if (![fixed containsObject:k]) [dynKeys addObject:k];
+            if (dynKeys.count) {
+                [dynKeys sortUsingSelector:@selector(compare:)];
+                for (NSString *k in dynKeys) {
+                    NSString *sig = RYSecTaskEntValue(k);
+                    id embVal = embDict[k];
+                    NSString *embDesc = [embVal isKindOfClass:[NSString class]]
+                        ? (NSString *)embVal
+                        : [NSString stringWithFormat:@"%@", embVal ?: @"(null)"];
+                    BOOL ok2 = (sig != nil);
+                    [out addObject:@{@"group": @"Entitlement·注入", @"title": k,
+                                     @"desc": @"重签注入的键（固定清单之外，动态列出）",
+                                     @"ok": @(ok2),
+                                     @"detail": [NSString stringWithFormat:
+                                                 @"内嵌段: %@\n签名层: %@",
+                                                 embDesc.length ? embDesc : @"(空)",
+                                                 sig ?: @"无（内核不认 → 不生效）"]}];
+                }
+            }
         }
         dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(out); });
     });
