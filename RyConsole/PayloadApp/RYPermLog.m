@@ -285,13 +285,13 @@ static NSString *RYEmbeddedEntitlementsString(void) {
     char *ptr = getsectdatafromheader_64(h, "__TEXT", "__entitlements", &size);
     if (ptr && size > 0)
         return [[NSString alloc] initWithBytes:ptr length:size encoding:NSUTF8StringEncoding];
-    // 2) codesign 真正的位置：__LINKEDIT 签名 blob（magic 0xfade7171，后跟 4 字节长度 + plist）
+    // 2) codesign 真正的位置：__LINKEDIT 签名 blob（magic 0xfade7171，文件/内存字节序 = fa de 71 71，后跟 4 字节大端长度 + XML plist）
     unsigned long lsz = 0;
     char *ld = getsegmentdata((const struct mach_header *)h, "__LINKEDIT", &lsz);
     if (ld && lsz > 8) {
         const uint8_t *b = (const uint8_t *)ld;
         for (unsigned long off = 0; off + 8 <= lsz; off++) {
-            if (b[off]==0x71 && b[off+1]==0x71 && b[off+2]==0xde && b[off+3]==0xfa) {
+            if (b[off]==0xfa && b[off+1]==0xde && b[off+2]==0x71 && b[off+3]==0x71) {
                 uint32_t blen = ((uint32_t)b[off+4]<<24)|((uint32_t)b[off+5]<<16)|((uint32_t)b[off+6]<<8)|b[off+7];
                 if (blen > 8 && off + blen <= lsz)
                     return [[NSString alloc] initWithBytes:(b + off + 8) length:(blen - 8) encoding:NSUTF8StringEncoding];
