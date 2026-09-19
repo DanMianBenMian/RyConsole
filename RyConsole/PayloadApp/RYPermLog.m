@@ -13,6 +13,7 @@
 #import <mach/mach_init.h>
 #import <IOKit/IOKitLib.h>
 #import <dlfcn.h>
+#import <stdatomic.h>                   // V2.4.6 脚本级作用域（gScopeMode 原子读写）
 #import <mach-o/dyld.h>
 #import <mach-o/getsect.h>
 #import <spawn.h>
@@ -136,11 +137,88 @@ static NSArray *RYManagedNormal(void) {
 }
 
 #pragma mark - 拦截
+// ---- V2.4.6 脚本级权限作用域 ----
+//   0 = 无作用域（逐次问）；1 = 本脚本全放行；2 = 本脚本全驳回。
+//   进程级全局（race worker 线程共享主脚本的作用域）；用 C11 原子变量，gateCommand
+//   会在任意线程（autorun 连接线程 / race worker）读它。
+static atomic_int gScopeMode = 0;
+
++ (NSArray<NSString *> *)disabledCommandsInCode:(NSString *)code {
+    if (![code isKindOfClass:[NSString class]] || !code.length) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *c in [RYPermLog managedCommands]) {
+        if (![self isEnabled:c] && [code rangeOfString:c].location != NSNotFound) [out addObject:c];
+    }
+    return out;
+}
+
+- (void)beginScriptScope:(NSString *)code {
+    NSArray *dc = [RYPermLog disabledCommandsInCode:code];
+    if (dc.count == 0) {                    // 没引用任何被禁命令 → 直接放行作用域，不弹窗
+        atomic_store(&gScopeMode, 1);
+        return;
+    }
+    // 一次性确认：列出全部被禁但要调用的命令
+    __block BOOL granted = NO;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self askUserForCommands:dc completion:^(BOOL ok) {
+            granted = ok; dispatch_semaphore_signal(sem);
+        }];
+    });
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC))) != 0)
+        granted = NO;                        // 超时按驳回（与旧语义一致）
+    atomic_store(&gScopeMode, granted ? 1 : 2);
+    [self logCall:@"<脚本作用域>" risk:RYPermRiskNormal allowed:granted
+             note:[NSString stringWithFormat:@"一次性确认：%@", [dc componentsJoinedByString:@"、"]]];
+}
+
+- (void)endScriptScope {
+    atomic_store(&gScopeMode, 0);
+}
+
+// 一次性确认弹窗：主标题「请求权限」，副标题列出全部被禁但要调用的命令
+- (void)askUserForCommands:(NSArray<NSString *> *)cmds completion:(void (^)(BOOL granted))cb {
+    NSString *list = [cmds componentsJoinedByString:@"、"];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"请求权限"
+        message:[NSString stringWithFormat:@"要调用 %@ 命令\n\n允许：本脚本执行期间全部放行（含并发线程）\n不同意：本脚本内这些命令直接驳回",
+                 list]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"允许" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+        ryLiveActivityAlert("", NULL);
+        if (cb) cb(YES);
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"不同意" style:UIAlertActionStyleCancel handler:^(UIAlertAction *_) {
+        ryLiveActivityAlert("", NULL);
+        if (cb) cb(NO);
+    }]];
+    UIViewController *host = [self topViewController];
+    if (!host) { if (cb) cb(NO); return; }
+    [host presentViewController:ac animated:YES completion:nil];
+}
+
 - (NSDictionary *)gateCommand:(NSString *)cmd {
     RYPermRisk risk = [RYPermLog riskOfCommand:cmd];
     BOOL managed = (RYHighRiskMap()[cmd] != nil) || [RYManagedNormal() containsObject:cmd];
 
-    if (!managed || [self isEnabled:cmd]) {
+    if (!managed) {
+        [self logCall:cmd risk:risk allowed:YES note:@""];
+        return @{@"ok": @YES};
+    }
+
+    // V2.4.6 脚本作用域：1=全放行 / 2=全驳回（不再逐次问）
+    int mode = atomic_load(&gScopeMode);
+    if (mode == 1) {
+        [self logCall:cmd risk:risk allowed:YES note:@"脚本级放行"];
+        return @{@"ok": @YES};
+    }
+    if (mode == 2) {
+        [self logCall:cmd risk:risk allowed:NO note:@"脚本已驳回，直接拦截"];
+        return @{@"ok": @NO,
+                 @"error": [NSString stringWithFormat:@"[权限] 权限请求驳回：%@（本脚本权限已被用户驳回，直接拦截）", cmd]};
+    }
+
+    if ([self isEnabled:cmd]) {
         [self logCall:cmd risk:risk allowed:YES note:@""];
         return @{@"ok": @YES};
     }
