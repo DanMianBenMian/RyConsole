@@ -1108,7 +1108,7 @@ static NSString *memReadNative(NSString *hex, NSNumber *lenN) {
 }
 
 // ============================================================
-//  V2.4.12 写内存桥（memWrite）：向本任务地址空间写二进制（mach_vm_write_overwrite）
+//  V2.4.12 写内存桥（memWrite）：向本任务地址空间写二进制（vm_write，就地覆盖）
 //   用途：mach_msg 构造 / 结构体打补丁——callPtr 前把消息体写进缓冲区（测试清单 #2 硬前提）
 //   data 三种形态：① hex 串（偶数长度，可含空格/0x 前缀）② "b64:…" 前缀 ③ {b64:"…"} 字典
 //   安全：kr 干净返回（未映射=2 / 页只读=4），不崩；只对可写页生效（__TEXT 改不了，
@@ -1147,14 +1147,13 @@ static NSString *memWriteNative(NSString *addrHex, id data) {
         return @"[memWrite error] data 必须是 hex 串 / \"b64:…\" / {b64:\"…\"}（mach_msg 构造传二进制请用 b64）";
     if (bytes.length > 65536)
         return @"[memWrite error] len must be 1..65536";
-    mach_vm_address_t outAddr = (mach_vm_address_t)addr;
-    kern_return_t kr = mach_vm_write_overwrite(mach_task_self(), (mach_vm_address_t)addr,
-                                               (mach_vm_offset_t)[bytes bytes],
-                                               (mach_msg_type_number_t)[bytes length],
-                                               &outAddr);
+    // vm_write 与 vm_read 同族（<mach/vm_map.h>，mach.h 已引入）；就地覆盖写入，无需输出地址参数
+    kern_return_t kr = vm_write(mach_task_self(), (vm_address_t)addr,
+                                (vm_offset_t)[bytes bytes],
+                                (mach_msg_type_number_t)[bytes length]);
     if (kr != KERN_SUCCESS)
         return [NSString stringWithFormat:
-            @"[memWrite error] vm_write_overwrite kr=%d（2=KERN_INVALID_ADDRESS 未映射；4=KERN_PROTECTION_FAILURE 页只读，__TEXT 改不了）", (int)kr];
+            @"[memWrite error] vm_write kr=%d（2=KERN_INVALID_ADDRESS 未映射；4=KERN_PROTECTION_FAILURE 页只读，__TEXT 改不了）", (int)kr];
     return [NSString stringWithFormat:@"{\"ok\":true,\"written\":%lu,\"addr\":\"0x%llx\"}",
             (unsigned long)[bytes length], (unsigned long long)addr];
 }
