@@ -474,6 +474,20 @@ static NSString *getEntitlementsStr(void) {
     unsigned long size = 0;
     const void *data = getsectiondata(&_mh_execute_header, "__TEXT", "__entitlements", &size);
     if (!data) data = getsectiondata(&_mh_execute_header, "__LINKEDIT", "__entitlements", &size);
+    // codesign 后 entitlements 在 __LINKEDIT 的签名 blob 里（magic 0xfade7171），无命名段 → 扫描 blob
+    if (!data || size == 0) {
+        unsigned long lsz = 0;
+        char *ld = getsegmentdata(&_mh_execute_header, "__LINKEDIT", &lsz);
+        if (ld && lsz > 8) {
+            const uint8_t *b = (const uint8_t *)ld;
+            for (unsigned long off = 0; off + 8 <= lsz; off++) {
+                if (b[off]==0x71 && b[off+1]==0x71 && b[off+2]==0xde && b[off+3]==0xfa) {
+                    uint32_t blen = ((uint32_t)b[off+4]<<24)|((uint32_t)b[off+5]<<16)|((uint32_t)b[off+6]<<8)|b[off+7];
+                    if (blen > 8 && off + blen <= lsz) { data = b + off + 8; size = blen - 8; break; }
+                }
+            }
+        }
+    }
     if (!data || size == 0)
         return @"[getEntitlements] no __entitlements section (unsigned build / none embedded)";
     const uint8_t *p = (const uint8_t*)data;
