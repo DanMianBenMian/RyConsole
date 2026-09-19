@@ -110,6 +110,7 @@ crashGuardSet(0)     // 关掉 → 恢复"真崩"（需要真崩时用，跑完 
 
 | IPA | 关键内容 |
 |---|---|
+| **V2.4.9** | ★ P89–P105 收官清单落地（测试 Agent 转交项核对：#2 threadBarrier/threadId/共享原子、#4 krName 0xE00002D9、#5 callPtr 契约**均已在前版合入**，名字为 raceBarrier/__threadId/raceSlot*——P100 探针找字面名才误判未合入）：① **xpcConn 族线程安全修复**（P102–P104 SIGSEGV 定性=注册表字典非线程安全 + close 与 send 并发的连接生命周期竞争）：g_xpcLock 串行化注册表操作 + send 用强引用保活连接（并发 close 只 cancel 不 UAF），**send 不串行化**——XPC 并发研究仍可做；② **threadJoin 多批次**：批次注册表（8 槽循环复用），threadSpawn 返回 batch 号，threadJoin(timeoutMs[, batchId]) 不传 batchId=收割全部未收割批次，部分收割可补收，整批收齐自动回收槽位，spawn 失败槽位标记 done 保证批次必然可收割；worker 加 __threadBatch 变量（批内序号 __threadId 之外再加批次号）。
 | **V2.4.8** | ★ 无灵动岛后台通道：Live Activities 不可用/被关的设备，脚本级权限确认在后台改发**本地推送**（UNUserNotificationCenter，点通知开 App → 确认框弹出，60s 内有效；首次调用申请通知授权，拒绝则退化为回 App 查看）。通道优先级：灵动岛/锁屏横幅 → 本地推送 → 回 App 直接看确认框。
 | **V2.4.7** | ★ 权限确认的后台可达性修复：脚本级一次性确认在**后台/锁屏**时先灵动岛+锁屏横幅顶出提醒（LiveActivity alert 字段），等 App 回前台再弹确认框——60s 窗口内点开 App 都能确认；旧实现后台时 topViewController 取不到宿主会**静默驳回**（用户根本看不到）。超时驳回同时清灵动岛提醒；观察者 120s 兜底摘除防泄漏。
 | **V2.4.6** | ★ 权限模型改**脚本级作用域**（用户需求：放行=当前脚本放行全部权限，拒绝=直接驳回）：RYExecStream/终端执行器入口扫描脚本文本里出现过的被禁受管命令 → 非空弹**一次**窗「请求权限：要调用 xx、xxx 命令」——允许=本脚本作用域全放行（进程级，含 race worker 线程）；不同意=作用域内被禁命令直接驳回不再弹窗；扫描为空不弹窗。出口（正常/兜底掀栈）一律 endScriptScope 清作用域。旧逐次弹窗仅保留为作用域外兜底（mode=0）。gScopeMode 为 C11 原子（gateCommand 任意线程读）。
