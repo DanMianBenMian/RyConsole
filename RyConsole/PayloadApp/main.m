@@ -1673,7 +1673,7 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
                 @"if(k==='__ry_note'||k==='print'||k.indexOf('__ry_')===0)continue;"
                 @"var f=g[k];"
                 @"if(typeof f!=='function')continue;"
-                @"g[k]=(function(n,fn){return function(){try{var r=__ry_gate(n);if(r&&r.ok===false)return r.error;}catch(e){}try{__ry_note(n);}catch(e){}return fn.apply(this,arguments);};})(k,f);"
+                @"g[k]=(function(n,fn){return function(){try{var r=__ry_gate(n);if(r&&r.ok===false)return JSON.stringify({ok:false,error:String(r.error),rejected:true,cmd:n});}catch(e){}try{__ry_note(n);}catch(e){}return fn.apply(this,arguments);};})(k,f);"
                 @"}})();"];
 }
 
