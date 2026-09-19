@@ -387,7 +387,7 @@ static atomic_int gScopeMode = 0;
 #pragma mark - 权限诊断
 + (NSArray<NSDictionary *> *)diagnosticSpecs {
     return @[
-      // ---- Entitlement（读 App 自身嵌入的 __entitlements 段）----
+      // ---- Entitlement（V2.4.10：SecTask 签名层实测为主，内嵌段对比 + 功能探针辅助）----
       @{@"key": @"ent:get-task-allow",                       @"group": @"Entitlement", @"title": @"get-task-allow",                   @"desc": @"允许调试器附加（未签名/自签通常有）"},
       @{@"key": @"ent:task_for_pid-allow",                   @"group": @"Entitlement", @"title": @"task_for_pid-allow",               @"desc": @"拿其他进程 task port（实验版才有）"},
       @{@"key": @"ent:com.apple.system-task-ports",          @"group": @"Entitlement", @"title": @"com.apple.system-task-ports",      @"desc": @"系统进程 task port（私有，极易被 AMFI 拒）"},
@@ -437,6 +437,85 @@ static NSString *RYEmbeddedEntitlementsString(void) {
     return nil;
 }
 
+// SecTask 符号是否可用（不可用时面板回退到旧的内嵌段判定语义）
+static BOOL RYSecTaskEntValueAvailable(void) {
+    return dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf") &&
+           dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+}
+
+// V2.4.10：SecTask 实测（签名层 = 内核视角）。内核 SecTask 校验读的是**签名 blob** 里的
+// entitlements；全能签等重签工具注入的是签名层，与内嵌段（__TEXT,__entitlements / blob 内嵌 XML）
+// 可以分叉 → 面板主判定改为 SecTask 取值，内嵌段检查降级为辅助标注。
+// iOS SDK 无 SecTask 公开头 → dlsym 取符号，取不到明确退回（保持旧行为）。
+static NSString *RYSecTaskEntValue(NSString *entKey) {
+    typedef CFTypeRef (*RYSecTaskCreateFromSelfFn)(CFAllocatorRef);
+    typedef CFTypeRef (*RYSecTaskCopyValueFn)(CFTypeRef, CFStringRef, CFErrorRef *);
+    static RYSecTaskCreateFromSelfFn cfs = NULL;
+    static RYSecTaskCopyValueFn cpv = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cfs = (RYSecTaskCreateFromSelfFn)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+        cpv = (RYSecTaskCopyValueFn)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+    });
+    if (!cfs || !cpv) return nil;
+    CFTypeRef task = cfs(kCFAllocatorDefault);
+    if (!task) return nil;
+    CFErrorRef err = NULL;
+    CFTypeRef v = cpv(task, (__bridge CFStringRef)entKey, &err);
+    CFRelease(task);
+    if (!v) { if (err) CFRelease(err); return nil; }
+    NSString *s;
+    if (CFGetTypeID(v) == CFBooleanGetTypeID())
+        s = [NSString stringWithFormat:@"%@(bool)", CFBooleanGetValue((CFBooleanRef)v) ? @"true" : @"false"];
+    else if (CFGetTypeID(v) == CFStringGetTypeID())
+        s = [NSString stringWithFormat:@"\"%@\"(string)", (__bridge NSString *)v];
+    else
+        s = [NSString stringWithFormat:@"%@", (__bridge id)v];
+    CFRelease(v);
+    return s;
+}
+
+// ent 键的功能探针（辅助证据；主判定 = SecTask 签名层）。
+// facepanel_fix.md 实测基线：system-task-ports 在签名层生效时 mach_port_allocate /
+// task_for_pid(self) 全通过；task_for_pid-allow 用 task_for_pid(1)；house_arrest /
+// containermanager 用服务 lookup kr。
+static NSString *RYEntProbeFor(NSString *entKey, BOOL *probeOK) {
+    *probeOK = NO;
+    if ([entKey isEqualToString:@"task_for_pid-allow"]) {
+        mach_port_t t = MACH_PORT_NULL;
+        kern_return_t kr = task_for_pid(mach_task_self(), 1, &t);
+        if (t) mach_port_deallocate(mach_task_self(), t);
+        *probeOK = (kr == KERN_SUCCESS);
+        return [NSString stringWithFormat:@"task_for_pid(1) kr=0x%x", kr];
+    }
+    if ([entKey isEqualToString:@"com.apple.system-task-ports"]) {
+        mach_port_t rp = MACH_PORT_NULL;
+        kern_return_t kr1 = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &rp);
+        if (rp) mach_port_deallocate(mach_task_self(), rp);
+        mach_port_t tp = MACH_PORT_NULL;
+        kern_return_t kr2 = task_for_pid(mach_task_self(), getpid(), &tp);
+        if (tp) mach_port_deallocate(mach_task_self(), tp);
+        *probeOK = (kr1 == KERN_SUCCESS && kr2 == KERN_SUCCESS);
+        return [NSString stringWithFormat:@"mach_port_allocate kr=0x%x / task_for_pid(self) kr=0x%x", kr1, kr2];
+    }
+    if ([entKey isEqualToString:@"com.apple.private.mobilehousearrest"] ||
+        [entKey isEqualToString:@"com.apple.private.containermanager"]) {
+        typedef kern_return_t (*BLookUpFn)(mach_port_t, const char *, mach_port_t *);
+        BLookUpFn bl = (BLookUpFn)dlsym(RTLD_DEFAULT, "bootstrap_look_up");
+        if (!bl) return @"bootstrap_look_up 不可用（iOS 未导出）";
+        mach_port_t bp = MACH_PORT_NULL;
+        task_get_bootstrap_port(mach_task_self(), &bp);
+        const char *svc = [entKey containsString:@"housearrest"] ? "com.apple.mobile.house_arrest"
+                                                                 : "com.apple.mobile.containermanager";
+        mach_port_t p = MACH_PORT_NULL;
+        kern_return_t kr = bl(bp, svc, &p);
+        if (p) mach_port_deallocate(mach_task_self(), p);
+        *probeOK = (kr == KERN_SUCCESS);
+        return [NSString stringWithFormat:@"bootstrap_look_up(%s) kr=0x%x", svc, kr];
+    }
+    return nil;   // 该键无可靠功能探针
+}
+
 - (void)runDiagnostics:(void (^)(NSArray<NSDictionary *> *))done {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSMutableArray *out = [NSMutableArray array];
@@ -450,15 +529,32 @@ static NSString *RYEmbeddedEntitlementsString(void) {
 
             if ([key hasPrefix:@"ent:"]) {
                 NSString *entKey = [key substringFromIndex:4];
-                if (!entStr) {
-                    detail = @"无 __entitlements 段（未嵌入 entitlement / 未签名）";
+                // ① 签名层（内核视角，主判定）：SecTaskCopyValueForEntitlement
+                NSString *sig = RYSecTaskEntValue(entKey);
+                // ② 内嵌段（声明层，辅助标注）
+                BOOL emb = entStr && ([entStr rangeOfString:entKey].length > 0);
+                if (sig) {
+                    ok = YES;
+                    detail = [NSString stringWithFormat:@"签名层生效：%@", sig];
+                    if (!emb)
+                        detail = [detail stringByAppendingString:@" ⚠ 内嵌段未含（重签注入，签名/内嵌两处分叉）"];
                 } else {
-                    // 段内容是 plist XML：直接子串匹配键名足够用于"诊断是否声明"
-                    NSString *needle = [NSString stringWithFormat:@"<string>%@</string>", entKey];
-                    ok = ([entStr rangeOfString:needle].length > 0)
-                         || ([entStr rangeOfString:entKey].length > 0);
-                    detail = ok ? @"已声明（注意：声明 ≠ 生效，取决于重签/安装方式）" : @"未声明";
+                    ok = NO;
+                    if (!entStr && !RYSecTaskEntValueAvailable())
+                        detail = @"SecTask API 不可用且无 __entitlements 段（未嵌入 / 未签名）";
+                    else if (emb)
+                        detail = @"内嵌段已声明但签名层无值（内核以签名为准 → 不生效）";
+                    else
+                        detail = @"未声明（内嵌段与签名层均无）";
                 }
+                // ③ 功能探针（辅助证据）
+                BOOL probeOK = NO;
+                NSString *probe = RYEntProbeFor(entKey, &probeOK);
+                if (probe)
+                    detail = [NSString stringWithFormat:@"%@\nprobe: %@（%@）", detail, probe,
+                              probeOK ? @"通过" : @"未通过"];
+                else
+                    detail = [detail stringByAppendingString:@"\n（无功能探针，以签名层为准）"];
             } else if ([key isEqualToString:@"cap:sandbox_mach"]) {
                 errno = 0;
                 int v = sandbox_check(getpid(), "mach-lookup", 0);
