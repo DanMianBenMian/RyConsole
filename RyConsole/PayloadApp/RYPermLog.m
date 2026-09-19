@@ -24,6 +24,9 @@
 // sandbox_check 是私有 C API（main.m 里已声明过，这里再声明一次即可直接链接）
 extern int sandbox_check(pid_t pid, const char *operation, ...);
 
+// iOS SDK 的 mach.h 不保证导出 task_for_pid 声明（新 clang 隐式声明 = 硬错误）→ 显式声明
+extern kern_return_t task_for_pid(mach_port_t target_tport, int pid, mach_port_t *task);
+
 // ---- 高危命令 + 提示文案 ----
 static NSDictionary *RYHighRiskMap(void) {
     static NSDictionary *m = nil;
