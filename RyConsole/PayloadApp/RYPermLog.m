@@ -147,7 +147,7 @@ static atomic_int gScopeMode = 0;
     if (![code isKindOfClass:[NSString class]] || !code.length) return @[];
     NSMutableArray *out = [NSMutableArray array];
     for (NSString *c in [RYPermLog managedCommands]) {
-        if (![self isEnabled:c] && [code rangeOfString:c].location != NSNotFound) [out addObject:c];
+        if (![[RYPermLog shared] isEnabled:c] && [code rangeOfString:c].location != NSNotFound) [out addObject:c];
     }
     return out;
 }
