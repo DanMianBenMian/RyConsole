@@ -1,6 +1,6 @@
 # 勘误与桥工具（安全测试交接）
 
-更新时间 **2026-09-19** ｜ 对应发布 **V2.4.0**（Release tag `RyConsole-iPad-v1`）
+更新时间 **2026-09-19** ｜ 对应发布 **V2.4.3**（Release tag `RyConsole-iPad-v1`）
 
 ---
 
@@ -110,6 +110,7 @@ crashGuardSet(0)     // 关掉 → 恢复"真崩"（需要真崩时用，跑完 
 
 | IPA | 关键内容 |
 |---|---|
+| **V2.4.3** | ★ Stage2 竞态 harness 合入（RACE_plan_v2 方案A，8 原语）：`threadSpawn(fnBodyStr, nWorkers 1..8)`（每 worker 独立 JSContext+全套原语，起跑闸同步）/ `threadJoin(timeoutMs)` / `raceBarrier(n)`（sense-reversing 会合）/ `raceSharedSet/Get`（跨线程传 conn handle）/ `threadProgress`（落盘 race_progress.json 防 panic 丢数据）/ `threadStop/Flag`（协作停）。★ 崩溃兜底状态 `__thread` 化（worker 各布各的检查点；worker 内 SIGSEGV → 该线程 guarded:true，进程存活；主线程布点不再被 worker 覆盖）。M1 探针骨架 `RyConsoleScripts/race_probe_m1.js`（并发版 close-then-use，spawn→barrier→race→join） |
 | **V2.4.2** | ★ callPtr 返回契约钉死（见 §5.1）：闸门驳回从纯文本 `权限请求驳回` 改为统一 JSON `{ok:false,error:"权限请求驳回…",rejected:true,cmd:n}`；验收脚本 `RyConsoleScripts/callptr_acceptance.js`（strlen / getcwd / mach_port_allocate / MCM null 三连）。**MCM SIGSEGV@0x58 定性**：非 callPtr 回归（源码 diff 证明参数侧 V2.3.0→32 零变化，ARC strong 传参推断不成立），根因 = build 29 起嵌入 entitlements 后 MCM 内部 entitlement 检查通过走深路径 → NULL+0x58 解引用；未签名 build 同样调用返 0。兜底会拦成 `guarded:true`（App 存活），属预期行为 |
 | **V2.4.0** | ★ 新增第5选项卡「权限与安全」：①**权限诊断**（逐项实测 entitlement/能力，可用/禁用各自独立显示）②**安全**（命令可用性开关，默认全启用，高危命令带提示；被禁用的命令调用时请求用户确认——后台优先灵动岛提醒、前台/无岛直接弹窗，主标题「请求权限」、子标题「要调用 xxx、xx 命令」，不同意回 AI「权限请求驳回」）③**日志**（顶层「高危命令 x 次 / 一般命令 n 次」计数 + 可筛选列表，高危红、一般绿）。原语统一经 `__ry_gate` 闸门；灵动岛 `LiveActivity` 加 `alert` 字段承载权限提醒 |
 | **V2.3.0** | ★ **`callPtr`**（C 函数指针调用/FFI，规格 `RYCONSOLE_CALLPTR_SPEC.md`；地址 vm_read 体检 + crashGuard 兜底）+ 版本号显示修复（UI/`/ping` 从 Bundle 读，本版 = 2.3.0）|
