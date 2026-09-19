@@ -2136,10 +2136,13 @@ static void RunCode(UIViewController *from, NSString *code) {
     if (!gOutBuf) gOutBuf = [NSMutableString string];
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         @autoreleasepool {
+            // V2.4.6 脚本级权限作用域：入口一次性确认，出口（含兜底路径）清除
+            [[RYPermLog shared] beginScriptScope:code];
             // ★ 崩溃兜底（V2.2.6）：终端 / 资源管理器跑脚本也套检查点（块体就是本层栈帧）
             int guardedSig = 0;
             RY_GUARD_ARM(guardedSig);
             if (guardedSig != 0) {
+                [[RYPermLog shared] endScriptScope];   // 作用域随脚本一起结束
                 NSString *what = [NSString stringWithFormat:
                         @"\n[崩溃兜底] 该脚本触发信号 %d（%s）@ 0x%llx（原语 %s）—— 已拦截，**进程存活**。\n"
                          "  ⚠ 本次执行被掀栈，状态可能不干净；行为异常就重启 App。\n"
@@ -2197,6 +2200,7 @@ static void RunCode(UIViewController *from, NSString *code) {
                 });
             }
             RY_GUARD_DISARM();   // 正常跑完撤检查点（之后崩溃恢复"真崩"老行为）
+            [[RYPermLog shared] endScriptScope];   // V2.4.6 作用域随脚本结束
             dispatch_async(dispatch_get_main_queue(), ^{
                 NSString *done = @"\n=== 执行完成 ===\n";
                 if (gOutTV) gOutTV.text = [gOutTV.text stringByAppendingString:done]; else [gOutBuf appendString:done];
@@ -2237,6 +2241,9 @@ void RYExecStream(NSString *code, void (^onLine)(NSString *line),
     volatile double t0 = [[NSDate date] timeIntervalSince1970];   // volatile：longjmp 回来后还要用它算耗时
     NSMutableArray *errs = [NSMutableArray array];
 
+    // V2.4.6 脚本级权限作用域：入口一次性确认（扫描被禁命令 → 弹一次窗），出口清除
+    [[RYPermLog shared] beginScriptScope:code];
+
     // ★★ 崩溃兜底检查点（V2.2.6）：布在**当前线程**（Autorun 连接线程 / Terminal 主线程），
     //    且必须布在**本层栈帧**（宏里直接展开 sigsetjmp）。本线程随后若发生 SIGSEGV 等，
     //    信号处理器会 siglongjmp 回这里 → 这次执行以"触发崩溃，已兜底"返回，App 不死。
@@ -2244,6 +2251,7 @@ void RYExecStream(NSString *code, void (^onLine)(NSString *line),
     RY_GUARD_ARM(guardedSig);
     if (guardedSig != 0) {
         // 刚从信号里跳回来：这次执行是**被掀栈**结束的，直接就地收尾（不再碰 JSC / 不建新 ctx）
+        [[RYPermLog shared] endScriptScope];   // 作用域随脚本一起结束（别泄漏给下个脚本）
         NSString *what = [NSString stringWithFormat:
                 @"[崩溃兜底] 该操作触发信号 %d（%s）@ 0x%llx，已被拦截 —— **进程存活**。\n"
                  "  崩时原语: %s\n"
@@ -2292,6 +2300,7 @@ void RYExecStream(NSString *code, void (^onLine)(NSString *line),
 
     double ms = ([[NSDate date] timeIntervalSince1970] - t0) * 1000.0;
     RY_GUARD_DISARM();   // 正常跑完：撤掉检查点（撤了之后崩溃就恢复"真崩"老行为）
+    [[RYPermLog shared] endScriptScope];   // V2.4.6 作用域随脚本结束
     if (onDone) onDone(resStr, err, ms);
 }
 
