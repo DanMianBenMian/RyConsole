@@ -79,6 +79,12 @@ static NSString *raceBarrierNative(NSNumber *n);
 static NSString *raceProgressNative(NSDictionary *obj);
 static NSString *raceSharedSetNative(NSString *key, id val);
 static NSString *raceSharedGetNative(NSString *key);
+// ---- V2.4.5 扩展：原子槽 / 自动多轮 ----
+static NSString *raceSlotSetNative(NSNumber *idx, id val);
+static NSString *raceSlotGetNative(NSNumber *idx);
+static NSString *raceAtomicAddNative(NSNumber *idx, id delta);
+static NSString *raceAtomicCasNative(NSNumber *idx, id expect, id swap);
+static NSString *raceRoundsNative(NSString *body, NSNumber *nw, NSNumber *rounds, NSNumber *timeoutMs);
 
 // ---- Stage2 竞态 harness 共享状态（★ 必须在 installPrimitives 之前：注册块引用 gRaceStop）----
 static atomic_int gRaceGo = 0;     // 起跑闸
@@ -92,6 +98,22 @@ static int gRaceN = 0;
 typedef struct { int idx; __strong NSString *body; } RYRaceArg;
 static pthread_mutex_t gSharedLock = PTHREAD_MUTEX_INITIALIZER;
 static NSMutableDictionary *gSharedMap = nil;
+
+// ---- V2.4.5 起跑闸升级：ready 到齐 + cond 广播（消除毫秒级起跑偏差）----
+//   旧版：threadSpawn 创建完线程就置 gRaceGo=1，早创建的 worker 还在建 JSContext，
+//         晚的刚被调度 → 各 worker 实际开跑时刻差毫秒级，竞态窗口没对齐。
+//   新版：worker 装好全套原语后报 ready，最后一名到齐时 cond_broadcast 放行全员
+//         —— 起跑对齐到"全部就绪"之后。失败路径（兜底跳回/setup 异常）也要放行，
+//         否则其他 worker 在 cond_wait 上挂死。
+static pthread_mutex_t gRaceGateLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  gRaceGateCond = PTHREAD_COND_INITIALIZER;
+static atomic_int gRaceReady = 0;      // 已就绪 worker 数（仅 gate lock 内增减）
+static atomic_int gRaceTarget = 0;     // 本轮目标 N
+
+// ---- V2.4.5 共享原子槽：16 × 64bit，跨线程 handle 传递/无锁协作 ----
+//   JS number 只有 53 位精度（2^53 以上丢失）→ 64 位内核指针/句柄一律走 "0x…" hex 串进出。
+//   threadSpawn 不清槽（跨轮累计器用）；要清就显式 raceSlotSet(i, 0)。
+static _Atomic unsigned long long gRaceSlots[16];
 static NSString *RYAutorunRunCapture(NSString *code);   // Autorun: 独立 ctx 执行并捕获输出
 static void RunCode(UIViewController *from, NSString *code);
 static void (^gRunCompletion)(NSString *output);   // LocalSend Code 头设入：RunCode 执行结束后回传完整输出
@@ -1699,6 +1721,14 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"raceSharedSet"] = ^(NSString *key, id val){ return raceSharedSetNative(key, val); };
             ctx[@"raceSharedGet"] = ^(NSString *key){ return raceSharedGetNative(key); };
 
+            // ---- V2.4.5 扩展：共享原子槽 / 自动多轮 ----
+            ctx[@"raceSlotSet"]  = ^(NSNumber *idx, id v){ return raceSlotSetNative(idx, v); };
+            ctx[@"raceSlotGet"]  = ^(NSNumber *idx){ return raceSlotGetNative(idx); };
+            ctx[@"raceAtomicAdd"]= ^(NSNumber *idx, id d){ return raceAtomicAddNative(idx, d); };
+            ctx[@"raceAtomicCas"]= ^(NSNumber *idx, id e, id s){ return raceAtomicCasNative(idx, e, s); };
+            ctx[@"raceRounds"]   = ^(NSString *body, NSNumber *nw, NSNumber *rc, NSNumber *tmo){
+                return raceRoundsNative(body, nw, rc, tmo); };
+
             // 给所有原生原语套一层"点名"包装。
             //   · 跳过 __ry_* 自身、跳过 print（print 调用太频繁，会把真正的凶手冲掉）
             //   · 只包函数，其它类型（对象/常量）原样不动
@@ -1779,6 +1809,14 @@ static __thread char gGuardLastPrim[128] = {0};   // 各线程记各线程的（
 //    和 worker 别混着调（主线程阻塞等 worker = 死锁）
 // ============================================================
 
+// 失败路径也放行（否则其他 worker 在 cond_wait 上挂死到 join 超时）
+static void raceGateReleaseAll(void) {
+    pthread_mutex_lock(&gRaceGateLock);
+    atomic_store(&gRaceGo, 1);
+    pthread_cond_broadcast(&gRaceGateCond);
+    pthread_mutex_unlock(&gRaceGateLock);
+}
+
 static void *raceWorker(void *p) {
     RYRaceArg *arg = (RYRaceArg *)p;
     int idx = arg->idx;
@@ -1798,6 +1836,7 @@ static void *raceWorker(void *p) {
         int gsig = 0;
         RY_GUARD_ARM(gsig);             // 线程本地检查点（★ 本帧，宏展开就是本层栈）
         if (gsig != 0) {                // 从信号跳回：worker 被兜底拦下
+            raceGateReleaseAll();       // 没等到起跑就崩了也要放行同伴
             gRaceResults[idx] = [NSString stringWithFormat:
                 @"{\"ok\":false,\"guarded\":true,\"guardSignal\":%d,\"guardAddr\":\"0x%llx\",\"thread\":%d}",
                 gsig, (unsigned long long)RYGuardLastAddr(), idx];
@@ -1805,8 +1844,6 @@ static void *raceWorker(void *p) {
             atomic_store(&gRaceDone[idx], 1);
             return NULL;
         }
-        // 起跑闸：等 threadSpawn 全部创建完
-        while (!atomic_load(&gRaceGo)) sched_yield();
 
         NSMutableString *out = [NSMutableString string];   // 线程本地 print 缓冲
         NSString *ret = nil;
@@ -1823,9 +1860,24 @@ static void *raceWorker(void *p) {
                 [out appendFormat:@"%@\n", [parts componentsJoinedByString:@" "]];
             };
             installPrimitives(ctx);     // worker 拿全套原语（含闸门包装）
+
+            // ★ 起跑闸（V2.4.5）：context/原语全部就绪后才报 ready；最后一名到齐即
+            //   cond_broadcast 放行全员 —— 开跑时刻对齐到"全部就绪"之后（毫秒级偏差消除）。
+            pthread_mutex_lock(&gRaceGateLock);
+            int rdy = atomic_fetch_add(&gRaceReady, 1) + 1;
+            if (rdy >= atomic_load(&gRaceTarget)) {
+                atomic_store(&gRaceGo, 1);
+                pthread_cond_broadcast(&gRaceGateCond);
+            } else {
+                while (!atomic_load(&gRaceGo))
+                    pthread_cond_wait(&gRaceGateCond, &gRaceGateLock);
+            }
+            pthread_mutex_unlock(&gRaceGateLock);
+
             JSValue *res = [ctx evaluateScript:body];
             if (res && ![res isUndefined]) ret = [res description];
         } @catch (NSException *e) {
+            raceGateReleaseAll();       // setup/执行异常同样放行同伴
             ret = [NSString stringWithFormat:@"{\"ok\":false,\"error\":\"[thread exception] %@\"}",
                    [e.reason stringByReplacingOccurrencesOfString:@"\"" withString:@"'"]];
         }
@@ -1846,6 +1898,9 @@ static NSString *raceThreadSpawnNative(NSString *body, NSNumber *nw) {
     if (n > 8) n = 8;
     atomic_store(&gRaceGo, 0);  atomic_store(&gRaceStop, 0);
     atomic_store(&gRBCount, 0); atomic_store(&gRBGen, 0);
+    atomic_store(&gRaceReady, 0);
+    atomic_store(&gRaceTarget, n);
+    // ★ 共享原子槽不清（跨轮累计器用）；要清就显式 raceSlotSet(i,0)
     for (int i = 0; i < 8; i++) {
         atomic_store(&gRaceDone[i], 0);
         atomic_store(&gRaceGuarded[i], 0);
@@ -1880,7 +1935,10 @@ static NSString *raceThreadJoinNative(NSNumber *timeoutMs) {
         for (int i = 0; i < gRaceN; i++)
             if (!atomic_load(&gRaceDone[i])) { all = NO; break; }
         if (all) break;
-        if (-[t0 timeIntervalSinceNow] * 1000.0 >= tmo) break;
+        if (-[t0 timeIntervalSinceNow] * 1000.0 >= tmo) {
+            raceGateReleaseAll();       // 超时兜底：卡在起跑闸上的 worker 一并放行，别悬挂
+            break;
+        }
         usleep(10000);
     }
     int doneCnt = 0;
@@ -1959,6 +2017,106 @@ static NSString *raceSharedGetNative(NSString *key) {
         return [NSString stringWithFormat:@"\"%@\"",
                 [(NSString *)v stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""]];
     return [v description];   // NSNumber → JS number
+}
+
+// ============================================================
+//  V2.4.5 共享原子槽（16 × 64bit）：跨线程 handle 传递不再靠字符串编码，
+//  且给 worker 提供无锁协作原语。JS number 只有 53 位精度 → 64 位值
+//  （内核指针/句柄）一律 "0x…" hex 串进出，槽内原生 uint64 无损。
+// ============================================================
+static int raceParseU64(id v, unsigned long long *out) {
+    if ([v isKindOfClass:[NSNumber class]]) { *out = [v unsignedLongLongValue]; return 1; }
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (![s hasPrefix:@"0x"] && ![s hasPrefix:@"0X"]) return 0;
+        return sscanf([s UTF8String], "0x%llx", out) == 1;
+    }
+    return 0;
+}
+
+static NSString *raceSlotSetNative(NSNumber *idx, id val) {
+    int i = [idx intValue];
+    if (i < 0 || i >= 16) return @"{\"ok\":false,\"error\":\"[raceSlotSet error] idx must be 0..15\"}";
+    unsigned long long u = 0;
+    if (!raceParseU64(val, &u))
+        return @"{\"ok\":false,\"error\":\"[raceSlotSet error] val must be number or \\\"0x…\\\" hex (64 位值用 hex 串，JS number 只保 53 位)\"}";
+    atomic_store(&gRaceSlots[i], u);
+    return [NSString stringWithFormat:@"{\"ok\":true,\"slot\":%d,\"value\":\"0x%llx\"}", i, u];
+}
+
+static NSString *raceSlotGetNative(NSNumber *idx) {
+    int i = [idx intValue];
+    if (i < 0 || i >= 16) return @"{\"ok\":false,\"error\":\"[raceSlotGet error] idx must be 0..15\"}";
+    unsigned long long u = atomic_load(&gRaceSlots[i]);
+    return [NSString stringWithFormat:@"{\"ok\":true,\"slot\":%d,\"value\":\"0x%llx\"}", i, u];
+}
+
+static NSString *raceAtomicAddNative(NSNumber *idx, id delta) {
+    int i = [idx intValue];
+    if (i < 0 || i >= 16) return @"{\"ok\":false,\"error\":\"[raceAtomicAdd error] idx must be 0..15\"}";
+    unsigned long long d = 0;
+    if (!raceParseU64(delta, &d))
+        return @"{\"ok\":false,\"error\":\"[raceAtomicAdd error] delta must be number or \\\"0x…\\\" hex\"}";
+    unsigned long long old = atomic_fetch_add(&gRaceSlots[i], d);
+    return [NSString stringWithFormat:@"{\"ok\":true,\"slot\":%d,\"old\":\"0x%llx\",\"now\":\"0x%llx\"}",
+            i, old, old + d];
+}
+
+static NSString *raceAtomicCasNative(NSNumber *idx, id expect, id swap) {
+    int i = [idx intValue];
+    if (i < 0 || i >= 16) return @"{\"ok\":false,\"error\":\"[raceAtomicCas error] idx must be 0..15\"}";
+    unsigned long long e = 0, s = 0;
+    if (!raceParseU64(expect, &e) || !raceParseU64(swap, &s))
+        return @"{\"ok\":false,\"error\":\"[raceAtomicCas error] expect/swap must be number or \\\"0x…\\\" hex\"}";
+    unsigned long long old = atomic_load(&gRaceSlots[i]);
+    BOOL swapped = atomic_compare_exchange_strong(&gRaceSlots[i], &old, s);
+    return [NSString stringWithFormat:@"{\"ok\":true,\"slot\":%d,\"swapped\":%@,\"old\":\"0x%llx\",\"now\":\"0x%llx\"}",
+            i, swapped ? @"true" : @"false", old, atomic_load(&gRaceSlots[i])];
+}
+
+// ============================================================
+//  V2.4.5 自动多轮：raceRounds(fnBodyStr, nWorkers, rounds, timeoutMs)
+//  逐轮 threadSpawn→threadJoin，聚合每轮结果；槽跨轮保留（累计器）。
+//  纪律：某轮超时仍有 worker 未完 → 停（避免悬挂放大）；某轮 guarded 命中
+//  → 停（命中线索，降 iters 复现，别把污染面跑大）。
+//  返回 {ok,rounds,ran,totalGuarded,earlyStop,rounds:[{round,done,guarded,stillRunning,results}]}
+// ============================================================
+static NSString *raceRoundsNative(NSString *body, NSNumber *nw, NSNumber *rounds, NSNumber *timeoutMs) {
+    if (![body isKindOfClass:[NSString class]] || !body.length)
+        return @"{\"ok\":false,\"error\":\"[raceRounds error] fnBodyStr must be a non-empty JS string  |  签名: raceRounds(fnBodyStr, nWorkers, rounds, timeoutMs)\"}";
+    int n = [nw isKindOfClass:[NSNumber class]] ? (int)[nw intValue] : 2;
+    if (n < 1) n = 1;  if (n > 8) n = 8;
+    int rc = [rounds isKindOfClass:[NSNumber class]] ? (int)[rounds intValue] : 1;
+    if (rc < 1) rc = 1;  if (rc > 100) rc = 100;
+    double tmo = [timeoutMs isKindOfClass:[NSNumber class]] ? [timeoutMs doubleValue] : 60000;
+    if (tmo <= 0 || tmo > 600000) tmo = 600000;   // 1e6+ iters 单轮可能很久，默认放宽到 10 分钟
+    NSMutableArray *detail = [NSMutableArray array];
+    int ran = 0, totalGuarded = 0; BOOL earlyStop = NO; NSString *stopReason = nil;
+    for (int r = 0; r < rc; r++) {
+        NSString *sp = raceThreadSpawnNative(body, @(n));
+        NSDictionary *spd = [NSJSONSerialization JSONObjectWithData:
+                             [(NSString *)sp dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
+        if (![spd[@"ok"] boolValue]) { earlyStop = YES; stopReason = sp; break; }
+        NSString *jr = raceThreadJoinNative(@(tmo));
+        NSDictionary *jd = [NSJSONSerialization JSONObjectWithData:
+                            [(NSString *)jr dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
+        if (!jd) { earlyStop = YES; stopReason = @"[raceRounds] join 结果不可解析"; break; }
+        ran++;
+        int g = 0;
+        for (NSDictionary *res in jd[@"results"]) if ([res[@"guarded"] boolValue]) g++;
+        totalGuarded += g;
+        [detail addObject:@{@"round": @(r), @"done": jd[@"done"] ?: @(0),
+                            @"guarded": @(g), @"stillRunning": jd[@"stillRunning"] ?: @[],
+                            @"results": jd[@"results"] ?: @[]}];
+        if ([jd[@"stillRunning"] count] > 0) { earlyStop = YES; stopReason = @"[raceRounds] 本轮超时仍有 worker 未完 → 停"; break; }
+        if (g > 0) { earlyStop = YES; stopReason = [NSString stringWithFormat:@"[raceRounds] 第 %d 轮 guarded 命中 → 停（降 iters 复现）", r]; break; }
+    }
+    NSDictionary *d = @{@"ok": @YES, @"rounds": @(rc), @"ran": @(ran),
+                        @"totalGuarded": @(totalGuarded), @"earlyStop": @(earlyStop),
+                        @"stopReason": stopReason ?: [NSNull null], @"detail": detail};
+    NSData *jd2 = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
+    return jd2 ? [[NSString alloc] initWithData:jd2 encoding:NSUTF8StringEncoding]
+               : @"{\"ok\":false,\"error\":\"serialize failed\"}";
 }
 
 static void RunCode(UIViewController *from, NSString *code) {
