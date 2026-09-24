@@ -9,8 +9,10 @@ description: >-
   ★ 关键坑（v1.0 实测）：提交必须用 JSON body（form 分支不做 percent-decode，会静默失败）、
   job 只活 ~36s（超时变 404 而非报错）、`lsAppList()` 一次调用即崩进程、服务单线程（并发必坏）。
   ★ 若官方 exe 只报 `unknown job`，改用直连客户端 `ryc.py` 看服务端原始响应。
-  ★ V2.4.13 起：移动数据 / 个人热点环境也能连（服务端本就绑 0.0.0.0；envIP() 列出全部接口 IP，
-  热点看 bridge100=172.20.10.1）；环境被探针搞脏用 envReset() 原地复位，不必重启 RyConsole。
+  ★ V2.4.14 起：移动数据 / 个人热点环境也能连（服务端本就绑 0.0.0.0，Wi-Fi 与热点/蜂窝**同时可达**）。
+  用 envNet() 拿分类端点 {wifi?, hotspot?, cellular?, hasAny} —— 没有的那一类不出现；
+  **主地址 Wi-Fi 优先**（已修"连着 Wi-Fi 却报热点 172.20.10.1"的 Bug）；网都没有时
+  envServerStart() 直接报错、不启动监听。环境被探针搞脏用 envReset() 原地复位，不必重启 RyConsole。
 agent_created: true
 ---
 
@@ -33,7 +35,7 @@ AI（电脑端 / Ryan）  ── 写 JS ──▶  RyConsole（iPad，Autorun �
 | 条件 | 怎么确认 |
 |---|---|
 | iPad 上 Autorun 已启动 | 应用内打开面板点「启动」，或在控制台执行 `autorunStart(8899)`；面板顶部会显示本机 IP |
-| iPad 与电脑同一网络（Wi-Fi / 个人热点 / 移动数据都行） | 电脑 `ping <iPadIP>` 能通。**拿不准连哪个地址就先 `envIP()`**：列出全部接口 IP；热点场景看 `bridge100`（iPhone 个人热点通常是 `172.20.10.1`） |
+| iPad 与电脑同一网络（Wi-Fi / 个人热点 / 移动数据都行） | 电脑 `ping <iPadIP>` 能通。**拿不准连哪个地址就先 `envNet()`**：按类给出 `wifi` / `hotspot` / `cellular`，**没有的那一类不出现**；电脑在哪个网就挑哪一类的 `ip`（服务端绑 `0.0.0.0`，几个网同时可达） |
 | RyConsole 处于**保活态** | V2.2 起点「启动监听」后自动保活（静音音频 + 后台任务续期）→ **可切后台 / 锁屏**；面板提示应为「● 正在监听 · 后台保活已开」，灵动岛/锁屏显示「监听中」。若面板显示未启动就是没开 |
 | 端口一致 | 默认 `8899`（面板里可改） |
 
@@ -245,7 +247,8 @@ iokitMapTry(conn)       // 扫 memType 0..15，给"哪个可用/都不支持"的
 |---|---|---|
 | `连不上 ... WinError 10060` / 超时 | 服务没启动 / 不同网段 / 保活被系统回收 | 让用户①开面板点启动 ②确认同一 Wi-Fi ③看灵动岛是否还在显示「监听中」，不在就重点启动 |
 | `连不上 ... 10061 拒绝` | 端口不对或服务已停 | 核对端口；面板里看「● 正在监听」 |
-| **移动数据 / 热点下连不上** | 拿错了 IP（连了 Wi-Fi 的 `en0`，不是热点的 `bridge100`） | 先 `envIP()` 找 `bridge100`（热点网段通常 `172.20.10.x`）。服务端本就绑 `0.0.0.0`，**不需要改配置** |
+| **移动数据 / 热点下连不上** | 拿错了 IP（电脑在 Wi-Fi 却用了热点的 `bridge100`，或反之） | 先 `envNet()`：电脑在哪个网就用哪一类的 `ip`。服务端本就绑 `0.0.0.0`，**不需要改配置** |
+| **启动监听报「无可用网络」** | 既没连 Wi-Fi 也没开蜂窝 / 热点 | V2.4.14 起 `envServerStart()` 在 `hasAny=false` 时**拒绝启动**（不静默失败）。先连网或开热点 |
 | `HTTP 404 no such route` | 端点拼错 | 只用 `/ping` `/eval` `/submit` `/result` |
 | `执行器未注册` | 原生侧 `RYAutorunSetEval` 没跑到 | 让用户先在控制台跑任意一段 JS（会触发注册），再启动 Autorun |
 | 返回不是 JSON | 服务被别的程序占用端口 | 换端口（面板改 + `--port` 同步改） |
@@ -379,18 +382,30 @@ if (inst.ok) {
 |---|---|---|
 | **`envState()`** | `() → JSON` | **环境快照**：`{clean, uid, euid, gid, egid, pid, groups[], ip, interfaces[], serverRunning, sharedMapCount, batchUsed, batchActive, slotNonZero, reasons[]}`。`clean:true` = 无残留（共享字典空 / 无竞态批次 / 原子槽全零 / 服务端未跑）；脏的时候 `reasons` 逐条列出污染原因 |
 | **`envReset()`** | `() → JSON` | **原地复位环境**：清共享字典、16 个原子槽归零、回收全部竞态批次（销毁闸锁、清零 done/guarded/taken、置空 results）、停 Autorun 服务 → `{ok:true, recycledBatches, …}`。**环境被探针搞脏时先跑它，不要重启 App** |
-| **`envIP()`** | `() → [{if, family, ip}]` | 枚举**全部**接口 IP（IPv4/IPv6）。热点 / 蜂窝下找可达地址就用这个 |
-| **`envServerStart(port)`** | `(port) → JSON` | 起 Autorun 服务并回 `{ok, port, ip, url}`；`ip` 已按 `bridge100 → pdp_ip0/ipsec0 → en0/en1` 优先级挑过（即"对电脑可达的那个"） |
+| **`envIP()`** | `() → [{if, family, ip, kind}]` | 枚举**全部**接口 IP（IPv4/IPv6），每项带 `kind` 归类（wifi/hotspot/cellular/vpn/other） |
+| **`envNet()`** | `() → JSON` | ★ **分类端点**：`{wifi?, hotspot?, cellular?, hasAny, all[]}`。**没有的那一类不出现** —— 没连 Wi-Fi 就没有 `wifi` 键，没开蜂窝就没有 `cellular` 键；`hasAny:false` = 网都没有 |
+| **`envServerStart(port)`** | `(port) → JSON` | 起服务并回 `{ok, port, ip, urls[]}`；`urls` **按类各给一条** `{kind, if, ip, url}`。**`hasAny=false`（无网络）时直接返 `{ok:false, error:"无可用网络…"}`，不启动监听**；`ip` 是主地址，Wi-Fi 优先 |
 | **`envServerStop()`** | `() → string` | 停服务 |
 | **`envServerStatus()`** | `() → JSON` | 同 `/ping` 的服务端状态（`running` / `port` / `lanIP` …） |
 
-**★ 移动数据 / 个人热点下怎么连（V2.4.13）**：服务端本来就绑 `0.0.0.0`（全接口可连），
-所以移动数据环境**不需要任何额外配置** —— 真正的难点只是"该连哪个 IP"。判据：
+**★ 该连哪个地址（V2.4.14）**：服务端绑 `0.0.0.0`，所以 **Wi-Fi 与热点/蜂窝是同时可达的** ——
+不需要任何配置，也不需要在两者之间"切换"。一行拿全：
 
-- 电脑连的是 **iPad/iPhone 的个人热点** → 看 `bridge100`（iPhone 热点一般 `172.20.10.1`，电脑拿到 `172.20.10.2` 等）
-- 设备自己走 **蜂窝移动数据** → 看 `pdp_ip0` / `ipsec0`
-- 普通 **Wi-Fi** → `en0`（iPad 上偶为 `en1`）
-- 一行拿全：`print(JSON.stringify(envIP()))`；或在 App 里「权限与安全 → **环境**」页直接看
+```js
+print(JSON.stringify(envNet()));
+// {"wifi":{"if":"en0","ip":"192.168.1.5"},"hotspot":{"if":"bridge100","ip":"172.20.10.1"},
+//  "cellular":{"if":"pdp_ip0","ip":"10.x.x.x"},"hasAny":true,"all":[...]}
+```
+
+- **电脑在同网段 Wi-Fi** → 用 `wifi.ip`（`en0`）
+- **电脑连的是 iPad/iPhone 的个人热点** → 用 `hotspot.ip`（`bridge100`，一般 `172.20.10.1`，电脑拿到 `172.20.10.2+`）
+- **设备自己走蜂窝移动数据** → `cellular.ip`（`pdp_ip0` / `ipsec0`）。注意蜂窝地址常被运营商 NAT，
+  电脑要连上通常得**连到设备的热点**，那时用 `hotspot.ip`
+- **没有的那一类就不出现** —— 看到几个键就有几条路可走；`hasAny:false` = 网都没有
+
+> ⚠️ **V2.4.14 修了优先级 Bug**：早期版本把 `bridge100`（热点）排在最前，导致**连着 Wi-Fi 时
+> 也报 `172.20.10.1`**，而电脑在同网段 Wi-Fi 上根本连不到它。现在主地址 **Wi-Fi 优先**
+> （`en0/en1 → bridge100 → pdp_ip0/ipsec0`），热点只在没有 Wi-Fi 时才被选为主地址。
 
 **★ 环境脏了不要重启 App**：竞态批次没回收、共享字典涨了、原子槽非零、服务端还挂着 ——
 这些以前只能杀进程重开。现在 `envReset()` 原地复位。
@@ -499,7 +514,7 @@ block 参数方法、开放 Keychain 明文（`keychainProbe` 只做读探测）
 | ① 权限诊断 | **V2.4.13 起完全动态**：不再写固定表单，运行时枚举本机**真实存在**的 entitlement 键（内嵌段键 ∪ 已知键描述表）；签名层（SecTask）与内嵌段两处分叉会标 ⚠；能力项（沙盒 / IOKit / Mach / dyld / spawn / 钥匙串 / 灵动岛）逐项实测。**表单只承载"这个权限是干什么的"描述，不再硬编码检测结果** |
 | ② 安全 | 命令开关（默认全启用）；关掉的命令被调用时会先向用户确认，拒绝 = 回给 AI「权限请求驳回」 |
 | ③ 日志 | 高危 / 一般调用计数 + 可筛选列表 |
-| ④ **环境**（V2.4.13 新增） | 身份（UID / EUID / GID / EGID / PID / **所在组数组**）+ 环境是否干净（脏则列出 `reasons`）+ **一键重置**；网络段列出全部接口 IP 与「自动运行服务器」开关，启动后直接给出电脑可连的 `http://<IP>:8899/ping` |
+| ④ **环境**（V2.4.13 新增，V2.4.14 改网络段） | 身份（UID / EUID / GID / EGID / PID / **所在组数组**）+ 环境是否干净（脏则列出 `reasons`）+ **一键重置**；网络段**按类各一行**（Wi-Fi / 个人热点 / 蜂窝，**没有的那一类不显示**），启动后每行各自给出 `http://<该类IP>:8899/ping`；**无网络时开关置灰、不给启动** |
 
 > 面板「环境」页 = `envState()` 的可视化；重置按钮 = `envReset()`。
 
