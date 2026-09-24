@@ -28,6 +28,7 @@
 #import <pthread.h>
 #import <stdatomic.h>
 #import <sched.h>
+#import <ifaddrs.h>          // V2.4.13 环境页/网络：枚举接口 IP（含个人热点 bridge100）
 #import "AutorunServer.h"
 #import "KeepAlive.h"
 #import "LiveActivityBridge.h"
@@ -1584,6 +1585,140 @@ static NSString *httpRequestNative(NSDictionary *opts) {
 }
 
 // ---- 安装原生原语（从 #4 原 runCode 提取，行为完全一致）----
+// ============================================================
+//  V2.4.13 环境状态 / 重置 / 网络可达性（「权限与安全 → 环境」页 + env* 原语）
+//  —— 这些函数引用本文件顶部的环境质量全局（gSharedMap / gBatches / gRaceSlots / gRaceStop）。
+// ============================================================
+
+// 枚举所有网络接口 IP（IPv4/IPv6），用于热点/局域网可达性展示
+static NSString *RYInterfaceIPsJSON(void) {
+    struct ifaddrs *addrs = NULL;
+    if (getifaddrs(&addrs) != 0 || addrs == NULL) return @"[]";
+    NSMutableArray *list = [NSMutableArray array];
+    for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
+        if (p->ifa_addr == NULL) continue;
+        int fam = p->ifa_addr->sa_family;
+        if (fam != AF_INET && fam != AF_INET6) continue;
+        NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
+        char buf[INET6_ADDRSTRLEN] = {0};
+        const void *addr = (fam == AF_INET)
+            ? (const void *)&((struct sockaddr_in *)p->ifa_addr)->sin_addr
+            : (const void *)&((struct sockaddr_in6 *)p->ifa_addr)->sin6_addr;
+        if (inet_ntop(fam, addr, buf, sizeof(buf)) == NULL) continue;
+        [list addObject:@{@"if": name,
+                          @"family": fam == AF_INET ? @"inet" : @"inet6",
+                          @"ip": [NSString stringWithUTF8String:buf]}];
+    }
+    freeifaddrs(addrs);
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:list options:0 error:NULL];
+    return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"[]";
+}
+
+// 取一个「对连热点/局域网的电脑可达」的 IP：优先个人热点 bridge100 / 蜂窝 pdp_ip0/ipsec0 / Wi-Fi en0/en1，排除回环
+static NSString *RYHotspotIP(void) {
+    struct ifaddrs *addrs = NULL;
+    if (getifaddrs(&addrs) != 0 || addrs == NULL) return @"?";
+    NSArray *pri = @[@"bridge100", @"pdp_ip0", @"ipsec0", @"en0", @"en1"];
+    NSString *fallback = nil;
+    for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
+        if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET) continue;
+        NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
+        char buf[INET_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, buf, sizeof(buf)) == NULL) continue;
+        NSString *ip = [NSString stringWithUTF8String:buf];
+        if ([ip hasPrefix:@"127."]) continue;
+        if ([pri containsObject:name]) { freeifaddrs(addrs); return ip; }
+        if (!fallback) fallback = ip;
+    }
+    freeifaddrs(addrs);
+    return fallback ? fallback : @"?";
+}
+
+// 环境状态快照：身份 + 干净与否（干净 = 无环境污染状态残留）
+static NSString *RYEnvironmentStateJSON(void) {
+    NSInteger sharedCount = gSharedMap ? (NSInteger)gSharedMap.count : 0;
+    NSInteger batchUsed = 0, batchActive = 0, slotNonZero = 0;
+    for (int i = 0; i < RY_RACE_MAXBATCH; i++) {
+        if (gBatches[i].used) {
+            batchUsed++;
+            int n = gBatches[i].n, done = 0;
+            for (int w = 0; w < n && w < RY_RACE_MAXW; w++) done += atomic_load(&gBatches[i].done[w]) ? 1 : 0;
+            if (done < n) batchActive++;
+        }
+    }
+    for (int i = 0; i < 16; i++) if (atomic_load(&gRaceSlots[i]) != 0) slotNonZero++;
+    NSString *srvStatus = RYAutorunStatus();
+    BOOL serverRunning = (srvStatus && [srvStatus rangeOfString:@"\"running\":true"].location != NSNotFound);
+    BOOL clean = (sharedCount == 0 && batchUsed == 0 && slotNonZero == 0 && !serverRunning);
+    uid_t uid = getuid(), euid = geteuid();
+    gid_t gid = getgid(), egid = getegid();
+    pid_t pid = getpid();
+    gid_t groups[16]; int ng = getgroups(16, groups);
+    if (ng < 0) ng = 0;
+    NSMutableArray *garr = [NSMutableArray array];
+    for (int gi = 0; gi < ng; gi++) [garr addObject:@(groups[gi])];
+
+    NSString *ips = RYInterfaceIPsJSON();
+    id ifs = [NSJSONSerialization JSONObjectWithData:[ips dataUsingEncoding:NSUTF8StringEncoding]
+                                             options:0 error:NULL];
+    NSMutableArray *reasons = [NSMutableArray array];
+    if (sharedCount)      [reasons addObject:[NSString stringWithFormat:@"共享字典有 %ld 项", (long)sharedCount]];
+    if (batchUsed)       [reasons addObject:[NSString stringWithFormat:@"%ld 个竞态批次在用", (long)batchUsed]];
+    if (slotNonZero)     [reasons addObject:[NSString stringWithFormat:@"%ld 个原子槽非零", (long)slotNonZero]];
+    if (serverRunning)   [reasons addObject:@"环境服务端仍在运行"];
+
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"clean"]          = @(clean);
+    d[@"uid"] = @(uid); d[@"euid"] = @(euid);
+    d[@"gid"] = @(gid); d[@"egid"] = @(egid);
+    d[@"pid"] = @(pid); d[@"groupCount"] = @(ng); d[@"groups"] = garr;
+    d[@"sharedMapCount"] = @(sharedCount);
+    d[@"batchUsed"]     = @(batchUsed);
+    d[@"batchActive"]   = @(batchActive);
+    d[@"slotNonZero"]   = @(slotNonZero);
+    d[@"serverRunning"] = @(serverRunning);
+    d[@"ip"]            = RYHotspotIP();
+    d[@"interfaces"]    = (ifs && [ifs isKindOfClass:[NSArray class]]) ? ifs : @[];
+    d[@"reasons"]       = reasons;
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
+    return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{\"clean\":false}";
+}
+
+// 重置环境：清共享字典、归零原子槽、回收竞态批次、停服务端 —— 避免重启 RyConsole
+static NSString *RYResetEnvironment(void) {
+    if (gSharedMap) [gSharedMap removeAllObjects];
+    else gSharedMap = [NSMutableDictionary dictionary];
+    for (int i = 0; i < 16; i++) atomic_store(&gRaceSlots[i], 0);
+    atomic_store(&gRaceStop, 0);
+    int recycled = 0;
+    for (int i = 0; i < RY_RACE_MAXBATCH; i++) {
+        if (gBatches[i].used) {
+            gBatches[i].used = 0; gBatches[i].joined = 0; gBatches[i].id = 0; gBatches[i].n = 0;
+            if (gBatches[i].gateInited) {
+                pthread_mutex_destroy(&gBatches[i].gateLock);
+                pthread_cond_destroy(&gBatches[i].gateCond);
+                gBatches[i].gateInited = 0;
+            }
+            for (int w = 0; w < RY_RACE_MAXW; w++) {
+                atomic_store(&gBatches[i].done[w], 0);
+                atomic_store(&gBatches[i].guarded[w], 0);
+                atomic_store(&gBatches[i].taken[w], 0);
+                gBatches[i].results[w] = nil;
+            }
+            recycled++;
+        }
+    }
+    NSString *srv = RYAutorunStop();
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"ok"] = @YES;
+    d[@"recycledBatches"] = @(recycled);
+    d[@"sharedMapCleared"] = @YES;
+    d[@"slotsZeroed"] = @(16);
+    d[@"serverStop"] = srv ?: @"";
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
+    return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{\"ok\":true}";
+}
+
 static void installPrimitives(JSContext *ctx) {
 ctx[@"runCommand"]=^NSString*(NSString *cmd){
                 FILE *fp=popen([cmd UTF8String],"r");
@@ -1695,6 +1830,20 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"memRead"]=^(NSString *hex, NSNumber *len){ return memReadNative(hex, len); };
             ctx[@"memWrite"]=^(NSString *addrHex, id data){ return memWriteNative(addrHex, data); };
             ctx[@"threadBatches"]=^{ return raceThreadBatchesNative(); };
+
+            // ---- V2.4.13 环境 / 网络原语 ----
+            ctx[@"envState"]      = ^{ return RYEnvironmentStateJSON(); };
+            ctx[@"envReset"]      = ^{ return RYResetEnvironment(); };
+            ctx[@"envIP"]         = ^{ return RYInterfaceIPsJSON(); };
+            ctx[@"envServerStart"]= ^(NSNumber *port){
+                int p = [port intValue]; if (p < 1 || p > 65535) p = 8899;
+                RYAutorunStart(p, nil, nil);
+                NSString *ip = RYHotspotIP();
+                return [NSString stringWithFormat:
+                    @"{\"ok\":true,\"port\":%d,\"ip\":\"%@\",\"url\":\"http://%@:%d/ping\"}", p, ip, ip, p];
+            };
+            ctx[@"envServerStop"] = ^{ return RYAutorunStop(); };
+            ctx[@"envServerStatus"]=^{ return RYAutorunStatus(); };
 
             // ---- V2.3 callPtr：C 函数指针调用（FFI）—— 补齐 dlopen/dlsym 之后的最后一环 ----
             //   规格：RYCONSOLE_CALLPTR_SPEC.md。只支持整型/指针返回；函数地址会先做可读性体检。
