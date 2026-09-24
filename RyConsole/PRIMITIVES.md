@@ -419,3 +419,33 @@ JSON.stringify([callPtr(b.addr,['abc','abc']), callPtr(b.addr,['abc','abd'])]); 
 var c = dlsymAddr(0, 'getcwd');
 JSON.stringify(callPtr(c.addr, [{ buf: 1024 }]));  // value=缓冲地址, out.buf0=base64(工作目录)
 ```
+
+## 16. 环境与网络（V2.4.13 新增）★
+
+> 本节四个 C 函数实现在 `main.m`，声明在 `RYPermLog.h`，面板「权限与安全 → 环境」页是它们的可视化。
+
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| `envState` | `() → JSON` | 环境快照：`{clean, uid, euid, gid, egid, pid, groups[], groupCount, ip, interfaces[], serverRunning, sharedMapCount, batchUsed, batchActive, slotNonZero, reasons[]}`。`clean = 共享字典空 && 无竞态批次 && 原子槽全零 && 服务端未跑`；脏时 `reasons` 逐条给原因 |
+| `envReset` | `() → JSON` | **原地复位**：清 `gSharedMap`、16 个 `gRaceSlots` 归零、`gRaceStop` 归零、回收全部 `gBatches`（销毁闸 mutex/cond、清零 done/guarded/taken、置空 results）、调 `RYAutorunStop()`。返回 `{ok, recycledBatches, sharedMapCleared, slotsZeroed, serverStop}` |
+| `envIP` | `() → [{if, family, ip}]` | `getifaddrs` 枚举全部接口 IPv4/IPv6（`family` = `inet`/`inet6`） |
+| `envServerStart` | `(port) → JSON` | 起服务并回 `{ok, port, ip, url}`；`ip` 来自 `RYHotspotIP()` |
+| `envServerStop` | `() → string` | 停服务 |
+| `envServerStatus` | `() → JSON` | 同 `/ping`（`running`/`port`/`lanIP`…） |
+
+**可达 IP 的选取优先级**（`RYHotspotIP()`，排除 `127.*`）：
+`bridge100`（个人热点）→ `pdp_ip0` / `ipsec0`（蜂窝）→ `en0` / `en1`（Wi-Fi）→ 其它非回环接口兜底。
+
+> 热点场景：iPhone/iPad 个人热点的 `bridge100` 通常是 `172.20.10.1`，连上热点的电脑拿到 `172.20.10.2` 等。
+> 服务端本来就 `bind("0.0.0.0")`，**全接口可连**，移动数据环境无需额外配置 —— 只需要连对 IP。
+
+**配套（V2.4.12，此前未录入本节）**：
+
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| `memWrite` | `(addrHex, data) → JSON` | 向本任务地址空间写二进制（`vm_write` 就地覆盖）。`data` 支持 hex 串 / `"b64:…"` / `{b64:"…"}`；kr 干净报错（2=未映射，4=页只读）；64KB 上限，与 `memRead` 对称 |
+| `threadBatches` | `() → JSON` | 逐槽 dump 竞态批次注册表（`used/joined/id/n/ready/done/taken` + `seq`），排查 `threadJoin` 收割不到时用 |
+
+> ⚠️ **待补录**：竞态 harness 全套（`threadSpawn` / `threadJoin` / `raceBarrier` / `raceSharedSet|Get` /
+> `raceSlotSet|Get|AtomicAdd|AtomicCas` / `raceRounds` / `threadProgress` / `threadStop|Flag`，
+> V2.4.3～V2.4.5 引入）尚未在本文件展开，签名以 `ERRATA_AND_TOOLING.md` 版本表 + 设备上 `primHelp("<名>")` 为准。
