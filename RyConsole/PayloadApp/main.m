@@ -1591,7 +1591,7 @@ static NSString *httpRequestNative(NSDictionary *opts) {
 // ============================================================
 
 // 枚举所有网络接口 IP（IPv4/IPv6），用于热点/局域网可达性展示
-static NSString *RYInterfaceIPsJSON(void) {
+NSString *RYInterfaceIPsJSON(void) {
     struct ifaddrs *addrs = NULL;
     if (getifaddrs(&addrs) != 0 || addrs == NULL) return @"[]";
     NSMutableArray *list = [NSMutableArray array];
@@ -1615,7 +1615,7 @@ static NSString *RYInterfaceIPsJSON(void) {
 }
 
 // 取一个「对连热点/局域网的电脑可达」的 IP：优先个人热点 bridge100 / 蜂窝 pdp_ip0/ipsec0 / Wi-Fi en0/en1，排除回环
-static NSString *RYHotspotIP(void) {
+NSString *RYHotspotIP(void) {
     struct ifaddrs *addrs = NULL;
     if (getifaddrs(&addrs) != 0 || addrs == NULL) return @"?";
     NSArray *pri = @[@"bridge100", @"pdp_ip0", @"ipsec0", @"en0", @"en1"];
@@ -1635,7 +1635,7 @@ static NSString *RYHotspotIP(void) {
 }
 
 // 环境状态快照：身份 + 干净与否（干净 = 无环境污染状态残留）
-static NSString *RYEnvironmentStateJSON(void) {
+NSString *RYEnvironmentStateJSON(void) {
     NSInteger sharedCount = gSharedMap ? (NSInteger)gSharedMap.count : 0;
     NSInteger batchUsed = 0, batchActive = 0, slotNonZero = 0;
     for (int i = 0; i < RY_RACE_MAXBATCH; i++) {
@@ -1685,7 +1685,7 @@ static NSString *RYEnvironmentStateJSON(void) {
 }
 
 // 重置环境：清共享字典、归零原子槽、回收竞态批次、停服务端 —— 避免重启 RyConsole
-static NSString *RYResetEnvironment(void) {
+NSString *RYResetEnvironment(void) {
     if (gSharedMap) [gSharedMap removeAllObjects];
     else gSharedMap = [NSMutableDictionary dictionary];
     for (int i = 0; i < 16; i++) atomic_store(&gRaceSlots[i], 0);
