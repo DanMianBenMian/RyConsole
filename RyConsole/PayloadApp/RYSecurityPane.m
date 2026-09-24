@@ -249,9 +249,31 @@
     [self.envTable reloadData];
 }
 
+// 分类端点（V2.4.14）：Wi-Fi / 个人热点 / 蜂窝 —— **哪类存在才出现哪一行**
+- (NSArray *)envEndpointRows {
+    NSDictionary *net = self.envState[@"net"];
+    if (![net isKindOfClass:[NSDictionary class]]) return @[];
+    NSArray *order = @[@"wifi", @"hotspot", @"cellular"];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *k in order) {
+        id e = net[k];
+        if (![e isKindOfClass:[NSDictionary class]]) continue;
+        NSMutableDictionary *m = [e mutableCopy];
+        m[@"kind"]  = k;
+        m[@"label"] = [k isEqualToString:@"wifi"]    ? @"Wi-Fi"
+                    : [k isEqualToString:@"hotspot"] ? @"个人热点"
+                    : @"蜂窝移动数据";
+        [out addObject:m];
+    }
+    return out;
+}
+
 - (void)onEnvServer:(UISwitch *)sw {
-    if (sw.on) RYAutorunStart(8899, nil, nil);
-    else RYAutorunStop();
+    if (sw.on) {
+        // 网都没有 → 不启动（服务端给不出可达地址，监听没有意义）
+        if (![self envEndpointRows].count) { sw.on = NO; [self reloadEnv]; return; }
+        RYAutorunStart(8899, nil, nil);
+    } else RYAutorunStop();
     [self performSelector:@selector(reloadEnv) withObject:nil afterDelay:0.4];
 }
 
@@ -311,7 +333,7 @@
     if (tv == self.envTable) {
         return (sec == 0) ? @"身份（UID / 组）"
              : (sec == 1) ? @"环境状态"
-             : @"网络（热点 / 移动数据 · 电脑可连）";
+             : @"网络（Wi-Fi / 热点 / 蜂窝 · 同时可达，电脑在哪个网就用哪个）";
     }
     return nil;
 }
@@ -321,9 +343,9 @@
     if (tv == self.envTable) {
         if (sec == 0) return 6;                       // UID/EUID/GID/EGID/PID/组
         if (sec == 1) return 2;                       // 干净状态 + 重置
-        NSArray *ifs = self.envState[@"interfaces"];  // 接口 + 服务器开关 + (运行中显示地址)
-        NSInteger n = [ifs isKindOfClass:[NSArray class]] ? ifs.count : 0;
-        return n + 1 + ([self.envServer[@"running"] boolValue] ? 1 : 0);
+        // 分类端点各一行（Wi-Fi / 个人热点 / 蜂窝，没有的那一类不出现）+ 服务器开关一行
+        NSInteger n = [self envEndpointRows].count;
+        return (n ? n : 1) + 1;                       // 一个都没有 → 占 1 行「无可用网络」
     }
     return [self currentLogEntries].count ?: 1;
 }
@@ -379,34 +401,36 @@
             return c;
         }
 
-        // —— ③ 网络
-        NSArray *ifs = self.envState[@"interfaces"];
-        NSInteger n = [ifs isKindOfClass:[NSArray class]] ? ifs.count : 0;
+        // —— ③ 网络（分类端点：Wi-Fi / 个人热点 / 蜂窝，各给一个地址）
+        NSArray *eps = [self envEndpointRows];
+        NSInteger n = eps.count ? eps.count : 1;      // 一个都没有 → 1 行提示
         if (ip.row < n) {
-            NSDictionary *it = ifs[ip.row];
-            c.textLabel.text = [NSString stringWithFormat:@"%@ (%@)", it[@"if"] ?: @"?", it[@"family"] ?: @"?"];
+            if (!eps.count) {
+                c.textLabel.text = @"无可用网络（既没 Wi-Fi 也没蜂窝 / 热点）";
+                c.textLabel.textColor = SP_RED;
+                c.detailTextLabel.text = @"连上网或开热点后才能启动监听";
+                return c;
+            }
+            NSDictionary *e = eps[ip.row];
+            BOOL run = [self.envServer[@"running"] boolValue];
+            NSInteger p = [self.envServer[@"port"] integerValue] ?: 8899;
+            c.textLabel.text = [NSString stringWithFormat:@"%@ · %@ : %@", e[@"label"], e[@"if"], e[@"ip"]];
             c.textLabel.textColor = SP_TEXT;
-            c.detailTextLabel.text = it[@"ip"] ?: @"";
+            // 服务端绑 0.0.0.0，所以每个地址都真的能连（电脑在哪个网就用哪个）
+            c.detailTextLabel.text = run ? [NSString stringWithFormat:@"http://%@:%ld/ping", e[@"ip"], (long)p]
+                                         : @"（服务未启动）";
+            c.detailTextLabel.textColor = run ? SP_GREEN : SP_MUTED;
             return c;
         }
-        NSInteger r = ip.row - n;
-        if (r == 0) {
-            c.textLabel.text = @"自动运行服务器（电脑可连）";
-            c.textLabel.textColor = SP_TEXT;
-            c.detailTextLabel.text = nil;
-            UISwitch *sw = [[UISwitch alloc] init];
-            sw.on = [self.envServer[@"running"] boolValue];
-            [sw addTarget:self action:@selector(onEnvServer:) forControlEvents:UIControlEventValueChanged];
-            c.accessoryView = sw;
-            return c;
-        }
-        BOOL running = [self.envServer[@"running"] boolValue];
-        NSString *ipAddr = (self.envServer[@"lanIP"] && [self.envServer[@"lanIP"] length]) ? self.envServer[@"lanIP"] : (self.envState[@"ip"] ?: @"?");
-        NSInteger port = [self.envServer[@"port"] integerValue] ?: 8899;
-        c.textLabel.text = @"访问地址（电脑浏览器 / 脚本）";
-        c.textLabel.textColor = SP_TEXT;
-        c.detailTextLabel.text = running ? [NSString stringWithFormat:@"http://%@:%ld/ping", ipAddr, (long)port] : @"（服务未启动）";
-        c.detailTextLabel.textColor = running ? SP_GREEN : SP_MUTED;
+        // 服务器开关（没网时禁用）
+        c.textLabel.text = @"自动运行服务器（电脑可连）";
+        c.textLabel.textColor = eps.count ? SP_TEXT : SP_MUTED;
+        c.detailTextLabel.text = nil;
+        UISwitch *sw = [[UISwitch alloc] init];
+        sw.on = [self.envServer[@"running"] boolValue];
+        sw.enabled = (eps.count > 0);
+        [sw addTarget:self action:@selector(onEnvServer:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = sw;
         return c;
     }
 
