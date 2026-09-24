@@ -391,13 +391,14 @@
                 NSArray *rs = self.envState[@"reasons"];
                 c.detailTextLabel.text = (rs && rs.count)
                     ? [rs componentsJoinedByString:@"；"]
-                    : (clean ? @"无残留（共享字典 / 竞态批次 / 原子槽 / 服务端均空）" : nil);
+                    : (clean ? @"无残留（共享字典 / 竞态批次 / 原子槽 均空；监听中属正常工作态，不算污染）" : nil);
                 return c;
             }
-            c.textLabel.text = @"⤵ 重置环境（清共享字典 / 竞态 / 原子槽 / 停服务端）";
+            // ★ V2.4.15：重置**不停监听**（监听是工作台，停了会打断电脑端的活）
+            c.textLabel.text = @"⤵ 重置环境（清共享字典 / 竞态 / 原子槽 · 不停监听）";
             c.textLabel.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightSemibold];
             c.textLabel.textColor = SP_RED;
-            c.detailTextLabel.text = nil;
+            c.detailTextLabel.text = @"只清残留，Autorun 监听与电脑端连接保持不断";
             return c;
         }
 
@@ -525,7 +526,7 @@
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (tv == self.envTable && ip.section == 1 && ip.row == 1) {
-        RYResetEnvironment();
+        RYResetEnvironment(NO);      // ★ 默认保留监听
         [self reloadEnv];
     }
 }
