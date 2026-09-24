@@ -1694,7 +1694,8 @@ NSString *RYEnvironmentStateJSON(void) {
     for (int i = 0; i < 16; i++) if (atomic_load(&gRaceSlots[i]) != 0) slotNonZero++;
     NSString *srvStatus = RYAutorunStatus();
     BOOL serverRunning = (srvStatus && [srvStatus rangeOfString:@"\"running\":true"].location != NSNotFound);
-    BOOL clean = (sharedCount == 0 && batchUsed == 0 && slotNonZero == 0 && !serverRunning);
+    // ★ V2.4.15：clean 只看"残留"，不看服务端（服务端开着是正常工作态）
+    BOOL clean = (sharedCount == 0 && batchUsed == 0 && slotNonZero == 0);
     uid_t uid = getuid(), euid = geteuid();
     gid_t gid = getgid(), egid = getegid();
     pid_t pid = getpid();
@@ -1710,7 +1711,8 @@ NSString *RYEnvironmentStateJSON(void) {
     if (sharedCount)      [reasons addObject:[NSString stringWithFormat:@"共享字典有 %ld 项", (long)sharedCount]];
     if (batchUsed)       [reasons addObject:[NSString stringWithFormat:@"%ld 个竞态批次在用", (long)batchUsed]];
     if (slotNonZero)     [reasons addObject:[NSString stringWithFormat:@"%ld 个原子槽非零", (long)slotNonZero]];
-    if (serverRunning)   [reasons addObject:@"环境服务端仍在运行"];
+    // ★ V2.4.15：服务端运行中**不算污染**（它是工作台，不是残留）—— 旧实现把它算进 clean，
+    //   导致"只要开着监听就永远显示环境不干净"，还会诱导用户去重置、进而（旧版）把监听停掉。
 
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"clean"]          = @(clean);
@@ -1734,8 +1736,12 @@ NSString *RYEnvironmentStateJSON(void) {
     return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{\"clean\":false}";
 }
 
-// 重置环境：清共享字典、归零原子槽、回收竞态批次、停服务端 —— 避免重启 RyConsole
-NSString *RYResetEnvironment(void) {
+// 重置环境：清共享字典、归零原子槽、回收竞态批次 —— 避免重启 RyConsole。
+// ★ V2.4.15 设计修正：**默认不停服务端**（stopServer=NO）。
+//   监听进程是「工作台」：电脑端连着它干活；旧实现无条件 RYAutorunStop() 会一并掐断连接，
+//   等于每次重置都要重连、Autorun 面板要重新点启动 —— 与「半自动」的初衷相悖。
+//   真要停，显式传 YES（UI 的网络段开关、脚本 envReset(true) 都能停）。
+NSString *RYResetEnvironment(BOOL stopServer) {
     if (gSharedMap) [gSharedMap removeAllObjects];
     else gSharedMap = [NSMutableDictionary dictionary];
     for (int i = 0; i < 16; i++) atomic_store(&gRaceSlots[i], 0);
@@ -1758,13 +1764,24 @@ NSString *RYResetEnvironment(void) {
             recycled++;
         }
     }
-    NSString *srv = RYAutorunStop();
+    // 服务端：**默认保留**（只在显式要求时才停）
+    NSString *srv = @"";
+    id st = [NSJSONSerialization JSONObjectWithData:[(RYAutorunStatus() ?: @"") dataUsingEncoding:NSUTF8StringEncoding]
+                                            options:0 error:NULL];
+    BOOL wasRunning = [st isKindOfClass:[NSDictionary class]] && [st[@"running"] boolValue];
+    if (stopServer) srv = RYAutorunStop() ?: @"";
+
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"ok"] = @YES;
     d[@"recycledBatches"] = @(recycled);
     d[@"sharedMapCleared"] = @YES;
     d[@"slotsZeroed"] = @(16);
-    d[@"serverStop"] = srv ?: @"";
+    d[@"serverStopped"]     = @(stopServer ? YES : NO);   // 本次是否真停了
+    d[@"serverKeptRunning"] = @(stopServer ? NO : YES);   // 是否保留了监听
+    d[@"serverWasRunning"]  = @(wasRunning);
+    d[@"serverStop"] = srv;
+    if (!stopServer && wasRunning)
+        d[@"note"] = @"监听已保留（重置环境不再停服务端；要停请用网络段的开关或 envReset(true)）";
     NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
     return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{\"ok\":true}";
 }
@@ -1883,7 +1900,8 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
 
             // ---- V2.4.13 环境 / 网络原语 ----
             ctx[@"envState"]      = ^{ return RYEnvironmentStateJSON(); };
-            ctx[@"envReset"]      = ^{ return RYResetEnvironment(); };
+            // ★ V2.4.15：默认**不停服务端**（半自动工作流不该被重置打断）；要停就 envReset(true)
+            ctx[@"envReset"]      = ^(NSNumber *stopServer){ return RYResetEnvironment([stopServer boolValue]); };
             ctx[@"envIP"]         = ^{ return RYInterfaceIPsJSON(); };
             ctx[@"envNet"]        = ^{ return RYNetworkEndpointsJSON(); };
             ctx[@"envServerStart"]= ^NSString*(NSNumber *port){
