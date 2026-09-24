@@ -420,24 +420,30 @@ var c = dlsymAddr(0, 'getcwd');
 JSON.stringify(callPtr(c.addr, [{ buf: 1024 }]));  // value=缓冲地址, out.buf0=base64(工作目录)
 ```
 
-## 16. 环境与网络（V2.4.13 新增）★
+## 16. 环境与网络（V2.4.13 新增 / V2.4.14 改端点分类）★
 
-> 本节四个 C 函数实现在 `main.m`，声明在 `RYPermLog.h`，面板「权限与安全 → 环境」页是它们的可视化。
+> 本节 C 函数实现在 `main.m`，声明在 `RYPermLog.h`；面板「权限与安全 → 环境」页是它们的可视化。
 
 | 原语 | 签名 | 说明 |
 |---|---|---|
-| `envState` | `() → JSON` | 环境快照：`{clean, uid, euid, gid, egid, pid, groups[], groupCount, ip, interfaces[], serverRunning, sharedMapCount, batchUsed, batchActive, slotNonZero, reasons[]}`。`clean = 共享字典空 && 无竞态批次 && 原子槽全零 && 服务端未跑`；脏时 `reasons` 逐条给原因 |
+| `envState` | `() → JSON` | 环境快照：`{clean, uid, euid, gid, egid, pid, groups[], groupCount, ip, interfaces[], net, hasNetwork, serverRunning, sharedMapCount, batchUsed, batchActive, slotNonZero, reasons[]}`。`clean = 共享字典空 && 无竞态批次 && 原子槽全零 && 服务端未跑`；脏时 `reasons` 逐条给原因 |
 | `envReset` | `() → JSON` | **原地复位**：清 `gSharedMap`、16 个 `gRaceSlots` 归零、`gRaceStop` 归零、回收全部 `gBatches`（销毁闸 mutex/cond、清零 done/guarded/taken、置空 results）、调 `RYAutorunStop()`。返回 `{ok, recycledBatches, sharedMapCleared, slotsZeroed, serverStop}` |
-| `envIP` | `() → [{if, family, ip}]` | `getifaddrs` 枚举全部接口 IPv4/IPv6（`family` = `inet`/`inet6`） |
-| `envServerStart` | `(port) → JSON` | 起服务并回 `{ok, port, ip, url}`；`ip` 来自 `RYHotspotIP()` |
+| `envIP` | `() → [{if, family, ip, kind}]` | `getifaddrs` 枚举全部接口 IPv4/IPv6；`family` = `inet`/`inet6`，`kind` = `wifi`/`hotspot`/`cellular`/`vpn`/`other` |
+| **`envNet`** | `() → JSON` | ★ **分类端点**：`{wifi?, hotspot?, cellular?, hasAny, all[]}`，各类形如 `{if, kind, ip}`。**没有的那一类不出现**（没连 Wi-Fi 就无 `wifi` 键，没开蜂窝就无 `cellular` 键）；`hasAny:false` = 网都没有 |
+| `envServerStart` | `(port) → JSON` | 起服务并回 `{ok, port, ip, urls[]}`；`urls` **按类各一条** `{kind, if, ip, url}`。**`hasAny=false` 时直接返 `{ok:false, error:"无可用网络…"}` 且不启动监听** |
 | `envServerStop` | `() → string` | 停服务 |
-| `envServerStatus` | `() → JSON` | 同 `/ping`（`running`/`port`/`lanIP`…） |
+| `envServerStatus` | `() → JSON` | 同 `/ping`（`running`/`port`/`lanIP`/`endpoints`…） |
 
-**可达 IP 的选取优先级**（`RYHotspotIP()`，排除 `127.*`）：
-`bridge100`（个人热点）→ `pdp_ip0` / `ipsec0`（蜂窝）→ `en0` / `en1`（Wi-Fi）→ 其它非回环接口兜底。
+**主地址的选取优先级**（`RYReachableIP()`，原名 `RYHotspotIP()`；排除 `127.*`、`awdl*`、`lo*`）：
+`en0` / `en1`（Wi-Fi）→ `bridge100`（个人热点）→ `pdp_ip0` / `ipsec0`（蜂窝）→ 其它非回环接口兜底。
+
+> ⚠️ **V2.4.14 修正**：旧版把 `bridge100` 排最前 → **连着 Wi-Fi 时却报热点的 `172.20.10.1`**，
+> 而电脑在同网段 Wi-Fi 上根本连不到它。现在 **Wi-Fi 优先**，热点只在没有 Wi-Fi 时才当主地址。
+> 服务端 `bind("0.0.0.0")` 全接口可连，**各类地址其实同时可达** —— 主地址只是"最可能的那个"，
+> 完整列表用 `envNet()`（`/ping` 的 `endpoints` 字段同源）。
 
 > 热点场景：iPhone/iPad 个人热点的 `bridge100` 通常是 `172.20.10.1`，连上热点的电脑拿到 `172.20.10.2` 等。
-> 服务端本来就 `bind("0.0.0.0")`，**全接口可连**，移动数据环境无需额外配置 —— 只需要连对 IP。
+> 蜂窝的 `pdp_ip0` 常被运营商 NAT，电脑要连上一般得**连到设备的热点**，那时用 `hotspot.ip`。
 
 **配套（V2.4.12，此前未录入本节）**：
 
