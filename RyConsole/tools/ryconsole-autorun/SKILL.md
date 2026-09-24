@@ -12,7 +12,8 @@ description: >-
   ★ V2.4.14 起：移动数据 / 个人热点环境也能连（服务端本就绑 0.0.0.0，Wi-Fi 与热点/蜂窝**同时可达**）。
   用 envNet() 拿分类端点 {wifi?, hotspot?, cellular?, hasAny} —— 没有的那一类不出现；
   **主地址 Wi-Fi 优先**（已修"连着 Wi-Fi 却报热点 172.20.10.1"的 Bug）；网都没有时
-  envServerStart() 直接报错、不启动监听。环境被探针搞脏用 envReset() 原地复位，不必重启 RyConsole。
+  envServerStart() 直接报错、不启动监听。环境被探针搞脏用 envReset() 原地复位，不必重启 RyConsole
+  —— ★ V2.4.15 起 envReset() **默认不停监听**（只清残留），半自动工作流不会被重置打断；要停传 envReset(true)。
 agent_created: true
 ---
 
@@ -380,8 +381,8 @@ if (inst.ok) {
 
 | 原语 | 签名 | 说明 |
 |---|---|---|
-| **`envState()`** | `() → JSON` | **环境快照**：`{clean, uid, euid, gid, egid, pid, groups[], ip, interfaces[], serverRunning, sharedMapCount, batchUsed, batchActive, slotNonZero, reasons[]}`。`clean:true` = 无残留（共享字典空 / 无竞态批次 / 原子槽全零 / 服务端未跑）；脏的时候 `reasons` 逐条列出污染原因 |
-| **`envReset()`** | `() → JSON` | **原地复位环境**：清共享字典、16 个原子槽归零、回收全部竞态批次（销毁闸锁、清零 done/guarded/taken、置空 results）、停 Autorun 服务 → `{ok:true, recycledBatches, …}`。**环境被探针搞脏时先跑它，不要重启 App** |
+| **`envState()`** | `() → JSON` | **环境快照**：`{clean, uid, euid, gid, egid, pid, groups[], ip, interfaces[], net, hasNetwork, serverRunning, sharedMapCount, batchUsed, batchActive, slotNonZero, reasons[]}`。`clean:true` = 无残留（共享字典空 / 无竞态批次 / 原子槽全零）。★ **V2.4.15 起「服务端运行中」不算污染**（它是工作台不是残留——旧版把它算进 clean，导致开着监听就永远显示不干净）；脏的时候 `reasons` 逐条列出污染原因 |
+| **`envReset(stopServer?)`** | `([bool]) → JSON` | **原地复位环境**：清共享字典、16 个原子槽归零、回收全部竞态批次（销毁闸锁、清零 done/guarded/taken、置空 results）。★ **V2.4.15 起默认不停服务端** —— 监听是工作台，重置只清残留，**电脑端连接不断**；要停就 `envReset(true)`（或用环境页网络段的开关）。返回 `{ok, recycledBatches, sharedMapCleared, slotsZeroed, serverStopped, serverKeptRunning, serverWasRunning, note?}`。**环境被探针搞脏时先跑它，不要重启 App** |
 | **`envIP()`** | `() → [{if, family, ip, kind}]` | 枚举**全部**接口 IP（IPv4/IPv6），每项带 `kind` 归类（wifi/hotspot/cellular/vpn/other） |
 | **`envNet()`** | `() → JSON` | ★ **分类端点**：`{wifi?, hotspot?, cellular?, hasAny, all[]}`。**没有的那一类不出现** —— 没连 Wi-Fi 就没有 `wifi` 键，没开蜂窝就没有 `cellular` 键；`hasAny:false` = 网都没有 |
 | **`envServerStart(port)`** | `(port) → JSON` | 起服务并回 `{ok, port, ip, urls[]}`；`urls` **按类各给一条** `{kind, if, ip, url}`。**`hasAny=false`（无网络）时直接返 `{ok:false, error:"无可用网络…"}`，不启动监听**；`ip` 是主地址，Wi-Fi 优先 |
@@ -407,8 +408,18 @@ print(JSON.stringify(envNet()));
 > 也报 `172.20.10.1`**，而电脑在同网段 Wi-Fi 上根本连不到它。现在主地址 **Wi-Fi 优先**
 > （`en0/en1 → bridge100 → pdp_ip0/ipsec0`），热点只在没有 Wi-Fi 时才被选为主地址。
 
-**★ 环境脏了不要重启 App**：竞态批次没回收、共享字典涨了、原子槽非零、服务端还挂着 ——
+**★ 环境脏了不要重启 App**：竞态批次没回收、共享字典涨了、原子槽非零 ——
 这些以前只能杀进程重开。现在 `envReset()` 原地复位。
+
+> ⚠️ **V2.4.15 设计修正（半自动友好）**：`envReset()` **默认不停服务端**。
+> 旧实现无条件 `RYAutorunStop()`，会把电脑端连着的监听一起掐断 —— 每次重置都要重连、
+> 面板要重新点启动，工作流被反复打断。现在**监听是工作台、重置只是扫垃圾**，二者解耦：
+> ```js
+> envReset()        // 只清残留，监听与电脑端连接保持不断 ★ 默认
+> envReset(true)    // 连监听一起停（真要停时才用）
+> ```
+> 同理，`envState().clean` **不再把"服务端运行中"算作污染** —— 否则"开着监听就永远不干净"，
+> 还会诱导你去重置。判断环境要不要清，只看 `reasons`（共享字典 / 竞态批次 / 原子槽）。
 
 ### 文件（相对路径基于 Documents；`/` 开头为绝对路径）🟡
 | 原语 | 说明 |
