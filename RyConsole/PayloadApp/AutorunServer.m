@@ -15,6 +15,7 @@
 #import "KeepAlive.h"
 #import "LiveActivityBridge.h"
 #import "RyExec.h"          // 崩溃兜底状态（RYGuard*）—— /ping 里要报出来
+#import "RYPermLog.h"       // V2.4.14：/ping 带分类网络端点（RYNetworkEndpointsJSON）
 
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -79,12 +80,15 @@ static NSString *ryStamp(void) {
     return [f stringFromDate:[NSDate date]];
 }
 
-// 取本机可达 IPv4：优先个人热点 bridge100 / 蜂窝 pdp_ip0·ipsec0 / Wi-Fi en0·en1
+// 取本机可达 IPv4：Wi-Fi en0·en1 优先 → 个人热点 bridge100 → 蜂窝 pdp_ip0·ipsec0
+// ★ V2.4.14 修正排序：早期把 bridge100 排第一，用户连着 Wi-Fi 时却报出 172.20.10.1
+//   （电脑在同网段 Wi-Fi 上根本连不到热点的地址）。服务端绑 0.0.0.0，两个网其实同时可达，
+//   这里只挑"最可能的那个"作主地址；完整分类端点见 RYNetworkEndpointsJSON() / /ping 的 endpoints。
 static NSString *ryLANAddress(void) {
     NSString *found = nil, *fallback = nil;
     struct ifaddrs *addrs = NULL;
     if (getifaddrs(&addrs) != 0 || addrs == NULL) return @"?";
-    NSArray *pri = @[@"bridge100", @"pdp_ip0", @"ipsec0", @"en0", @"en1"];
+    NSArray *pri = @[@"en0", @"en1", @"bridge100", @"pdp_ip0", @"ipsec0"];
     for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
         if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET) continue;
         NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
@@ -649,6 +653,11 @@ static void rySendAll(int fd, NSData *data) {
     //   session     = 本进程会话前缀（job id 前缀；重启后会变，可据此判断服务是否重启过）
     //   pid         = 进程号（判断是否发生过崩溃重启）
     NSString *head120 = self.lastCode.length > 120 ? [self.lastCode substringToIndex:120] : (self.lastCode ?: @"");
+    // V2.4.14：分类网络端点（wifi / hotspot / cellular 各一个，没有的那一类不出现）
+    //   → 电脑端不用猜该连哪个：Wi-Fi 与热点/蜂窝因服务端绑 0.0.0.0 而**同时可达**。
+    id epObj = [NSJSONSerialization JSONObjectWithData:[RYNetworkEndpointsJSON() dataUsingEncoding:NSUTF8StringEncoding]
+                                               options:0 error:NULL];
+    NSDictionary *eps = [epObj isKindOfClass:[NSDictionary class]] ? epObj : @{};
     NSDictionary *d = @{
         @"ok": @YES,
         @"name": @"RyConsole-Autorun",
@@ -659,6 +668,7 @@ static void rySendAll(int fd, NSData *data) {
         @"running": @(self.running),
         @"port": @(self.port),
         @"lanIP": ryLANAddress(),
+        @"endpoints": eps,          // V2.4.14：{wifi?, hotspot?, cellular?, hasAny, all[]}
         @"busy": @(self.busy),
         @"jobs": @(self.jobs.count),
         @"hits": @(self.liveHits),
