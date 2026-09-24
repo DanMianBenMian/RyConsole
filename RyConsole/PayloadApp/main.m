@@ -1590,7 +1590,18 @@ static NSString *httpRequestNative(NSDictionary *opts) {
 //  —— 这些函数引用本文件顶部的环境质量全局（gSharedMap / gBatches / gRaceSlots / gRaceStop）。
 // ============================================================
 
-// 枚举所有网络接口 IP（IPv4/IPv6），用于热点/局域网可达性展示
+// 接口归类：Wi-Fi / 个人热点 / 蜂窝移动数据 / 其它
+static NSString *RYIfKind(NSString *n) {
+    if ([n hasPrefix:@"en"])      return @"wifi";      // en0/en1：Wi-Fi（有线以太网同理）
+    if ([n hasPrefix:@"bridge"])  return @"hotspot";   // bridge100：个人热点（服务于连上热点的电脑）
+    if ([n hasPrefix:@"pdp_ip"] || [n hasPrefix:@"ipsec"]) return @"cellular"; // 蜂窝数据
+    if ([n hasPrefix:@"awdl"])    return @"awdl";      // Apple Wireless Direct Link（隔空投送等，不算上网通道）
+    if ([n hasPrefix:@"lo"])      return @"loopback";
+    if ([n hasPrefix:@"utun"])    return @"vpn";
+    return @"other";
+}
+
+// 枚举所有网络接口 IP（IPv4/IPv6），顺带给出 kind 归类
 NSString *RYInterfaceIPsJSON(void) {
     struct ifaddrs *addrs = NULL;
     if (getifaddrs(&addrs) != 0 || addrs == NULL) return @"[]";
@@ -1607,6 +1618,7 @@ NSString *RYInterfaceIPsJSON(void) {
         if (inet_ntop(fam, addr, buf, sizeof(buf)) == NULL) continue;
         [list addObject:@{@"if": name,
                           @"family": fam == AF_INET ? @"inet" : @"inet6",
+                          @"kind": RYIfKind(name),
                           @"ip": [NSString stringWithUTF8String:buf]}];
     }
     freeifaddrs(addrs);
@@ -1614,15 +1626,48 @@ NSString *RYInterfaceIPsJSON(void) {
     return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"[]";
 }
 
-// 取一个「对连热点/局域网的电脑可达」的 IP：优先个人热点 bridge100 / 蜂窝 pdp_ip0/ipsec0 / Wi-Fi en0/en1，排除回环
-NSString *RYHotspotIP(void) {
+// ★ 分类端点（V2.4.14）：Wi-Fi / 个人热点 / 蜂窝，各自只取 IPv4。
+//   「没有的那一类就不出现」——没连 Wi-Fi 就没有 wifi 键，没开蜂窝就没有 cellular 键。
+//   hasAny=false = 网都没有 → 服务端无法给出可达地址，启动监听应直接报错。
+NSString *RYNetworkEndpointsJSON(void) {
+    struct ifaddrs *addrs = NULL;
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    NSMutableArray *all = [NSMutableArray array];
+    if (getifaddrs(&addrs) == 0 && addrs) {
+        for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
+            if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET) continue;
+            char buf[INET_ADDRSTRLEN] = {0};
+            if (inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, buf, sizeof(buf)) == NULL) continue;
+            NSString *ip = [NSString stringWithUTF8String:buf];
+            if ([ip hasPrefix:@"127."]) continue;
+            NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
+            NSString *kind = RYIfKind(name);
+            if ([kind isEqualToString:@"awdl"] || [kind isEqualToString:@"loopback"]) continue;
+            NSDictionary *e = @{@"if": name, @"kind": kind, @"ip": ip};
+            [all addObject:e];
+            if (!d[kind]) d[kind] = e;      // 同类取第一个（en0 优先于 en1）
+        }
+        freeifaddrs(addrs);
+    }
+    d[@"hasAny"] = @(all.count > 0);
+    d[@"all"] = all;
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
+    return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{\"hasAny\":false}";
+}
+
+// 「最可能对电脑可达」的那个 IP：Wi-Fi 优先 → 个人热点 → 蜂窝 → 其它非回环接口。
+// ★ 排序修过（V2.4.14）：早期把 bridge100(热点) 排第一，用户在 Wi-Fi 下会拿到 172.20.10.1，
+//   而电脑在同网段 Wi-Fi 上根本连不到这个地址。现在 Wi-Fi 优先，热点只在没有 Wi-Fi 时才被选中。
+NSString *RYReachableIP(void) {
     struct ifaddrs *addrs = NULL;
     if (getifaddrs(&addrs) != 0 || addrs == NULL) return @"?";
-    NSArray *pri = @[@"bridge100", @"pdp_ip0", @"ipsec0", @"en0", @"en1"];
+    NSArray *pri = @[@"en0", @"en1", @"bridge100", @"pdp_ip0", @"ipsec0"];
     NSString *fallback = nil;
     for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
         if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET) continue;
         NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
+        NSString *kind = RYIfKind(name);
+        if ([kind isEqualToString:@"awdl"] || [kind isEqualToString:@"loopback"]) continue;
         char buf[INET_ADDRSTRLEN] = {0};
         if (inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, buf, sizeof(buf)) == NULL) continue;
         NSString *ip = [NSString stringWithUTF8String:buf];
@@ -1677,8 +1722,13 @@ NSString *RYEnvironmentStateJSON(void) {
     d[@"batchActive"]   = @(batchActive);
     d[@"slotNonZero"]   = @(slotNonZero);
     d[@"serverRunning"] = @(serverRunning);
-    d[@"ip"]            = RYHotspotIP();
+    d[@"ip"]            = RYReachableIP();
     d[@"interfaces"]    = (ifs && [ifs isKindOfClass:[NSArray class]]) ? ifs : @[];
+    NSString *nej = RYNetworkEndpointsJSON();
+    id ne = [NSJSONSerialization JSONObjectWithData:[nej dataUsingEncoding:NSUTF8StringEncoding]
+                                            options:0 error:NULL];
+    d[@"net"]           = ([ne isKindOfClass:[NSDictionary class]]) ? ne : @{};
+    d[@"hasNetwork"]    = @([d[@"net"][@"hasAny"] boolValue]);
     d[@"reasons"]       = reasons;
     NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
     return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{\"clean\":false}";
@@ -1835,12 +1885,29 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"envState"]      = ^{ return RYEnvironmentStateJSON(); };
             ctx[@"envReset"]      = ^{ return RYResetEnvironment(); };
             ctx[@"envIP"]         = ^{ return RYInterfaceIPsJSON(); };
-            ctx[@"envServerStart"]= ^(NSNumber *port){
+            ctx[@"envNet"]        = ^{ return RYNetworkEndpointsJSON(); };
+            ctx[@"envServerStart"]= ^NSString*(NSNumber *port){
                 int p = [port intValue]; if (p < 1 || p > 65535) p = 8899;
+                // ★ 网都没有 → 不启动，直接报错（用户要求：无网络直接无法监听并报错）
+                NSString *nej = RYNetworkEndpointsJSON();
+                NSDictionary *net = [NSJSONSerialization JSONObjectWithData:[nej dataUsingEncoding:NSUTF8StringEncoding]
+                                                                    options:0 error:NULL];
+                if (![net isKindOfClass:[NSDictionary class]] || ![net[@"hasAny"] boolValue]) {
+                    return @"{\"ok\":false,\"error\":\"无可用网络：既没连 Wi-Fi 也没开蜂窝/热点，无法对外提供可达地址（监听已取消）\",\"urls\":[]}";
+                }
                 RYAutorunStart(p, nil, nil);
-                NSString *ip = RYHotspotIP();
-                return [NSString stringWithFormat:
-                    @"{\"ok\":true,\"port\":%d,\"ip\":\"%@\",\"url\":\"http://%@:%d/ping\"}", p, ip, ip, p];
+                NSMutableArray *urls = [NSMutableArray array];
+                NSArray *all = net[@"all"];
+                if ([all isKindOfClass:[NSArray class]]) {
+                    for (NSDictionary *e in all) {
+                        NSString *ip = e[@"ip"]; if (!ip) continue;
+                        [urls addObject:[NSString stringWithFormat:
+                            @"{\"kind\":\"%@\",\"if\":\"%@\",\"ip\":\"%@\",\"url\":\"http://%@:%d/ping\"}",
+                            e[@"kind"] ?: @"other", e[@"if"] ?: @"?", ip, ip, p]];
+                    }
+                }
+                return [NSString stringWithFormat:@"{\"ok\":true,\"port\":%d,\"ip\":\"%@\",\"urls\":[%@]}",
+                        p, RYReachableIP(), [urls componentsJoinedByString:@","]];
             };
             ctx[@"envServerStop"] = ^{ return RYAutorunStop(); };
             ctx[@"envServerStatus"]=^{ return RYAutorunStatus(); };
