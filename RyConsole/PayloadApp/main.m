@@ -1662,21 +1662,39 @@ NSString *RYReachableIP(void) {
     struct ifaddrs *addrs = NULL;
     if (getifaddrs(&addrs) != 0 || addrs == NULL) return @"?";
     NSArray *pri = @[@"en0", @"en1", @"bridge100", @"pdp_ip0", @"ipsec0"];
-    NSString *fallback = nil;
-    for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
-        if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET) continue;
-        NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
-        NSString *kind = RYIfKind(name);
-        if ([kind isEqualToString:@"awdl"] || [kind isEqualToString:@"loopback"]) continue;
-        char buf[INET_ADDRSTRLEN] = {0};
-        if (inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, buf, sizeof(buf)) == NULL) continue;
-        NSString *ip = [NSString stringWithUTF8String:buf];
-        if ([ip hasPrefix:@"127."]) continue;
-        if ([pri containsObject:name]) { freeifaddrs(addrs); return ip; }
-        if (!fallback) fallback = ip;
+    NSString *found = nil, *fallback = nil;
+    // ★ 必须**按 pri 顺序逐个接口名查找**，不能一遍扫过去看"谁在 pri 里"——
+    //   getifaddrs 的枚举顺序不保证，旧实现实际是"枚举里先出现哪个就用哪个"，
+    //   于是 bridge100 排在 en0 前面时就会选中热点，pri 数组写了等于没写（V2.4.16 修正）。
+    for (NSString *want in pri) {
+        for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
+            if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET) continue;
+            NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
+            if (![name isEqualToString:want]) continue;
+            char buf[INET_ADDRSTRLEN] = {0};
+            if (inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, buf, sizeof(buf)) == NULL) continue;
+            NSString *ip = [NSString stringWithUTF8String:buf];
+            if ([ip hasPrefix:@"127."]) continue;
+            found = ip;
+            break;
+        }
+        if (found) break;
+    }
+    if (!found) {
+        for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
+            if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET) continue;
+            NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
+            NSString *kind = RYIfKind(name);
+            if ([kind isEqualToString:@"awdl"] || [kind isEqualToString:@"loopback"]) continue;
+            char buf[INET_ADDRSTRLEN] = {0};
+            if (inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, buf, sizeof(buf)) == NULL) continue;
+            NSString *ip = [NSString stringWithUTF8String:buf];
+            if ([ip hasPrefix:@"127."]) continue;
+            if (!fallback) fallback = ip;
+        }
     }
     freeifaddrs(addrs);
-    return fallback ? fallback : @"?";
+    return found ?: (fallback ?: @"?");
 }
 
 // 环境状态快照：身份 + 干净与否（干净 = 无环境污染状态残留）
