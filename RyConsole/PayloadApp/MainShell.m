@@ -10,10 +10,25 @@
 #import "MainShell.h"
 #import "RySecurityPane.h"
 #import "AutorunServer.h"
+#import "RYPermLog.h"        // V2.4.17：复制地址弹窗要用分类端点 RYNetworkEndpointsJSON
 #import "RyExec.h"
 #import "RyShellBridge.h"
 #import <stdlib.h>
 #import <math.h>
+
+// 取当前可 present 的顶层 VC（文件级，供各个 Pane 共用）
+static UIViewController *RYTopVCForPresent(void) {
+    UIWindow *key = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)s;
+        for (UIWindow *w in ws.windows) { if (w.isKeyWindow) { key = w; break; } }
+        if (key) break;
+    }
+    UIViewController *vc = key.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
 
 #pragma mark - 配色（GitHub dark 风格）
 
@@ -240,6 +255,7 @@ static void ryScrollToBottom(UITextView *tv) {
 @property (nonatomic, strong) UITextView *outView;
 @property (nonatomic, strong) UIButton *toggleBtn;
 - (void)refresh;
+- (void)copyPicked:(NSDictionary *)item;   // V2.4.17：弹窗选中后落到剪贴板
 @end
 
 @implementation RYAutorunPane
@@ -287,7 +303,8 @@ static void ryScrollToBottom(UITextView *tv) {
         clr.tag = 9111;
         [self addSubview:clr];
 
-        UIButton *copy = ryButton(@"复制 IP", self, @selector(onCopyIP));
+        // V2.4.17：文案改「复制地址」（复制的是 http://… 且现在可选哪一条）
+        UIButton *copy = ryButton(@"复制地址", self, @selector(onCopyIP));
         copy.tag = 9112;
         [self addSubview:copy];
 
@@ -481,6 +498,8 @@ static void ryScrollToBottom(UITextView *tv) {
     [self refresh];
 }
 
+// V2.4.17：弹窗让你选要复制哪条地址（Wi-Fi / 个人热点 / 蜂窝各一条，电脑在哪个网就选哪条）。
+//   旧版只复制主地址一个，电脑若连的是热点就会复制到对不上的那条。
 - (void)onCopyIP {
     NSDictionary *sd = nil;
     id o = [NSJSONSerialization JSONObjectWithData:[RYAutorunStatus() dataUsingEncoding:NSUTF8StringEncoding]
@@ -494,9 +513,60 @@ static void ryScrollToBottom(UITextView *tv) {
     }
     NSInteger port = [sd[@"port"] integerValue];
     if (port <= 0) port = 8899;
-    NSString *url = [NSString stringWithFormat:@"http://%@:%d", sd[@"lanIP"] ?: @"?", (int)port];
+
+    // 分类端点（wifi / hotspot / cellular，没有的那一类不出现）
+    id ne = [NSJSONSerialization JSONObjectWithData:[RYNetworkEndpointsJSON() dataUsingEncoding:NSUTF8StringEncoding]
+                                           options:0 error:NULL];
+    NSDictionary *net = [ne isKindOfClass:[NSDictionary class]] ? (NSDictionary *)ne : @{};
+    NSArray *order = @[@"wifi", @"hotspot", @"cellular"];
+    NSMutableArray *items = [NSMutableArray array];   // @{@"label":…, @"url":…}
+    for (NSString *k in order) {
+        NSDictionary *e = net[k];
+        if (![e isKindOfClass:[NSDictionary class]]) continue;
+        NSString *label = [k isEqualToString:@"wifi"]    ? @"Wi-Fi"
+                        : [k isEqualToString:@"hotspot"] ? @"个人热点"
+                        : @"蜂窝移动数据";
+        [items addObject:@{@"label": label,
+                           @"url": [NSString stringWithFormat:@"http://%@:%d", e[@"ip"], (int)port]}];
+    }
+    // 兜底：分类端点拿不到时仍给主地址
+    if (!items.count) {
+        [items addObject:@{@"label": @"主地址",
+                           @"url": [NSString stringWithFormat:@"http://%@:%d", sd[@"lanIP"] ?: @"?", (int)port]}];
+    }
+    // 只有一条 → 不用弹，直接复制（少点一步）
+    if (items.count == 1) { [self copyPicked:items[0]]; return; }
+
+    UIViewController *top = RYTopVCForPresent();
+    if (!top) { [self copyPicked:items[0]]; return; }   // 取不到 VC 就退回复制主地址
+
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"复制哪个地址？"
+                                                               message:@"电脑在哪个网，就选哪一条"
+                                                        preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSDictionary *it in items) {
+        UIAlertAction *a = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@  %@", it[@"label"], it[@"url"]]
+                                                    style:UIAlertActionStyleDefault
+                                                  handler:^(UIAlertAction *_) { [self copyPicked:it]; }];
+        [ac addAction:a];
+    }
+    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+    [ac addAction:cancel];
+
+    // iPad 必须给 popover 锚点，否则直接崩
+    UIPopoverPresentationController *pop = ac.popoverPresentationController;
+    if (pop) {
+        UIView *anchor = [self viewWithTag:9112];       // 「复制地址」按钮
+        pop.sourceView = anchor ?: self;
+        pop.sourceRect = anchor ? anchor.bounds : self.bounds;
+        pop.permittedArrowDirections = UIPopoverArrowDirectionAny;
+    }
+    [top presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)copyPicked:(NSDictionary *)item {
+    NSString *url = item[@"url"] ?: @"";
     [UIPasteboard generalPasteboard].string = url;
-    self.ipLabel.text = [@"已复制 " stringByAppendingString:url];
+    self.ipLabel.text = [NSString stringWithFormat:@"已复制 %@：%@", item[@"label"] ?: @"地址", url];
     self.ipLabel.textColor = RY_GREEN;
 }
 
