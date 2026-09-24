@@ -89,19 +89,59 @@ static NSString *ryLANAddress(void) {
     struct ifaddrs *addrs = NULL;
     if (getifaddrs(&addrs) != 0 || addrs == NULL) return @"?";
     NSArray *pri = @[@"en0", @"en1", @"bridge100", @"pdp_ip0", @"ipsec0"];
-    for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
-        if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET) continue;
-        NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
-        char buf[INET_ADDRSTRLEN] = {0};
-        struct sockaddr_in *sin = (struct sockaddr_in *)p->ifa_addr;
-        if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) == NULL) continue;
-        NSString *ip = [NSString stringWithUTF8String:buf];
-        if ([ip hasPrefix:@"127."]) continue;
-        if ([pri containsObject:name]) { found = ip; break; }
-        if (!fallback) fallback = ip;
+    // ★ 按 pri 顺序逐个接口名查找（不是"扫一遍看谁在 pri 里"——枚举顺序不保证，
+    //   旧实现因此实际返回枚举里先出现的那个，bridge100 在 en0 前就会选中热点。V2.4.16 修正）
+    for (NSString *want in pri) {
+        for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
+            if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET) continue;
+            NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
+            if (![name isEqualToString:want]) continue;
+            char buf[INET_ADDRSTRLEN] = {0};
+            struct sockaddr_in *sin = (struct sockaddr_in *)p->ifa_addr;
+            if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) == NULL) continue;
+            NSString *ip = [NSString stringWithUTF8String:buf];
+            if ([ip hasPrefix:@"127."]) continue;
+            found = ip;
+            break;
+        }
+        if (found) break;
+    }
+    if (!found) {
+        for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
+            if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET) continue;
+            NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
+            if ([name hasPrefix:@"awdl"] || [name hasPrefix:@"lo"]) continue;
+            char buf[INET_ADDRSTRLEN] = {0};
+            struct sockaddr_in *sin = (struct sockaddr_in *)p->ifa_addr;
+            if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) == NULL) continue;
+            NSString *ip = [NSString stringWithUTF8String:buf];
+            if ([ip hasPrefix:@"127."]) continue;
+            if (!fallback) fallback = ip;
+        }
     }
     freeifaddrs(addrs);
-    return found ? found : (fallback ? fallback : @"?");
+    return found ?: (fallback ?: @"?");
+}
+
+// 面板用：把「电脑端可连的地址」按类逐行列出来（Wi-Fi / 个人热点 / 蜂窝各一条）。
+// ★ V2.4.16：旧面板只给一个 ryLANAddress()，用户拿不到热点那条，也看不出为什么选了这个。
+static NSString *ryEndpointLines(int port) {
+    NSString *one = [NSString stringWithFormat:@"http://%@:%d/ping", ryLANAddress(), port];
+    id o = [NSJSONSerialization JSONObjectWithData:[RYNetworkEndpointsJSON() dataUsingEncoding:NSUTF8StringEncoding]
+                                           options:0 error:NULL];
+    if (![o isKindOfClass:[NSDictionary class]]) return one;
+    NSDictionary *net = (NSDictionary *)o;
+    NSArray *order = @[@"wifi", @"hotspot", @"cellular"];
+    NSMutableArray *lines = [NSMutableArray array];
+    for (NSString *k in order) {
+        id e = net[k];
+        if (![e isKindOfClass:[NSDictionary class]]) continue;
+        NSString *label = [k isEqualToString:@"wifi"]    ? @"Wi-Fi"
+                        : [k isEqualToString:@"hotspot"] ? @"个人热点"
+                        : @"蜂窝";
+        [lines addObject:[NSString stringWithFormat:@"%@  http://%@:%d/ping", label, e[@"ip"], port]];
+    }
+    return lines.count ? [lines componentsJoinedByString:@"\n"] : one;
 }
 
 static UIViewController *ryTopVC(void) {
@@ -282,8 +322,8 @@ static void rySendAll(int fd, NSData *data) {
         [self logLine:@"实时活动不可用（系统设置里未允许 RyConsole 使用实时活动）"];
     }
 
-    [self logLine:[NSString stringWithFormat:@"Autorun 已启动 · 端口 %d · 本机 %@，电脑端连 http://%@:%d/ping",
-                   port, ryLANAddress(), ryLANAddress(), port]];
+    [self logLine:[NSString stringWithFormat:@"Autorun 已启动 · 端口 %d · 主地址 %@", port, ryLANAddress()]];
+    [self logLine:[NSString stringWithFormat:@"电脑端可连：\n%@", ryEndpointLines(port)]];
     [self logLine:[[RYKeepAlive shared] statusLine]];
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -732,8 +772,9 @@ static void rySendAll(int fd, NSData *data) {
     [self.toggleBtn addTarget:self action:@selector(onToggle) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.toggleBtn];
 
-    self.hintLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 140, self.view.bounds.size.width - 32, 40)];
-    self.hintLabel.numberOfLines = 2;
+    // V2.4.16：最多 4 行（状态 1 行 + Wi-Fi/热点/蜂窝 各 1 行），不再只显示一个 IP
+    self.hintLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 140, self.view.bounds.size.width - 32, 76)];
+    self.hintLabel.numberOfLines = 4;
     self.hintLabel.font = [UIFont systemFontOfSize:12];
     self.hintLabel.textColor = [UIColor secondaryLabelColor];
     [self.view addSubview:self.hintLabel];
@@ -755,8 +796,8 @@ static void rySendAll(int fd, NSData *data) {
     [super viewDidLayoutSubviews];
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
-    self.hintLabel.frame = CGRectMake(16, 140, w - 32, 40);
-    self.logView.frame = CGRectMake(16, 188, w - 32, h - 188 - 24);
+    self.hintLabel.frame = CGRectMake(16, 140, w - 32, 76);
+    self.logView.frame = CGRectMake(16, 224, w - 32, h - 224 - 24);
     if (self.logView.text.length > 0) {
         NSRange bottom = NSMakeRange(self.logView.text.length - 1, 1);
         [self.logView scrollRangeToVisible:bottom];
@@ -775,10 +816,11 @@ static void rySendAll(int fd, NSData *data) {
 - (void)refreshUI {
     RYAutorunServer *s = [RYAutorunServer shared];
     [self.toggleBtn setTitle:(s.running ? @"停止" : @"启动") forState:UIControlStateNormal];
+    int port = s.running ? s.port : RY_DEFAULT_PORT;
     self.hintLabel.text = [NSString stringWithFormat:
-        @"%@\n电脑端连：http://%@:%d/ping",
+        @"%@\n%@",
         s.running ? @"● 正在监听 · 后台保活已开（可切后台/锁屏）" : @"○ 未启动",
-        ryLANAddress(), s.running ? s.port : RY_DEFAULT_PORT];
+        ryEndpointLines(port)];   // ★ V2.4.16：按类列出所有可连地址（不再只给一个）
 }
 
 - (void)onToggle {
