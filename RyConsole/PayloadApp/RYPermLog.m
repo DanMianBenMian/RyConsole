@@ -388,26 +388,46 @@ static atomic_int gScopeMode = 0;
 }
 
 #pragma mark - 权限诊断
-+ (NSArray<NSDictionary *> *)diagnosticSpecs {
++ (NSDictionary<NSString *, NSString *> *)entitlementDescriptions {
+    return @{
+        @"get-task-allow":                 @"允许调试器附加（未签名/自签通常有）",
+        @"task_for_pid-allow":             @"拿其他进程 task port（实验版才有）",
+        @"com.apple.system-task-ports":     @"系统进程 task port（私有，极易被 AMFI 拒）",
+        @"com.apple.private.mobilehousearrest": @"House Arrest 跨容器（3105 分析判死，仅供实测）",
+        @"com.apple.private.containermanager":  @"容器管理私有权限",
+        @"com.apple.security.exception.mach-lookup.global-name": @"沙盒例外：允许向指定系统 Mach 服务发起 look_up",
+        @"com.apple.security.exception.files.absolute-path.read-only": @"沙盒例外：允许读指定绝对路径",
+        @"application-identifier":          @"App 唯一标识（沙盒容器归属）",
+        @"keychain-access-groups":          @"钥匙串访问组（跨 App 共享钥匙串）",
+        @"com.apple.security.application-groups": @"App Group（共享容器 / 扩展通信）",
+        @"com.apple.developer.default-data-protection": @"文件数据保护等级",
+        @"com.apple.security.cs.allow-jit":       @"允许 JIT（运行时代码生成）",
+        @"com.apple.security.cs.allow-unsigned-executable-memory": @"允许执行未签名内存页",
+        @"com.apple.security.cs.disable-library-validation": @"关闭库签名校验（可加载未签名 dylib）",
+        @"com.apple.security.cs.debugger":        @"允许自身被调试",
+        @"platform-application":            @"平台 App（系统级，不受普通沙盒约束）",
+        @"com.apple.private.security.no-sandbox": @"关闭沙盒（完全不受限）",
+        @"com.apple.security.iokit-user-client-class": @"允许打开指定 IOKit UserClient",
+        @"com.apple.mobileinstallation.allowedSPI": @"允许调用受限 MobileInstallation SPI",
+    };
+}
+
++ (NSArray<NSDictionary *> *)capabilitySpecs {
     return @[
-      // ---- Entitlement（V2.4.10：SecTask 签名层实测为主，内嵌段对比 + 功能探针辅助）----
-      @{@"key": @"ent:get-task-allow",                       @"group": @"Entitlement", @"title": @"get-task-allow",                   @"desc": @"允许调试器附加（未签名/自签通常有）"},
-      @{@"key": @"ent:task_for_pid-allow",                   @"group": @"Entitlement", @"title": @"task_for_pid-allow",               @"desc": @"拿其他进程 task port（实验版才有）"},
-      @{@"key": @"ent:com.apple.system-task-ports",          @"group": @"Entitlement", @"title": @"com.apple.system-task-ports",      @"desc": @"系统进程 task port（私有，极易被 AMFI 拒）"},
-      @{@"key": @"ent:com.apple.private.mobilehousearrest",  @"group": @"Entitlement", @"title": @"mobilehousearrest",                @"desc": @"House Arrest 跨容器（3105 分析判死，仅供实测）"},
-      @{@"key": @"ent:com.apple.private.containermanager",   @"group": @"Entitlement", @"title": @"containermanager",                 @"desc": @"容器管理私有权限"},
-      // ---- 能力实测 ----
-      @{@"key": @"cap:sandbox_mach",      @"group": @"能力", @"title": @"sandbox_check(mach-lookup)",  @"desc": @"Mach 服务查询是否被沙盒允许"},
-      @{@"key": @"cap:sandbox_file",      @"group": @"能力", @"title": @"sandbox_check(file-read*)",   @"desc": @"文件读取类操作（默认自身沙盒内可读）"},
-      @{@"key": @"cap:iokit",             @"group": @"能力", @"title": @"IOKit 打开 IOSurfaceRoot",    @"desc": @"V3 的入口：能否拿到 UserClient"},
-      @{@"key": @"cap:mach",              @"group": @"能力", @"title": @"machLookUp(com.apple.*)",     @"desc": @"能否看到系统 Mach 服务"},
-      @{@"key": @"cap:dyld",              @"group": @"能力", @"title": @"dlopen 私有框架",              @"desc": @"能否加载 PrivateFrameworks"},
-      @{@"key": @"cap:spawn",             @"group": @"能力", @"title": @"posixSpawn /bin/true",        @"desc": @"能否 fork/exec 子进程"},
-      @{@"key": @"cap:keychain",          @"group": @"能力", @"title": @"钥匙串访问",                    @"desc": @"SecItemCopyMatching 是否可用"},
-      @{@"key": @"cap:liveactivity",      @"group": @"能力", @"title": @"灵动岛 / 实时活动",             @"desc": @"后台权限提醒能不能走灵动岛"}
+        @{@"kind": @"sandbox_mach",  @"title": @"sandbox_check(mach-lookup)", @"desc": @"Mach 服务查询是否被沙盒允许"},
+        @{@"kind": @"sandbox_file",  @"title": @"sandbox_check(file-read*)",  @"desc": @"文件读取类操作（默认自身沙盒内可读）"},
+        @{@"kind": @"iokit",         @"title": @"IOKit 打开 IOSurfaceRoot",   @"desc": @"V3 的入口：能否拿到 UserClient"},
+        @{@"kind": @"mach",          @"title": @"machLookUp(com.apple.*)",    @"desc": @"能否看到系统 Mach 服务"},
+        @{@"kind": @"dyld",          @"title": @"dlopen 私有框架",             @"desc": @"能否加载 PrivateFrameworks"},
+        @{@"kind": @"spawn",         @"title": @"posixSpawn /bin/true",       @"desc": @"能否 fork/exec 子进程"},
+        @{@"kind": @"keychain",      @"title": @"钥匙串访问",                   @"desc": @"SecItemCopyMatching 是否可用"},
+        @{@"kind": @"liveactivity",  @"title": @"灵动岛 / 实时活动",            @"desc": @"后台权限提醒能不能走灵动岛"}
     ];
 }
 
++ (NSArray<NSDictionary *> *)diagnosticSpecs {
+    return [self capabilitySpecs];
+}
 // 读主程序嵌入的 entitlements（XML plist 文本）。
 // iOS 无 SecCode 公共 API；codesign 把 entitlements 放进 __LINKEDIT 的签名 blob 里
 // （magic 0xfade7171），早期无签名导出则完全没有。两种都覆盖。
@@ -562,157 +582,113 @@ static NSString *RYEntProbeFor(NSString *entKey, BOOL *probeOK) {
     return nil;   // 该键无可靠功能探针
 }
 
+// 前向声明（定义见下方 RYProbeCapabilityKind，runDiagnostics 会先调用）
+static void RYProbeCapabilityKind(NSString *kind, BOOL *outOk, NSString **outDetail);
+
 - (void)runDiagnostics:(void (^)(NSArray<NSDictionary *> *))done {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSMutableArray *out = [NSMutableArray array];
-        NSString *entStr = RYEmbeddedEntitlementsString();
-        NSDictionary *embDict = RYEmbeddedEntitlementsDict();   // V2.4.11：二进制/XML 通吃
+        NSDictionary *embDict = RYEmbeddedEntitlementsDict();
+        NSDictionary *descTbl = [RYPermLog entitlementDescriptions];
 
-        for (NSDictionary *spec in [RYPermLog diagnosticSpecs]) {
-            NSMutableDictionary *r = [spec mutableCopy];
-            NSString *key = spec[@"key"];
-            BOOL ok = NO;
-            NSString *detail = @"";
-
-            if ([key hasPrefix:@"ent:"]) {
-                NSString *entKey = [key substringFromIndex:4];
-                // ① 签名层（内核视角，主判定）：SecTaskCopyValueForEntitlement
-                NSString *sig = RYSecTaskEntValue(entKey);
-                // ② 内嵌段（声明层，辅助标注）—— V2.4.11 改字典判定（二进制 plist 不再判失）
-                BOOL emb = (embDict && embDict[entKey] != nil);
-                if (sig) {
-                    ok = YES;
-                    detail = [NSString stringWithFormat:@"签名层生效：%@", sig];
-                    if (!emb)
-                        detail = [detail stringByAppendingString:@" ⚠ 内嵌段未含（重签注入，签名/内嵌两处分叉）"];
-                } else {
-                    ok = NO;
-                    if (!entStr && !RYSecTaskEntValueAvailable())
-                        detail = @"SecTask API 不可用且无 __entitlements 段（未嵌入 / 未签名）";
-                    else if (emb)
-                        detail = @"内嵌段已声明但签名层无值（内核以签名为准 → 不生效）";
-                    else
-                        detail = @"未声明（内嵌段与签名层均无）";
-                }
-                // ③ 功能探针（辅助证据）
-                BOOL probeOK = NO;
-                NSString *probe = RYEntProbeFor(entKey, &probeOK);
-                if (probe)
-                    detail = [NSString stringWithFormat:@"%@\nprobe: %@（%@）", detail, probe,
-                              probeOK ? @"通过" : @"未通过"];
-                else
-                    detail = [detail stringByAppendingString:@"\n（无功能探针，以签名层为准）"];
-            } else if ([key isEqualToString:@"cap:sandbox_mach"]) {
-                errno = 0;
-                int v = sandbox_check(getpid(), "mach-lookup", 0);
-                ok = (v >= 0);
-                detail = [NSString stringWithFormat:@"sandbox_check = %d（errno %d）", v, errno];
-            } else if ([key isEqualToString:@"cap:sandbox_file"]) {
-                errno = 0;
-                int v = sandbox_check(getpid(), "file-read-data", 0);
-                ok = (v >= 0);
-                detail = [NSString stringWithFormat:@"sandbox_check = %d（errno %d）", v, errno];
-            } else if ([key isEqualToString:@"cap:iokit"]) {
-                // iOS 既没有 IOMasterPort 也没有 kIOMasterPortDefault → 与 main.m 一致，直接传 MACH_PORT_NULL
-                CFMutableDictionaryRef m = IOServiceMatching("IOSurfaceRoot");
-                io_service_t svc = m ? IOServiceGetMatchingService(MACH_PORT_NULL, m) : 0;   // iOS：与 main.m 一致，传 MACH_PORT_NULL
-                {
-                    kern_return_t kr = svc ? KERN_SUCCESS : KERN_FAILURE;
-                    io_connect_t conn = 0;
-                    kern_return_t okr = svc ? IOServiceOpen(svc, mach_task_self(), 0, &conn) : -1;
-                    ok = (okr == KERN_SUCCESS && conn != 0);
-                    detail = [NSString stringWithFormat:@"IOServiceOpen kr=0x%x conn=%u", okr, (unsigned)conn];
-                    if (conn) IOServiceClose(conn);
-                    if (svc) IOObjectRelease(svc);
-                }
-            } else if ([key isEqualToString:@"cap:mach"]) {
-                // iOS 不暴露 <servers/bootstrap.h> → 运行时 dlsym 取符号，取不到就明确说不可用
-                typedef kern_return_t (*BLookUpFn)(mach_port_t, const char *, mach_port_t *);
-                BLookUpFn bl = (BLookUpFn)dlsym(RTLD_DEFAULT, "bootstrap_look_up");
-                mach_port_t bp = MACH_PORT_NULL;
-                task_get_bootstrap_port(mach_task_self(), &bp);
-                if (!bl) {
-                    detail = @"bootstrap_look_up 不可用（iOS 未导出该符号）";
-                } else {
-                    mach_port_t p = MACH_PORT_NULL;
-                    kern_return_t kr = bl(bp, "com.apple.securityd", &p);
-                    ok = (kr == KERN_SUCCESS);
-                    detail = [NSString stringWithFormat:@"bootstrap_look_up(com.apple.securityd) kr=0x%x", kr];
-                }
-            } else if ([key isEqualToString:@"cap:dyld"]) {
-                void *h = dlopen("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_NOW);
-                ok = (h != NULL);
-                detail = ok ? @"dlopen OK（FrontBoardServices）" : [NSString stringWithFormat:@"dlopen 失败: %s", dlerror()];
-            } else if ([key isEqualToString:@"cap:spawn"]) {
-                pid_t pid = -1;
-                char *argv[] = {(char *)"/bin/true", NULL};
-                int sp = posix_spawn(&pid, "/bin/true", NULL, NULL, argv, NULL);
-                ok = (sp == 0);
-                detail = (sp == 0) ? [NSString stringWithFormat:@"posix_spawn ok pid=%d", pid]
-                                   : [NSString stringWithFormat:@"posix_spawn err=%d (%s)", sp, strerror(sp)];
-                if (sp == 0) { int st = 0; waitpid(pid, &st, 0); }
-            } else if ([key isEqualToString:@"cap:keychain"]) {
-                void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW);
-                typedef int (*SecCopyFn)(CFDictionaryRef, CFTypeRef *);
-                SecCopyFn fn = sec ? (SecCopyFn)dlsym(sec, "SecItemCopyMatching") : NULL;
-                if (!sec || !fn) { detail = @"Security 框架/符号不可用"; }
-                else {
-                    CFStringRef *kClass   = (CFStringRef *)dlsym(sec, "kSecClass");
-                    CFStringRef *kClassGP = (CFStringRef *)dlsym(sec, "kSecClassGenericPassword");
-                    CFStringRef *kLimit   = (CFStringRef *)dlsym(sec, "kSecMatchLimit");
-                    CFStringRef *kLimitOne= (CFStringRef *)dlsym(sec, "kSecMatchLimitOne");
-                    if (!kClass || !kClassGP || !kLimit || !kLimitOne) { detail = @"钥匙串常量取不到"; }
-                    else {
-                        NSDictionary *q = @{(__bridge id)*kClass   : (__bridge id)*kClassGP,
-                                            (__bridge id)*kLimit   : (__bridge id)*kLimitOne};
-                        CFTypeRef res = NULL;
-                        int st = fn((__bridge CFDictionaryRef)q, &res);
-                        ok = (st == 0 || st == -25300);   // 0=errSecSuccess, -25300=errSecItemNotFound（不引 Security 头）
-                        detail = [NSString stringWithFormat:@"SecItemCopyMatching = %d（0=有条目 / -25300=无条目，两者都算钥匙串可达）", st];
-                        if (res) CFRelease(res);
-                    }
-                }
-            } else if ([key isEqualToString:@"cap:liveactivity"]) {
-                ok = ryLiveActivityAvailable();
-                detail = ok ? @"灵动岛可用（后台权限提醒会先弹岛）" : @"不可用（后台提醒只能等回前台弹窗）";
+        // ---- ① Entitlement：动态枚举本 App 实际携带的所有键 ----
+        //   候选 = 内嵌/签名 blob 解析出的全部键 ∪ 已知键表（捕获「签名层有、内嵌段无」的键）。
+        //   只显示真实存在的键（签名层有值 或 内嵌段有值）；不存在的键跳过 → 不写死清单。
+        NSMutableSet *cands = [NSMutableSet set];
+        for (NSString *k in embDict.allKeys) [cands addObject:k];
+        for (NSString *k in descTbl.allKeys) [cands addObject:k];
+        NSArray *entKeys = [[cands allObjects] sortedArrayUsingSelector:@selector(compare:)];
+        for (NSString *entKey in entKeys) {
+            NSString *sig = RYSecTaskEntValue(entKey);
+            BOOL emb = (embDict && embDict[entKey] != nil);
+            if (!sig && !emb) continue;
+            BOOL ok = (sig != nil);
+            id embVal = embDict[entKey];
+            NSString *embDesc = [embVal isKindOfClass:[NSString class]] ? (NSString *)embVal
+                                : (embVal ? [NSString stringWithFormat:@"%@", embVal] : nil);
+            NSMutableString *detail = [NSMutableString string];
+            if (sig) {
+                [detail appendFormat:@"签名层生效：%@", sig];
+                if (!emb) [detail appendString:@" ⚠ 内嵌段未含（重签注入，签名/内嵌两处分叉）"];
+            } else {
+                [detail appendString:@"签名层无值（内核不认 → 不生效）"];
+                if (emb) [detail appendString:@" · 但内嵌段已声明"];
             }
-
-            r[@"ok"] = @(ok);
-            r[@"detail"] = detail;
-            [out addObject:r];
+            if (embDesc) [detail appendFormat:@"\n内嵌段值：%@", embDesc];
+            BOOL probeOK = NO;
+            NSString *probe = RYEntProbeFor(entKey, &probeOK);
+            if (probe) [detail appendFormat:@"\nprobe: %@（%@）", probe, probeOK ? @"通过" : @"未通过"];
+            NSString *desc = descTbl[entKey] ?: @"（未知键，动态枚举得到）";
+            [out addObject:@{@"group": @"Entitlement（签名层实测）", @"title": entKey,
+                             @"desc": desc, @"ok": @(ok), @"detail": [detail copy]}];
         }
 
-        // ---- V2.4.11 动态行：重签注入的键（固定清单之外）也逐键列出并查签名层 ----
-        // 旧版面板是固定清单（5 个 ent 键），全能签硬写新键时面板根本没行可显示。
-        // 内嵌/签名 blob 里解析出的每个键：不在固定清单 → 追加一行（ok = 签名层有无值）。
-        if (embDict.count) {
-            NSSet *fixed = [NSSet setWithArray:@[
-                @"get-task-allow", @"task_for_pid-allow", @"com.apple.system-task-ports",
-                @"com.apple.private.mobilehousearrest", @"com.apple.private.containermanager"]];
-            NSMutableArray *dynKeys = [NSMutableArray array];
-            for (NSString *k in embDict)
-                if (![fixed containsObject:k]) [dynKeys addObject:k];
-            if (dynKeys.count) {
-                [dynKeys sortUsingSelector:@selector(compare:)];
-                for (NSString *k in dynKeys) {
-                    NSString *sig = RYSecTaskEntValue(k);
-                    id embVal = embDict[k];
-                    NSString *embDesc = [embVal isKindOfClass:[NSString class]]
-                        ? (NSString *)embVal
-                        : [NSString stringWithFormat:@"%@", embVal ?: @"(null)"];
-                    BOOL ok2 = (sig != nil);
-                    [out addObject:@{@"group": @"Entitlement·注入", @"title": k,
-                                     @"desc": @"重签注入的键（固定清单之外，动态列出）",
-                                     @"ok": @(ok2),
-                                     @"detail": [NSString stringWithFormat:
-                                                 @"内嵌段: %@\n签名层: %@",
-                                                 embDesc.length ? embDesc : @"(空)",
-                                                 sig ?: @"无（内核不认 → 不生效）"]}];
-                }
-            }
+        // ---- ② 能力：数据驱动 registry，按 kind 分派探针 ----
+        for (NSDictionary *spec in [RYPermLog capabilitySpecs]) {
+            BOOL ok = NO; NSString *detail = @"";
+            RYProbeCapabilityKind(spec[@"kind"], &ok, &detail);
+            [out addObject:@{@"group": @"能力", @"title": spec[@"title"],
+                             @"desc": spec[@"desc"], @"ok": @(ok), @"detail": detail}];
         }
+
         dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(out); });
     });
 }
+
+// 能力探针（按 kind 分派），供 runDiagnostics 调用
+static void RYProbeCapabilityKind(NSString *kind, BOOL *outOk, NSString **outDetail) {
+    BOOL ok = NO; NSString *detail = @"";
+    if ([kind isEqualToString:@"sandbox_mach"]) {
+        errno = 0; int v = sandbox_check(getpid(), "mach-lookup", 0);
+        ok = (v >= 0); detail = [NSString stringWithFormat:@"sandbox_check = %d（errno %d）", v, errno];
+    } else if ([kind isEqualToString:@"sandbox_file"]) {
+        errno = 0; int v = sandbox_check(getpid(), "file-read-data", 0);
+        ok = (v >= 0); detail = [NSString stringWithFormat:@"sandbox_check = %d（errno %d）", v, errno];
+    } else if ([kind isEqualToString:@"iokit"]) {
+        CFMutableDictionaryRef m = IOServiceMatching("IOSurfaceRoot");
+        io_service_t svc = m ? IOServiceGetMatchingService(MACH_PORT_NULL, m) : 0;
+        io_connect_t conn = 0;
+        kern_return_t okr = svc ? IOServiceOpen(svc, mach_task_self(), 0, &conn) : -1;
+        ok = (okr == KERN_SUCCESS && conn != 0);
+        detail = [NSString stringWithFormat:@"IOServiceOpen kr=0x%x conn=%u", okr, (unsigned)conn];
+        if (conn) IOServiceClose(conn); if (svc) IOObjectRelease(svc);
+    } else if ([kind isEqualToString:@"mach"]) {
+        typedef kern_return_t (*BLookUpFn)(mach_port_t, const char *, mach_port_t *);
+        BLookUpFn bl = (BLookUpFn)dlsym(RTLD_DEFAULT, "bootstrap_look_up");
+        mach_port_t bp = MACH_PORT_NULL; task_get_bootstrap_port(mach_task_self(), &bp);
+        if (!bl) detail = @"bootstrap_look_up 不可用（iOS 未导出该符号）";
+        else { mach_port_t p = MACH_PORT_NULL; kern_return_t kr = bl(bp, "com.apple.securityd", &p);
+               ok = (kr == KERN_SUCCESS); detail = [NSString stringWithFormat:@"bootstrap_look_up(com.apple.securityd) kr=0x%x", kr]; }
+    } else if ([kind isEqualToString:@"dyld"]) {
+        void *h = dlopen("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_NOW);
+        ok = (h != NULL); detail = ok ? @"dlopen OK（FrontBoardServices）" : [NSString stringWithFormat:@"dlopen 失败: %s", dlerror()];
+    } else if ([kind isEqualToString:@"spawn"]) {
+        pid_t pid = -1; char *argv[] = {(char *)"/bin/true", NULL};
+        int sp = posix_spawn(&pid, "/bin/true", NULL, NULL, argv, NULL);
+        ok = (sp == 0);
+        detail = (sp == 0) ? [NSString stringWithFormat:@"posix_spawn ok pid=%d", pid] : [NSString stringWithFormat:@"posix_spawn err=%d (%s)", sp, strerror(sp)];
+        if (sp == 0) { int st = 0; waitpid(pid, &st, 0); }
+    } else if ([kind isEqualToString:@"keychain"]) {
+        void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW);
+        typedef int (*SecCopyFn)(CFDictionaryRef, CFTypeRef *);
+        SecCopyFn fn = sec ? (SecCopyFn)dlsym(sec, "SecItemCopyMatching") : NULL;
+        if (!sec || !fn) detail = @"Security 框架/符号不可用";
+        else {
+            CFStringRef *kClass=(CFStringRef *)dlsym(sec,"kSecClass"), *kClassGP=(CFStringRef *)dlsym(sec,"kSecClassGenericPassword"),
+                         *kLimit=(CFStringRef *)dlsym(sec,"kSecMatchLimit"), *kLimitOne=(CFStringRef *)dlsym(sec,"kSecMatchLimitOne");
+            if (!kClass||!kClassGP||!kLimit||!kLimitOne) detail = @"钥匙串常量取不到";
+            else { NSDictionary *q=@{(__bridge id)*kClass:(__bridge id)*kClassGP,(__bridge id)*kLimit:(__bridge id)*kLimitOne};
+                   CFTypeRef res=NULL; int st=fn((__bridge CFDictionaryRef)q,&res);
+                   ok=(st==0||st==-25300);
+                   detail=[NSString stringWithFormat:@"SecItemCopyMatching = %d（0=有条目 / -25300=无条目，两者都算钥匙串可达）", st];
+                   if(res) CFRelease(res); }
+        }
+    } else if ([kind isEqualToString:@"liveactivity"]) {
+        ok = ryLiveActivityAvailable();
+        detail = ok ? @"灵动岛可用（后台权限提醒会先弹岛）" : @"不可用（后台提醒只能等回前台弹窗）";
+    }
+    if (outOk) *outOk = ok; if (outDetail) *outDetail = detail;
+}
+
 
 @end
