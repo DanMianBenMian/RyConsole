@@ -68,10 +68,13 @@ typedef NS_ENUM(NSInteger, RYPermLogFilter) {
 // 逐项实测（后台线程跑，主线程回调）。结果项追加 ok / detail 字段
 - (void)runDiagnostics:(void (^)(NSArray<NSDictionary *> *results))done;
 
-#pragma mark - 环境（V2.4.13 / V2.4.14）
+#pragma mark - 环境（V2.4.13 / V2.4.14 / V2.4.15）
 // 以下为 main.m 实现的 C 函数，环境页与原语共用
 NSString *RYEnvironmentStateJSON(void);   // 身份(uid/gid/pid/组) + 干净与否 + 网络(net/hasNetwork)
-NSString *RYResetEnvironment(void);       // 清共享字典/归零原子槽/回收批次/停服务端
+                                          // ★ V2.4.15：clean 只看残留，**服务端运行中不算污染**
+// ★ V2.4.15：默认**不停服务端**（stopServer=NO）—— 监听是「工作台」，重置只清残留，
+//   旧实现无条件停服务会把电脑端的连接掐断，与「半自动」相悖。传 YES 才停。
+NSString *RYResetEnvironment(BOOL stopServer);   // 清共享字典/归零原子槽/回收批次
 NSString *RYInterfaceIPsJSON(void);       // 所有接口 IP（每项带 kind 归类）
 // ★ V2.4.14：分类端点 {wifi?, hotspot?, cellular?, hasAny, all[]} —— 「没有的那一类不出现」。
 //   服务端绑 0.0.0.0，所以 Wi-Fi 与热点/蜂窝**同时可达**，显示时按类各给一个地址。
