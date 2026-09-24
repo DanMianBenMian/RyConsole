@@ -3,11 +3,12 @@
 //  RyConsole —— 「权限与安全」面板（V2.4）
 //
 //  样式沿用外壳：深色卡片 + 系统色，小字号等宽文本。
-//  三个分区用 UISegmentedControl 切换，各自一张表。
+//  四个分区用 UISegmentedControl 切换，各自一张表。
 //
 
 #import "RySecurityPane.h"
 #import "RYPermLog.h"
+#import "AutorunServer.h"
 #import <UIKit/UIKit.h>
 
 #define SP_BG      [UIColor colorWithRed:0.043f green:0.043f blue:0.047f alpha:1.0f]
@@ -25,6 +26,9 @@
 @property (nonatomic, strong) UITableView *diagTable;
 @property (nonatomic, strong) UITableView *cmdTable;
 @property (nonatomic, strong) UITableView *logTable;
+@property (nonatomic, strong) UITableView *envTable;
+@property (nonatomic, strong) NSDictionary *envState;
+@property (nonatomic, strong) NSDictionary *envServer;
 @property (nonatomic, strong) UILabel *statLabel;
 @property (nonatomic, strong) UISegmentedControl *logFilter;
 @property (nonatomic, strong) NSArray *diagResults;
@@ -41,7 +45,7 @@
     self.view.backgroundColor = SP_BG;
     self.title = @"权限与安全";
 
-    self.seg = [[UISegmentedControl alloc] initWithItems:@[@"权限诊断", @"安全", @"日志"]];
+    self.seg = [[UISegmentedControl alloc] initWithItems:@[@"权限诊断", @"安全", @"日志", @"环境"]];
     self.seg.selectedSegmentIndex = 0;
     self.seg.translatesAutoresizingMaskIntoConstraints = NO;
     [self.seg addTarget:self action:@selector(onSeg:) forControlEvents:UIControlEventValueChanged];
@@ -64,6 +68,7 @@
     [self buildDiagView];
     [self buildCmdView];
     [self buildLogView];
+    [self buildEnvView];
     [self onSeg:self.seg];
 }
 
@@ -209,12 +214,54 @@
     ]];
 }
 
+#pragma mark - ④ 环境（V2.4.13）
+- (void)buildEnvView {
+    UIView *v = [[UIView alloc] init];
+    v.translatesAutoresizingMaskIntoConstraints = NO;
+    v.tag = 103;
+    [self.hostView addSubview:v];
+    [self pin:v];
+
+    self.envTable = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    self.envTable.translatesAutoresizingMaskIntoConstraints = NO;
+    self.envTable.backgroundColor = SP_BG;
+    self.envTable.dataSource = self;
+    self.envTable.delegate = self;
+    [v addSubview:self.envTable];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.envTable.topAnchor constraintEqualToAnchor:v.topAnchor constant:0],
+        [self.envTable.leadingAnchor constraintEqualToAnchor:v.leadingAnchor constant:0],
+        [self.envTable.trailingAnchor constraintEqualToAnchor:v.trailingAnchor constant:0],
+        [self.envTable.bottomAnchor constraintEqualToAnchor:v.bottomAnchor constant:0]
+    ]];
+}
+
+- (void)reloadEnv {
+    NSString *js = RYEnvironmentStateJSON();
+    id o = [NSJSONSerialization JSONObjectWithData:[js dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
+    self.envState = [o isKindOfClass:[NSDictionary class]] ? o : @{};
+
+    NSString *sj = RYAutorunStatus();
+    id s = [NSJSONSerialization JSONObjectWithData:[sj dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
+    self.envServer = [s isKindOfClass:[NSDictionary class]] ? s : @{};
+
+    [self.envTable reloadData];
+}
+
+- (void)onEnvServer:(UISwitch *)sw {
+    if (sw.on) RYAutorunStart(8899, nil, nil);
+    else RYAutorunStop();
+    [self performSelector:@selector(reloadEnv) withObject:nil afterDelay:0.4];
+}
+
 #pragma mark - 切换 / 刷新
 - (void)onSeg:(UISegmentedControl *)s {
     for (UIView *v in self.hostView.subviews) v.hidden = (v.tag != (100 + s.selectedSegmentIndex));
     if (s.selectedSegmentIndex == 0 && !self.diagResults.count) [self runDiag];
     if (s.selectedSegmentIndex == 1) [self reloadCommands];
     if (s.selectedSegmentIndex == 2) [self reloadLogs];
+    if (s.selectedSegmentIndex == 3) [self reloadEnv];
 }
 
 - (void)onFilter:(UISegmentedControl *)s { [self reloadLogs]; }
@@ -255,20 +302,114 @@
 #pragma mark - Table
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
     if (tv == self.cmdTable) return 2;
+    if (tv == self.envTable) return 3;
     return 1;
 }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)sec {
     if (tv == self.cmdTable) return (sec == 0) ? @"高危命令（关掉后调用需确认）" : @"一般命令";
     if (tv == self.diagTable) return @"逐项实测（正常=可用，否则=禁用并给原因）";
+    if (tv == self.envTable) {
+        return (sec == 0) ? @"身份（UID / 组）"
+             : (sec == 1) ? @"环境状态"
+             : @"网络（热点 / 移动数据 · 电脑可连）";
+    }
     return nil;
 }
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)sec {
     if (tv == self.diagTable) return self.diagResults.count ?: 1;
     if (tv == self.cmdTable) return (sec == 0) ? self.cmdHigh.count : self.cmdNormal.count;
+    if (tv == self.envTable) {
+        if (sec == 0) return 6;                       // UID/EUID/GID/EGID/PID/组
+        if (sec == 1) return 2;                       // 干净状态 + 重置
+        NSArray *ifs = self.envState[@"interfaces"];  // 接口 + 服务器开关 + (运行中显示地址)
+        NSInteger n = [ifs isKindOfClass:[NSArray class]] ? ifs.count : 0;
+        return n + 1 + ([self.envServer[@"running"] boolValue] ? 1 : 0);
+    }
     return [self currentLogEntries].count ?: 1;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    if (tv == self.envTable) {
+        UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"env"];
+        if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"env"];
+        c.backgroundColor = SP_PANEL;
+        c.accessoryView = nil;
+        c.accessoryType = UITableViewCellAccessoryNone;
+        c.textLabel.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightMedium];
+        c.textLabel.textColor = SP_TEXT;
+        c.detailTextLabel.font = [UIFont systemFontOfSize:10.5];
+        c.detailTextLabel.numberOfLines = 2;
+        c.detailTextLabel.textColor = SP_MUTED;
+
+        // —— ① 身份
+        if (ip.section == 0) {
+            if (ip.row < 5) {
+                NSArray *keys = @[@"uid", @"euid", @"gid", @"egid", @"pid"];
+                NSArray *labels = @[@"UID（用户）", @"EUID（有效用户）", @"GID（组）", @"EGID（有效组）", @"PID（进程）"];
+                NSString *k = keys[ip.row];
+                c.textLabel.text = [NSString stringWithFormat:@"%@: %@", labels[ip.row], self.envState[k] ?: @"?"];
+            } else {
+                id g = self.envState[@"groups"];
+                NSMutableArray *sa = [NSMutableArray array];
+                if ([g isKindOfClass:[NSArray class]]) for (id x in g) [sa addObject:[x stringValue]];
+                c.textLabel.text = [NSString stringWithFormat:@"所在组（%lu 个）: %@",
+                                    (unsigned long)([g isKindOfClass:[NSArray class]] ? [(NSArray *)g count] : 0),
+                                    [sa componentsJoinedByString:@", "] ?: @"?"];
+            }
+            c.detailTextLabel.text = nil;
+            return c;
+        }
+
+        // —— ② 环境状态
+        if (ip.section == 1) {
+            if (ip.row == 0) {
+                BOOL clean = [self.envState[@"clean"] boolValue];
+                c.textLabel.text = clean ? @"环境是否干净：干净 ✓" : @"环境是否干净：污染 ✗";
+                c.textLabel.textColor = clean ? SP_GREEN : SP_RED;
+                NSArray *rs = self.envState[@"reasons"];
+                c.detailTextLabel.text = (rs && rs.count)
+                    ? [rs componentsJoinedByString:@"；"]
+                    : (clean ? @"无残留（共享字典 / 竞态批次 / 原子槽 / 服务端均空）" : nil);
+                return c;
+            }
+            c.textLabel.text = @"⤵ 重置环境（清共享字典 / 竞态 / 原子槽 / 停服务端）";
+            c.textLabel.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightSemibold];
+            c.textLabel.textColor = SP_RED;
+            c.detailTextLabel.text = nil;
+            return c;
+        }
+
+        // —— ③ 网络
+        NSArray *ifs = self.envState[@"interfaces"];
+        NSInteger n = [ifs isKindOfClass:[NSArray class]] ? ifs.count : 0;
+        if (ip.row < n) {
+            NSDictionary *it = ifs[ip.row];
+            c.textLabel.text = [NSString stringWithFormat:@"%@ (%@)", it[@"if"] ?: @"?", it[@"family"] ?: @"?"];
+            c.textLabel.textColor = SP_TEXT;
+            c.detailTextLabel.text = it[@"ip"] ?: @"";
+            return c;
+        }
+        NSInteger r = ip.row - n;
+        if (r == 0) {
+            c.textLabel.text = @"自动运行服务器（电脑可连）";
+            c.textLabel.textColor = SP_TEXT;
+            c.detailTextLabel.text = nil;
+            UISwitch *sw = [[UISwitch alloc] init];
+            sw.on = [self.envServer[@"running"] boolValue];
+            [sw addTarget:self action:@selector(onEnvServer:) forControlEvents:UIControlEventValueChanged];
+            c.accessoryView = sw;
+            return c;
+        }
+        BOOL running = [self.envServer[@"running"] boolValue];
+        NSString *ipAddr = (self.envServer[@"lanIP"] && [self.envServer[@"lanIP"] length]) ? self.envServer[@"lanIP"] : (self.envState[@"ip"] ?: @"?");
+        NSInteger port = [self.envServer[@"port"] integerValue] ?: 8899;
+        c.textLabel.text = @"访问地址（电脑浏览器 / 脚本）";
+        c.textLabel.textColor = SP_TEXT;
+        c.detailTextLabel.text = running ? [NSString stringWithFormat:@"http://%@:%ld/ping", ipAddr, (long)port] : @"（服务未启动）";
+        c.detailTextLabel.textColor = running ? SP_GREEN : SP_MUTED;
+        return c;
+    }
+
     if (tv == self.diagTable) {
         UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"diag"];
         if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"diag"];
@@ -357,6 +498,14 @@
     [[RYPermLog shared] setEnabled:sw.on forCommand:list[row]];
 }
 
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    if (tv == self.envTable && ip.section == 1 && ip.row == 1) {
+        RYResetEnvironment();
+        [self reloadEnv];
+    }
+}
+
 @end
 
 UIViewController *RYMakeSecurityPane(void) { return [[RYSecurityPaneVC alloc] init]; }
@@ -365,5 +514,6 @@ void RYSecurityPaneRefresh(UIViewController *vc) {
         RYSecurityPaneVC *p = (RYSecurityPaneVC *)vc;
         [p reloadCommands];
         [p reloadLogs];
+        [p reloadEnv];
     }
 }
