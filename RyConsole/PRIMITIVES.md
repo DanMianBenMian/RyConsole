@@ -426,8 +426,8 @@ JSON.stringify(callPtr(c.addr, [{ buf: 1024 }]));  // value=缓冲地址, out.bu
 
 | 原语 | 签名 | 说明 |
 |---|---|---|
-| `envState` | `() → JSON` | 环境快照：`{clean, uid, euid, gid, egid, pid, groups[], groupCount, ip, interfaces[], net, hasNetwork, serverRunning, sharedMapCount, batchUsed, batchActive, slotNonZero, reasons[]}`。`clean = 共享字典空 && 无竞态批次 && 原子槽全零 && 服务端未跑`；脏时 `reasons` 逐条给原因 |
-| `envReset` | `() → JSON` | **原地复位**：清 `gSharedMap`、16 个 `gRaceSlots` 归零、`gRaceStop` 归零、回收全部 `gBatches`（销毁闸 mutex/cond、清零 done/guarded/taken、置空 results）、调 `RYAutorunStop()`。返回 `{ok, recycledBatches, sharedMapCleared, slotsZeroed, serverStop}` |
+| `envState` | `() → JSON` | 环境快照：`{clean, uid, euid, gid, egid, pid, groups[], groupCount, ip, interfaces[], net, hasNetwork, serverRunning, sharedMapCount, batchUsed, batchActive, slotNonZero, reasons[]}`。`clean = 共享字典空 && 无竞态批次 && 原子槽全零`；脏时 `reasons` 逐条给原因。★ **V2.4.15 起「服务端运行中」不算污染**（它是工作台不是残留） |
+| `envReset` | `([stopServer]) → JSON` | **原地复位**：清 `gSharedMap`、16 个 `gRaceSlots` 归零、`gRaceStop` 归零、回收全部 `gBatches`（销毁闸 mutex/cond、清零 done/guarded/taken、置空 results）。★ **V2.4.15 起默认不停服务端**（监听是工作台，重置只清残留，**电脑端连接不断**）；传 `true` 才调 `RYAutorunStop()`。返回 `{ok, recycledBatches, sharedMapCleared, slotsZeroed, serverStopped, serverKeptRunning, serverWasRunning, serverStop, note?}` |
 | `envIP` | `() → [{if, family, ip, kind}]` | `getifaddrs` 枚举全部接口 IPv4/IPv6；`family` = `inet`/`inet6`，`kind` = `wifi`/`hotspot`/`cellular`/`vpn`/`other` |
 | **`envNet`** | `() → JSON` | ★ **分类端点**：`{wifi?, hotspot?, cellular?, hasAny, all[]}`，各类形如 `{if, kind, ip}`。**没有的那一类不出现**（没连 Wi-Fi 就无 `wifi` 键，没开蜂窝就无 `cellular` 键）；`hasAny:false` = 网都没有 |
 | `envServerStart` | `(port) → JSON` | 起服务并回 `{ok, port, ip, urls[]}`；`urls` **按类各一条** `{kind, if, ip, url}`。**`hasAny=false` 时直接返 `{ok:false, error:"无可用网络…"}` 且不启动监听** |
