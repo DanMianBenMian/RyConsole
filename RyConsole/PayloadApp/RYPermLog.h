@@ -68,11 +68,15 @@ typedef NS_ENUM(NSInteger, RYPermLogFilter) {
 // 逐项实测（后台线程跑，主线程回调）。结果项追加 ok / detail 字段
 - (void)runDiagnostics:(void (^)(NSArray<NSDictionary *> *results))done;
 
-#pragma mark - 环境（V2.4.13）
+#pragma mark - 环境（V2.4.13 / V2.4.14）
 // 以下为 main.m 实现的 C 函数，环境页与原语共用
-NSString *RYEnvironmentStateJSON(void);   // 身份(uid/gid/pid/组) + 干净与否 + 网络
+NSString *RYEnvironmentStateJSON(void);   // 身份(uid/gid/pid/组) + 干净与否 + 网络(net/hasNetwork)
 NSString *RYResetEnvironment(void);       // 清共享字典/归零原子槽/回收批次/停服务端
-NSString *RYInterfaceIPsJSON(void);       // 所有接口 IP（含个人热点 bridge100）
-NSString *RYHotspotIP(void);              // 对连热点/局域网电脑可达的 IP
+NSString *RYInterfaceIPsJSON(void);       // 所有接口 IP（每项带 kind 归类）
+// ★ V2.4.14：分类端点 {wifi?, hotspot?, cellular?, hasAny, all[]} —— 「没有的那一类不出现」。
+//   服务端绑 0.0.0.0，所以 Wi-Fi 与热点/蜂窝**同时可达**，显示时按类各给一个地址。
+NSString *RYNetworkEndpointsJSON(void);
+// 「最可能对电脑可达」的 IP：Wi-Fi 优先 → 个人热点 → 蜂窝（V2.4.14 修正了排序）
+NSString *RYReachableIP(void);
 
 @end
