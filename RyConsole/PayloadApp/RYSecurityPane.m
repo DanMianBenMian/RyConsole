@@ -333,7 +333,7 @@
     if (tv == self.envTable) {
         return (sec == 0) ? @"身份（UID / 组）"
              : (sec == 1) ? @"环境状态"
-             : @"网络（Wi-Fi / 热点 / 蜂窝 · 同时可达，电脑在哪个网就用哪个）";
+             : @"网络（Wi-Fi/热点/蜂窝 同时可达 · 点条目即复制该地址）";
     }
     return nil;
 }
@@ -528,6 +528,17 @@
     if (tv == self.envTable && ip.section == 1 && ip.row == 1) {
         RYResetEnvironment(NO);      // ★ 默认保留监听
         [self reloadEnv];
+    }
+    // V2.4.17：点网络段某条端点 → 直接复制该条地址（不必回到主界面点「复制地址」）
+    if (tv == self.envTable && ip.section == 2) {
+        NSArray *eps = [self envEndpointRows];
+        if (ip.row < (NSInteger)eps.count) {
+            NSString *addr = eps[ip.row][@"ip"];
+            NSInteger p = [self.envServer[@"port"] integerValue];
+            if (p <= 0) p = 8899;
+            [UIPasteboard generalPasteboard].string = [NSString stringWithFormat:@"http://%@:%ld/ping", addr, (long)p];
+            [self reloadEnv];
+        }
     }
 }
 
