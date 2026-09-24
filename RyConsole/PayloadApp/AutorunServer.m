@@ -79,26 +79,25 @@ static NSString *ryStamp(void) {
     return [f stringFromDate:[NSDate date]];
 }
 
-// 取本机局域网 IPv4（en0 优先）
+// 取本机可达 IPv4：优先个人热点 bridge100 / 蜂窝 pdp_ip0·ipsec0 / Wi-Fi en0·en1
 static NSString *ryLANAddress(void) {
-    NSString *found = nil;
+    NSString *found = nil, *fallback = nil;
     struct ifaddrs *addrs = NULL;
     if (getifaddrs(&addrs) != 0 || addrs == NULL) return @"?";
+    NSArray *pri = @[@"bridge100", @"pdp_ip0", @"ipsec0", @"en0", @"en1"];
     for (struct ifaddrs *p = addrs; p != NULL; p = p->ifa_next) {
-        if (p->ifa_addr == NULL) continue;
-        if (p->ifa_addr->sa_family != AF_INET) continue;
+        if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET) continue;
         NSString *name = [NSString stringWithUTF8String:p->ifa_name ? p->ifa_name : ""];
-        if (![name isEqualToString:@"en0"] && ![name isEqualToString:@"en1"]) continue;
         char buf[INET_ADDRSTRLEN] = {0};
         struct sockaddr_in *sin = (struct sockaddr_in *)p->ifa_addr;
         if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) == NULL) continue;
         NSString *ip = [NSString stringWithUTF8String:buf];
         if ([ip hasPrefix:@"127."]) continue;
-        found = ip;
-        break;
+        if ([pri containsObject:name]) { found = ip; break; }
+        if (!fallback) fallback = ip;
     }
     freeifaddrs(addrs);
-    return found ? found : @"?";
+    return found ? found : (fallback ? fallback : @"?");
 }
 
 static UIViewController *ryTopVC(void) {
