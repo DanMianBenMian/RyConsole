@@ -1240,7 +1240,31 @@ static NSString *memWriteNative(NSString *addrHex, id data) {
 //        ④ {buf:<数字>} 的数字就是缓冲大小（规格 3.2 写了 {buf:<n>}，参考实现却只认 v[@"size"]）
 //        ⑤ 函数地址先做可读性体检（vm_read 4 字节）→ 垃圾地址给结构化错误，不靠崩溃兜底硬扛
 // ============================================================
-static NSString *callPtrNative(NSString *addrHex, NSArray *args, NSDictionary *opts) {
+// ============================================================
+//  V2.4.21 变参调用核心（修缺陷报告 ryconsole_2420_callptr_variadic_defect_report.md §1-§3）
+//   根因：旧 callPtr 的 arity 分发用【固定原型】(uintptr_t(*)(void*,...))fp——实参全塞
+//        寄存器 x0-x7；而 arm64 ABI 规定变参函数的【未命名实参必须上栈】，libc 的
+//        syscall() 用 va_arg 从栈读 → 读到寄存器垃圾 → ≥1 实参静默返回假 EINVAL/ENOENT
+//        （不崩溃不报错，极具迷惑性；0 实参因 x0 恰好是命名参数而侥幸正确）。
+//   修法：经【真正的变参函数指针类型】(uintptr_t(*)(uintptr_t,...)) 调用，
+//        clang 自动按 ABI 把未命名实参上栈。无需 libffi / 手写汇编。
+//   约定：第 0 个实参 = 命名参数（syscall 的 number / printf 的 fmt），其余全按未命名。
+//   红线不变：只支持整型/指针返回；float/struct 返回不适用。
+// ============================================================
+static uintptr_t ryVariadicCall(uintptr_t fp, void **slots, int n) {
+    switch (n) {
+        case 1:  return ((uintptr_t(*)(uintptr_t, ...))fp)((uintptr_t)slots[0]);
+        case 2:  return ((uintptr_t(*)(uintptr_t, ...))fp)((uintptr_t)slots[0], (uintptr_t)slots[1]);
+        case 3:  return ((uintptr_t(*)(uintptr_t, ...))fp)((uintptr_t)slots[0], (uintptr_t)slots[1], (uintptr_t)slots[2]);
+        case 4:  return ((uintptr_t(*)(uintptr_t, ...))fp)((uintptr_t)slots[0], (uintptr_t)slots[1], (uintptr_t)slots[2], (uintptr_t)slots[3]);
+        case 5:  return ((uintptr_t(*)(uintptr_t, ...))fp)((uintptr_t)slots[0], (uintptr_t)slots[1], (uintptr_t)slots[2], (uintptr_t)slots[3], (uintptr_t)slots[4]);
+        case 6:  return ((uintptr_t(*)(uintptr_t, ...))fp)((uintptr_t)slots[0], (uintptr_t)slots[1], (uintptr_t)slots[2], (uintptr_t)slots[3], (uintptr_t)slots[4], (uintptr_t)slots[5]);
+        case 7:  return ((uintptr_t(*)(uintptr_t, ...))fp)((uintptr_t)slots[0], (uintptr_t)slots[1], (uintptr_t)slots[2], (uintptr_t)slots[3], (uintptr_t)slots[4], (uintptr_t)slots[5], (uintptr_t)slots[6]);
+        default: return ((uintptr_t(*)(uintptr_t, ...))fp)((uintptr_t)slots[0], (uintptr_t)slots[1], (uintptr_t)slots[2], (uintptr_t)slots[3], (uintptr_t)slots[4], (uintptr_t)slots[5], (uintptr_t)slots[6], (uintptr_t)slots[7]);
+    }
+}
+
+static NSString *callPtrCommon(NSString *addrHex, NSArray *args, NSDictionary *opts, BOOL variadic) {
     if (![addrHex isKindOfClass:[NSString class]] || !addrHex.length)
         return @"{\"ok\":false,\"error\":\"[callPtr error] addrHex must be a non-empty hex string 形如 \\\"0x00000002218bbdc4\\\"  |  签名: callPtr(addrHex, args, opts)  |  查参数: primHelp(\\\"callPtr\\\")\"}";
     uintptr_t fp = objcHexToPtr(addrHex);
@@ -1304,9 +1328,15 @@ static NSString *callPtrNative(NSString *addrHex, NSArray *args, NSDictionary *o
         n++;
     }
 
+    if (variadic && n < 1)
+        return @"{\"ok\":false,\"error\":\"[callVariadic error] 变参调用至少 1 个实参（第 0 个=命名参数，如 syscall 的 number）\""
+                @",\"签名\":\"callVariadic(addrHex, args, opts) — 与 callPtr 同一套打包，但实参按 arm64 变参 ABI 上栈\"}";
+
     uintptr_t r = 0;
     @try {
-        switch (n) {
+        if (variadic) {
+            r = ryVariadicCall(fp, slots, n);
+        } else switch (n) {
             case 0: r = ((uintptr_t(*)(void))fp)(); break;
             case 1: r = ((uintptr_t(*)(void *))fp)(slots[0]); break;
             case 2: r = ((uintptr_t(*)(void *, void *))fp)(slots[0], slots[1]); break;
@@ -1323,8 +1353,14 @@ static NSString *callPtrNative(NSString *addrHex, NSArray *args, NSDictionary *o
         return [NSString stringWithFormat:@"{\"ok\":false,\"error\":\"[callPtr exception] %@\"}", reason];
     }
 
+    // ★ V2.4.21 变参路径：errno 紧跟调用捕获（同线程语义；后面任何 libc 调用都可能污染它）
+    int callErrno = 0;
+    if (variadic && r == (uintptr_t)-1) callErrno = errno;
+
     // 回传 {buf:} 缓冲内容（base64）。key 用「出现顺序」序号 buf0/buf1…，与参数槽位无关，
     // 方便后续脚本按固定 key 解析（第 k 个缓冲恒为 out.bufK）。
+    // ★ V2.4.21 同时回传 bufAddrK（缓冲的地址）—— sysctl 的 oldlenp 这类
+    //   "内核往里写、JS 还得知道它在哪"的场景必需（可加法回传，不破坏旧探针）。
     NSMutableString *outs = [NSMutableString string];
     for (NSUInteger i = 0; i + 1 < bufIdx.count; i += 2) {
         NSUInteger slot = (NSUInteger)[bufIdx[i] unsignedIntegerValue];   // 槽位（仅用于取回指针）
@@ -1333,14 +1369,97 @@ static NSString *callPtrNative(NSString *addrHex, NSArray *args, NSDictionary *o
         NSData *d = [NSData dataWithBytes:p length:sz];
         [outs appendFormat:@"%@\"buf%lu\":\"%@\"", (outs.length ? @"," : @""), (unsigned long)(i / 2),
                            [d base64EncodedStringWithOptions:0]];
+        [outs appendFormat:@",\"bufAddr%lu\":\"0x%llx\"", (unsigned long)(i / 2),
+                           (unsigned long long)(uintptr_t)p];
     }
     for (NSValue *bv in inbufs) free([bv pointerValue]);
 
-    if (outs.length) {
-        return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\",\"out\":{%@}}",
-                (unsigned long long)r, outs];
+    NSString *variadicExtra = @"";
+    if (variadic) {
+        variadicExtra = (r == (uintptr_t)-1)
+            ? [NSString stringWithFormat:@",\"variadic\":true,\"ret\":-1,\"errno\":%d", callErrno]
+            : @",\"variadic\":true";
     }
-    return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\"}", (unsigned long long)r];
+    if (outs.length) {
+        return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\"%@,\"out\":{%@}}",
+                (unsigned long long)r, variadicExtra, outs];
+    }
+    return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\"%@}", (unsigned long long)r, variadicExtra];
+}
+
+static NSString *callPtrNative(NSString *addrHex, NSArray *args, NSDictionary *opts) {
+    return callPtrCommon(addrHex, args, opts, NO);
+}
+
+// ★ V2.4.21 callVariadic：变参函数调用入口（syscall/printf 族）。
+//   第 0 个实参=命名参数，其余按未命名上栈；成功回传含 "variadic":true，
+//   返回 -1 时附 errno（当场分清 EINVAL/EPERM/ENOENT，不再有"假错误码"）。
+static NSString *callVariadicNative(NSString *addrHex, NSArray *args, NSDictionary *opts) {
+    return callPtrCommon(addrHex, args, opts, YES);
+}
+
+// ============================================================
+//  V2.4.21 syscallN：变参 syscall 的受控入口（缺陷报告 §3.2 + §4 黑名单加固）
+//   syscallN(number, args[], opts) ≡ syscall(number, ...args)，但：
+//   ① 号段校验：0 <= number < nsysent（注册时 sysctl kern.nsysent，读不到退 512）。
+//      27B2 实测越界号内核直接 SIGSYS 杀进程（不返 ENOSYS）→ 现在受控报错不自杀；
+//   ② 死亡名单 {45:csops}：2.4.20 实测经变参路径调用即死 → 默认拦截，
+//      opts {allowDead:true} 显式放行（研究者自己担责）；
+//   ③ 走 ryVariadicCall 同一条变参通道 → 实参真正上栈，终结"假 EINVAL"。
+//   实参支持：数字 / "0x.." 十六进制串 / {hex:"0x.."}；字符串与 {buf:} 缓冲请用 callVariadic。
+// ============================================================
+static int ryNsysent = 0;   // 惰性初始化，进程内只读一次
+static NSString *syscallNNative(JSValue *numVal, NSArray *args, NSDictionary *opts) {
+    if (!numVal || numVal.isUndefined || numVal.isNull || !numVal.isNumber)
+        return @"{\"ok\":false,\"error\":\"[syscallN error] 第一参数必须是 syscall 号（整数）\""
+                @",\"签名\":\"syscallN(number, args, opts) 例: syscallN(202, [mibHex, 2, bufHex, lenPtrHex, 0, 0])\"}";
+    if (!ryNsysent) {
+        size_t sz = sizeof(ryNsysent);
+        if (sysctlbyname("kern.nsysent", &ryNsysent, &sz, NULL, 0) != 0 || ryNsysent <= 0)
+            ryNsysent = 512;    // 读不到就取保守值：宁可受控报错，不可 SIGSYS 自杀
+    }
+    long number = [numVal toNumber].longValue;
+    if (number < 0 || number >= ryNsysent)
+        return [NSString stringWithFormat:
+                @"{\"ok\":false,\"error\":\"[syscallN error] syscall 号 %ld 越界（nsysent=%d）\""
+                @",\"hint\":\"27B2 越界号 = 内核 SIGSYS 杀进程且 JS 捕获不到 —— 已受控拦截\",\"nsysent\":%d}",
+                number, ryNsysent, ryNsysent];
+    if (number == 45 && ![opts[@"allowDead"] boolValue])
+        return @"{\"ok\":false,\"error\":\"[syscallN error] syscall 45 (csops) 在实验死亡名单（2.4.20 实测调用即杀进程）\""
+                @",\"hint\":\"确要试验：opts 传 {allowDead:true}；或用 callPtr 直调 csops 符号（非变参路径，风险未排除）\"}";
+
+    void *sc = dlsym(RTLD_DEFAULT, "syscall");
+    if (!sc) return @"{\"ok\":false,\"error\":\"[syscallN error] dlsym(RTLD_DEFAULT, \\\"syscall\\\") 失败\"}";
+
+    unsigned long long nums[8] = {0};
+    void *slots[8] = {0};
+    int n = 0;
+    nums[0] = (unsigned long long)number; slots[0] = (void *)nums[0]; n = 1;
+    for (id v in (args ?: @[])) {
+        if (n >= 8) return @"{\"ok\":false,\"error\":\"[syscallN error] too many args (>7 实参)\"}";
+        if (v == nil || [v isKindOfClass:[NSNull class]]) { slots[n] = NULL; }
+        else if ([v isKindOfClass:[NSNumber class]]) {
+            nums[n] = [v unsignedLongLongValue]; slots[n] = (void *)nums[n];
+        }
+        else if ([v isKindOfClass:[NSString class]] && [(NSString *)v hasPrefix:@"0x"]) {
+            slots[n] = (void *)objcHexToPtr(v);
+        }
+        else if ([v isKindOfClass:[NSDictionary class]] && v[@"hex"]) {
+            slots[n] = (void *)objcHexToPtr(v[@"hex"]);
+        }
+        else return @"{\"ok\":false,\"error\":\"[syscallN error] 实参只支持 数字 / \\\"0x..\\\" / {hex:..}\""
+                     @",\"hint\":\"字符串/缓冲槽请用 callVariadic（同一变参通道 + callPtr 打包全家桶）\"}";
+        n++;
+    }
+
+    uintptr_t r = ryVariadicCall((uintptr_t)sc, slots, n);
+    if (r == (uintptr_t)-1) {
+        int e = errno;
+        return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\",\"ret\":-1,\"errno\":%d,\"syscallNo\":%ld}",
+                (unsigned long long)r, e, number];
+    }
+    return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\",\"variadic\":true,\"syscallNo\":%ld}",
+            (unsigned long long)r, number];
 }
 
 static NSString *objcMsgSendSafeNative(id recvArg, NSString *selName, NSArray *args) {
@@ -2046,6 +2165,12 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             //   规格：RYCONSOLE_CALLPTR_SPEC.md。只支持整型/指针返回；函数地址会先做可读性体检。
             //   ★ 崩溃兜底对它同样生效（调用坏函数 → guarded:true），内核 panic 除外。
             ctx[@"callPtr"]=^(NSString *addrHex, NSArray *args, NSDictionary *opts){ return callPtrNative(addrHex, args, opts); };
+
+            // ---- V2.4.21 变参修复（callPtr 缺陷报告）----
+            //   callVariadic：变参函数（syscall/printf 族）真·ABI 上栈调用，errno 透传；
+            //   syscallN：syscall 号段校验 + csops(45) 死亡名单拦截，越界不再 SIGSYS 自杀。
+            ctx[@"callVariadic"]=^(NSString *addrHex, NSArray *args, NSDictionary *opts){ return callVariadicNative(addrHex, args, opts); };
+            ctx[@"syscallN"]=^(JSValue *numVal, NSArray *args, NSDictionary *opts){ return syscallNNative(numVal, args, opts); };
 
             // ---- V2.2 保活状态（只读）：保活由 Autorun 监听开关驱动，JS 只能查不能改 ----
             ctx[@"keepAliveStatus"]=^{ return [[RYKeepAlive shared] statusLine]; };
