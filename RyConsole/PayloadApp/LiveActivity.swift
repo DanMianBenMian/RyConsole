@@ -41,6 +41,12 @@ final class RYLiveActivityManager {
     //      且高频 update 会被系统节流合并，越频繁越迟。
     //  方案：变更全部汇入 pushQ（串行）→ 推送单飞（inFlight + dirty 追赶，永远推最新
     //        快照）→ 计数类更新合并进 0.5s 窗口（避开系统节流）；提醒类绕过窗口立即推。
+    //
+    //  ★ V2.4.18 修复「保持 0 / 不实时」：原 doPush 在 `await a.update(content)` 抛异常时，
+    //    收账代码（pushInFlight=false + 追 dirty）被跳过 → pushInFlight 永久卡 true →
+    //    后续所有 push 提前返回、灵动岛再也不刷新，定格在最后一次值（多为 0）。
+    //    典型触发：首条连接在 Activity.request 刚返回、系统尚未就绪时 update 抛错即焊死。
+    //    修法：用 defer 无论如何都复位管道（见 doPush）。
     private let pushQ = DispatchQueue(label: "ry.liveactivity.push")
     private var pushInFlight = false             // 仅 pushQ 触碰
     private var pushDirty = false                // 仅 pushQ 触碰
@@ -86,11 +92,12 @@ final class RYLiveActivityManager {
         do {
             activity = try Activity.request(attributes: attrs, content: content, pushType: nil)
             NSLog("[LiveActivity] 已启动 id=%@", activity?.id ?? "-")
-            // 管线复位：start 的起算点也计为"刚推过"（首帧 content 已带全量状态）
+            // 管线复位：lastPushAt = 0 表示"本监听周期尚未推过" → 首条连接立即上屏，
+            // 不再等 0.5s 合并窗口（修首刷"慢半拍"）；其后连接才走合并窗口。
             pushQ.async { [weak self] in
                 self?.pushInFlight = false
                 self?.pushDirty = false
-                self?.lastPushAt = Date().timeIntervalSince1970
+                self?.lastPushAt = 0
             }
             return true
         } catch {
@@ -123,9 +130,10 @@ final class RYLiveActivityManager {
         doPush()
     }
 
-    // 计数类：走 0.5s 合并窗口
+    // 计数类：走 0.5s 合并窗口（首条连接因 lastPushAt==0 走立即推送分支）
     private func pushCount() {
         if pushInFlight { pushDirty = true; return }
+        if lastPushAt == 0 { doPush(); return }      // 首推：立即上屏，不等窗口
         let delta = Date().timeIntervalSince1970 - lastPushAt
         if delta < Self.coalesceWindow {
             pushInFlight = true           // 占住管道，窗口到点推最新快照
@@ -143,11 +151,19 @@ final class RYLiveActivityManager {
         guard let a = activity else { pushInFlight = false; return }
         let content = makeContent()
         Task { [weak self] in
-            await a.update(content)
-            guard let self else { return }
-            self.pushQ.async {                       // 推完回队列收账，追 dirty
-                self.pushInFlight = false
-                if self.pushDirty { self.pushDirty = false; self.pushCount() }
+            // ★ V2.4.18：defer 保证无论 a.update 成功/抛错都复位管道，
+            //   杜绝"一次异常 → pushInFlight 永久卡 true → 灵动岛焊死在 0"的死锁。
+            defer {
+                self?.pushQ.async {
+                    guard let self else { return }
+                    self.pushInFlight = false
+                    if self.pushDirty { self.pushDirty = false; self.pushCount() }
+                }
+            }
+            do {
+                try await a.update(content)
+            } catch {
+                NSLog("[LiveActivity] update 失败（已忽略，管道继续）: %@", "\(error)")
             }
         }
     }
