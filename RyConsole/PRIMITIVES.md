@@ -2,7 +2,7 @@
 
 > 由 `main.m` 的 `installPrimitives(ctx)` 注册，JS 侧**直接当全局函数调用**。
 > 每次执行都是**全新 JSContext**（原语会重新注册），所以跨轮次状态必须落盘（见 §6 文件 IO）。
-> 共 **69 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 8 个 JS 桥库文件。
+> 共 **70 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 8 个 JS 桥库文件。
 >
 > | 批次 | 新增 |
 > |---|---|
@@ -426,7 +426,8 @@ JSON.stringify(callPtr(c.addr, [{ buf: 1024 }]));  // value=缓冲地址, out.bu
 
 | 原语 | 签名 | 说明 |
 |---|---|---|
-| `envState` | `() → JSON` | 环境快照：`{clean, uid, euid, gid, egid, pid, groups[], groupCount, ip, interfaces[], net, hasNetwork, serverRunning, sharedMapCount, batchUsed, batchActive, slotNonZero, reasons[]}`。`clean = 共享字典空 && 无竞态批次 && 原子槽全零`；脏时 `reasons` 逐条给原因。★ **V2.4.15 起「服务端运行中」不算污染**（它是工作台不是残留） |
+| `envState` | `() → JSON` | 环境快照：`{clean, uid, euid, gid, egid, pid, groups[], groupCount, login, ip, interfaces[], net, hasNetwork, serverRunning, sharedMapCount, batchUsed, batchActive, slotNonZero, reasons[]}`。`clean = 共享字典空 && 无竞态批次 && 原子槽全零`；脏时 `reasons` 逐条给原因。★ **V2.4.15 起「服务端运行中」不算污染**（它是工作台不是残留）。V2.4.18 起加 `login` 字段 |
+| **`envCred`** ★ | `() → JSON` | **V2.4.18 新增**。专给 AI/脚本一键查进程凭据：`{uid, euid, gid, egid, groupCount, groups[], login}`。**uid/euid 拆开报是故意的实时 LPE 金丝雀**——真提权时 `uid→0`（或 `uid` 仍 501 但 `euid→0` 的分歧 = 只抬了 effective 的半吊子提权）；返回**原始数值**（501 这类绝不替换成名字丢掉），`login:"mobile"` 只作提示。⚠️ iOS 上 `uid=0 ≠ 完全控制`：AMFI entitlement 是独立于 UID 的另一道门，要确认越狱还需另查 entitlement 层 |
 | `envReset` | `([stopServer]) → JSON` | **原地复位**：清 `gSharedMap`、16 个 `gRaceSlots` 归零、`gRaceStop` 归零、回收全部 `gBatches`（销毁闸 mutex/cond、清零 done/guarded/taken、置空 results）。★ **V2.4.15 起默认不停服务端**（监听是工作台，重置只清残留，**电脑端连接不断**）；传 `true` 才调 `RYAutorunStop()`。返回 `{ok, recycledBatches, sharedMapCleared, slotsZeroed, serverStopped, serverKeptRunning, serverWasRunning, serverStop, note?}` |
 | `envIP` | `() → [{if, family, ip, kind}]` | `getifaddrs` 枚举全部接口 IPv4/IPv6；`family` = `inet`/`inet6`，`kind` = `wifi`/`hotspot`/`cellular`/`vpn`/`other` |
 | **`envNet`** | `() → JSON` | ★ **分类端点**：`{wifi?, hotspot?, cellular?, hasAny, all[]}`，各类形如 `{if, kind, ip}`。**没有的那一类不出现**（没连 Wi-Fi 就无 `wifi` 键，没开蜂窝就无 `cellular` 键）；`hasAny:false` = 网都没有 |
