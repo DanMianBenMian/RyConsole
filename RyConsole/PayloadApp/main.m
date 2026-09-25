@@ -1387,8 +1387,13 @@ static NSString *callPtrCommon(NSString *addrHex, NSArray *args, NSDictionary *o
     return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\"%@}", (unsigned long long)r, variadicExtra];
 }
 
+// ★ V2.4.22：callPtr 现在也走变参通道（与 callVariadic/syscallN 同一条 ryVariadicCall）。
+//   原因：安全测试 Agent 只认文档里的「FFI 入口 = callPtr」，而 2.4.21 仍把它留在固定原型
+//   分支（variadic=NO），变参函数（syscall 等）≥1 实参依旧静默假 EINVAL → 反馈「FFI 没变」。
+//   现在 callPtr ≡ callVariadic：固定原型函数与变参函数走同一 ABI 上栈路径（arm64 ≤7 实参
+//   两路径寄存器布局一致，无副作用），文档入口统一修复，不依赖调用方改用新名字。
 static NSString *callPtrNative(NSString *addrHex, NSArray *args, NSDictionary *opts) {
-    return callPtrCommon(addrHex, args, opts, NO);
+    return callPtrCommon(addrHex, args, opts, YES);
 }
 
 // ★ V2.4.21 callVariadic：变参函数调用入口（syscall/printf 族）。
