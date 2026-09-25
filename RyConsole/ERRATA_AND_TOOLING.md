@@ -1,6 +1,6 @@
 # 勘误与桥工具（安全测试交接）
 
-更新时间 **2026-09-25** ｜ 对应发布 **V2.4.20**（Release tag `RyConsole-iPad-v2420`）
+更新时间 **2026-09-25** ｜ 对应发布 **V2.4.21**（Release tag `RyConsole-iPad-v2421`）
 
 ---
 
@@ -110,6 +110,7 @@ crashGuardSet(0)     // 关掉 → 恢复"真崩"（需要真崩时用，跑完 
 
 | IPA | 关键内容 |
 |---|---|
+| **V2.4.21** | ★ **callPtr 变参缺陷修复 + syscall 加固（报告 `output/ryconsole_2420_callptr_variadic_defect_report.md`）**。缺陷：`callPtr` 用固定原型分发 → 实参全走寄存器，而 arm64 ABI 变参函数**未命名实参必须上栈** → `syscall` ≥1 实参**静默返回假 EINVAL/ENOENT**（0 实参正常；A/B 对照非变参直调 msync/getattrlist/proc_pidinfo 全成功，§2）。修复：`callPtrCommon` 加 `variadic` 分支走 `(uintptr_t(*)(uintptr_t,...))` **真变参原型**（clang 自动上栈，无 libffi/汇编）。新增 2 原语：① `callVariadic(addrHex,args,opts)`——第 0 实参=命名参数，返回 -1 附 **errno 透传**（当场分清 EINVAL/EPERM），`{buf:}` 槽加回传 **`bufAddrN`**（sysctl oldlenp 场景必需，加法不破坏旧探针）；② `syscallN(number,args,opts)`——**号段校验**（`sysctl kern.nsysent`，读不到退 512）+ **csops(45) 死亡名单默认拦截**（`{allowDead:true}` 放行）→ 27B2 越界号 SIGSYS 杀进程改为受控报错。真机验收：报告 §5 msync A/B 应同为 0x0；`syscallN(202,…)` 失败时看 errno（P1 errno 定性）。|
 | **V2.4.20** | ★ **Tier 3 原生 Mach 竞态桥（RACE_plan_v2 §3）**。解锁此前被 `bridge_iokit` 用户态 `ryConnProblem` 体检封死的 `ipc_port`/`vm_map` 内核竞态面。新增 9 个原生原语（`main.m:486-538`）：`portAlloc/portInsertRight/portDealloc/portDestroy/portModRefs/portType`（mach_port 生命周期）+ `vmAlloc/vmDealloc`（vm_map 并发）+ `iokitCallPort`（**跳过 `ryConnProblem` 体检直发 `IOConnectCallMethod`**，打通 Tier 1 内核竞态——使用侧拿已 `iokitClose` 的 conn 数字强行发内核调用，绕开封装层）。返回值统一数字/对象，贴合已探明的桥形态铁律（worker 顶层禁 `return`、回传用 `raceSharedSet`、`threadJoin(timeoutMs, batchId)` 必须传 batchId）。配套探针 `race_probe_port.js`/`race_probe_vm.js` 已写（`ryconsole_probes/`），侧载后真机跑。⚠️ Mach/vm UAF 可能触发 kernel panic（设备重启），探针 `ITERS` 已保守（800），真命中再降 iters 复现并抓 `guardAddr`+`lastPrim`。|
 | **V2.4.19** | ★ **envReset 回归修复（JSC 桥转换坑）**。① 无参 `envReset()` 在真机竟停了服务端（违背 V2.4.15「默认不停服务端」）—— 根因 = JS 调 ObjC 原语不传参时 `undefined` 被 JSC 转成 `NSNumber`（非零/NaN），`[stopServer boolValue]` 返回 YES → 当成要停。**已修注册点**（main.m:1947）改用 `JSValue *` 参数 + 显式判 `isUndefined/isNull` 才默认 `NO`；`envReset(true/false)` 仍按调用方意图。② 通用坑：所有声明 `NSNumber*/BOOL` 形参的原语，无参调用都会踩同样的 undefined→非零 NSNumber，统一用 `JSValue` 参数 + 判空兜底。③ 本次仅此修复 + 版本号 2.4.19/50；liveHits 修复与 `envCred` 已在 V2.4.18 落地。|
 | **V2.4.18** | ★ **新增 `envCred()` 身份原语 + 修复 liveHits 灵动岛焊接 Bug**。① **`envCred()`**：`() → {uid,euid,gid,egid,groupCount,groups[],login}`——专给 AI/脚本一键查进程凭据，**uid/euid 拆开报**是故意做成**实时 LPE 金丝雀**（见下★）：真提权时 uid→0（或 uid 仍 501 但 euid→0 的分歧 = 只抬了 effective 的半吊子提权），是链打穿凭据层的铁证。返回值是**原始数值**（501 这类绝不替换成名字丢掉），`login:"mobile"` 只是顺手提示。② **`envState()` 也补 `login` 字段**。③ ★ **liveHits 修复（V2.4.4 重做）**：`LiveActivity.swift` 的 `doPush()` 原本 `await a.update()` 抛错后收账代码被跳过 → `pushInFlight` 永久 `true` → 灵动岛焊死在 0、连接数不实时。**`defer` 兜底**后无论成功/抛错都复位管道并追 dirty，管道不再卡死；`start` 复位把 `lastPushAt` 设 0 → 首条连接立即上屏不再等 0.5s 合并窗口。④ **构建脚本 `build_ui.py` 推送清单修复**：旧清单只列 7 个文件，**漏推 `LiveActivity.swift`/`RyListenAttributes.swift`/`Widget` 等全部 Swift + 其余 .m/.h**，导致云构建用仓库旧版、修复白做；改为**完整遍历 `PayloadApp`/`RyConsoleScripts`/`tools`**（SKIP_DIRS 排除 `AppIcon.xcassets` 等纯资源）。|
