@@ -1944,7 +1944,13 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             // ★ V2.4.18：凭据原语（专查 uid/euid/gid/egid/所在组，原始数值保留）
             ctx[@"envCred"]       = ^{ return RYCredJSON(); };
             // ★ V2.4.15：默认**不停服务端**（半自动工作流不该被重置打断）；要停就 envReset(true)
-            ctx[@"envReset"]      = ^(NSNumber *stopServer){ return RYResetEnvironment([stopServer boolValue]); };
+            // ★ V2.4.18 修复回归：JSC 把无参 undefined 转成 NSNumber(非零/NaN)→boolValue=YES，
+            //   导致 envReset() 无参反而停了服务端（违背 V2.4.15 设计）。改用 JSValue 参数，
+            //   显式判 undefined/null 才默认 NO；envReset(true)/envReset(false) 仍按调用方意图。
+            ctx[@"envReset"]      = ^(JSValue *stopServer){
+                BOOL stop = (stopServer && ![stopServer isUndefined] && ![stopServer isNull]) ? [stopServer toBool] : NO;
+                return RYResetEnvironment(stop);
+            };
             ctx[@"envIP"]         = ^{ return RYInterfaceIPsJSON(); };
             ctx[@"envNet"]        = ^{ return RYNetworkEndpointsJSON(); };
             ctx[@"envServerStart"]= ^NSString*(NSNumber *port){
