@@ -2,7 +2,7 @@
 
 > 由 `main.m` 的 `installPrimitives(ctx)` 注册，JS 侧**直接当全局函数调用**。
 > 每次执行都是**全新 JSContext**（原语会重新注册），所以跨轮次状态必须落盘（见 §6 文件 IO）。
-> 共 **70 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 8 个 JS 桥库文件。
+> 共 **79 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 8 个 JS 桥库文件。
 >
 > | 批次 | 新增 |
 > |---|---|
@@ -434,6 +434,26 @@ JSON.stringify(callPtr(c.addr, [{ buf: 1024 }]));  // value=缓冲地址, out.bu
 | `envServerStart` | `(port) → JSON` | 起服务并回 `{ok, port, ip, urls[]}`；`urls` **按类各一条** `{kind, if, ip, url}`。**`hasAny=false` 时直接返 `{ok:false, error:"无可用网络…"}` 且不启动监听** |
 | `envServerStop` | `() → string` | 停服务 |
 | `envServerStatus` | `() → JSON` | 同 `/ping`（`running`/`port`/`lanIP`/`endpoints`…） |
+
+## Tier 3 原生 Mach 竞态桥（V2.4.20 · RACE_plan_v2 §3）
+
+> 绕过 `bridge_iokit` 的 `ryConnProblem` 用户态体检，直打内核 `ipc_port` / `vm_map` 竞态。
+> 仅操作本进程自 alloc 的 port/vm，不会误伤系统 key port；竞态本身即研究目标（沙盒可达）。
+> 返回约定：数字类返 `long`（负 kr=失败，0 需结合语义判断）；`iokitCallPort` 返对象（同 `iokitCall` 形态）。
+
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| `portAlloc` | `() → number` | `mach_port_allocate(RECEIVE)` 分配接收权，返 port name（>0 成功；负 = kr 失败） |
+| `portInsertRight` | `(name) → number` | `mach_port_insert_right(MAKE_SEND)` 给自己注入 send right（name 既是接收又是发送） |
+| `portDealloc` | `(name) → number` | `mach_port_deallocate` 减一次引用（最后引用释放 → 内核 `ipc_port` 析构） |
+| `portDestroy` | `(name) → number` | `mach_port_destroy` 彻底销毁端口（撤销所有 right，制造「已释放端口」） |
+| `portModRefs` | `(name, right, delta) → number` | `mach_port_mod_refs` 改引用计数（right=`MACH_PORT_RIGHT_*`；delta=`+1/-1`）。经典 UAF 构造：减到 0 释放，另一线程仍持 send right 名 → 双击释放 / use-after-free |
+| `portType` | `(name) → number` | `mach_port_type` 查端口类型（>0 = live；0/负 = 已释放或 dead name），验证竞态结果用 |
+| `vmAlloc` | `(size) → number` | `vm_allocate(VM_FLAGS_ANYWHERE)` 返地址（>0 成功；0 = 失败） |
+| `vmDealloc` | `(addr, size) → number` | `vm_deallocate` 释放映射（kr） |
+| **`iokitCallPort`** ★ | `(conn, sel, inputs) → obj` | **打通 Tier 1**：直接对 port name（含已 `iokitClose` 的 conn）发 `IOConnectCallMethod`，**跳过 `ryConnProblem` 体检**。返 `{ret, ok, outputs, inCount}`（同 `iokitCall`）。使用侧拿已释放 conn 强行发内核 → 内核 `ipc_port` 已释放仍被解引用 → UAF |
+
+**配套探针**：`ryconsole_probes/race_probe_port.js`（ipc_port / IOKit 生命周期 UAF）、`race_probe_vm.js`（vm_map 双击释放）。⚠️ 真 UAF 可能 kernel panic（设备重启），`ITERS` 已保守。
 
 **主地址的选取优先级**（`RYReachableIP()`，原名 `RYHotspotIP()`；排除 `127.*`、`awdl*`、`lo*`）：
 `en0` / `en1`（Wi-Fi）→ `bridge100`（个人热点）→ `pdp_ip0` / `ipsec0`（蜂窝）→ 其它非回环接口兜底。
