@@ -2,7 +2,7 @@
 
 > 由 `main.m` 的 `installPrimitives(ctx)` 注册，JS 侧**直接当全局函数调用**。
 > 每次执行都是**全新 JSContext**（原语会重新注册），所以跨轮次状态必须落盘（见 §6 文件 IO）。
-> 共 **79 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 8 个 JS 桥库文件。
+> 共 **81 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 8 个 JS 桥库文件。
 >
 > | 批次 | 新增 |
 > |---|---|
@@ -11,6 +11,8 @@
 > | V2.2 | `objc_msgSendSafe`（结构化错误 + 参数上限）、`memRead`（映射内存 dump）、`keepAliveStatus` / `keepAliveInfo`、`liveActivityStatus` |
 > | V2.2.4 | **Bug6 自解释错误**：失败一律给「参数名 + 合法范围」；`iokitMapTry`、`krWhy/machKrWhy`、`primHelp/primErrors/primMissing`（详见「通用约定 → 错误约定」） |
 > | **V2.3.0** | **`callPtr`（C 函数指针调用/FFI）**——补齐 dlopen/dlsym 之后最后一环；规格见 `RYCONSOLE_CALLPTR_SPEC.md`（§14 有完整说明） |
+> | **V2.4.20** | **Tier 3 原生 Mach 竞态桥 9 桥**（`portAlloc/portInsertRight/portDealloc/portDestroy/portModRefs/portType` + `vmAlloc/vmDealloc` + `iokitCallPort`）+ `envCred` |
+> | **V2.4.21** | **变参 FFI 修复**：`callVariadic`（真·ABI 上栈 + errno 透传）、`syscallN`（号段校验 + csops 死亡名单）；`callPtr` 输出加 `bufAddr*`（详见 §15.5） |
 
 ## 通用约定
 
@@ -419,6 +421,30 @@ JSON.stringify([callPtr(b.addr,['abc','abc']), callPtr(b.addr,['abc','abd'])]); 
 var c = dlsymAddr(0, 'getcwd');
 JSON.stringify(callPtr(c.addr, [{ buf: 1024 }]));  // value=缓冲地址, out.buf0=base64(工作目录)
 ```
+
+### 15.5 callVariadic / syscallN —— 变参 FFI（V2.4.21）★ 修 2.4.20 缺陷
+
+> **缺陷（2.4.20 实测，报告 `ryconsole_2420_callptr_variadic_defect_report.md`）**：`callPtr` 用**固定原型**调用 →
+> 实参全走寄存器 x0-x7；但 arm64 ABI 变参函数的**未命名实参必须上栈**，libc `syscall()` 用 `va_arg` 从栈读 →
+> **0 实参正常、≥1 实参静默返回假 EINVAL/ENOENT**（不崩不报错，极具迷惑性——A/B 对照：同参数非变参直调 `msync`/`getattrlist`/`proc_pidinfo` 全部成功）。
+> **修法**：经真变参函数指针类型 `(uintptr_t(*)(uintptr_t,...))` 调用，clang 自动按 ABI 上栈（无 libffi/汇编）。
+
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| **`callVariadic`** | `(addrHex, args?, opts?) → {ok, value, variadic:true, ret?, errno?, out?, error?}` | 变参函数调用入口。**约定：第 0 个实参 = 命名参数**（`syscall` 的 number / `printf` 的 fmt），其余全部按未命名上栈。打包规则与 `callPtr` 完全同源（含 `{buf:}`/`{str:}`）。返回 -1 时附 `errno`（**当场分清 EINVAL/EPERM/ENOENT，不再有假错误码**）。`out` 同时回传 `bufN`（base64 内容）与 `bufAddrN`（缓冲地址——sysctl `oldlenp` 这类"内核往里写、JS 还要知道地址"的场景必需） |
+| **`syscallN`** | `(number, args?, opts?) → {ok, value, errno?, syscallNo, error?, nsysent?}` | **受控 syscall 入口**（等价 `syscall(number, ...args)` 但带闸门）：① 号段校验 `0 ≤ number < nsysent`（注册时 `sysctl kern.nsysent`，读不到退 512）——27B2 越界号内核**直接 SIGSYS 杀进程**（不返 ENOSYS），现在受控报错；② **死亡名单 {45:csops}**（2.4.20 实测调用即死）默认拦截，`opts {allowDead:true}` 显式放行；③ 走同一变参通道，实参真正上栈。实参只收 数字 / `"0x.."` / `{hex:"0x.."}` |
+
+```js
+// A/B 验收（缺陷报告 §5）：变参路径与非变参直调结果必须一致
+var h = dlopenFW('libSystem.B.dylib').h;
+var page = valhex(callPtr(dlsymAddr(h,'mmap').addr, [null, 4096, 3, 0x1002, -1, 0]).value);
+callPtr(dlsymAddr(h,'msync').addr, [{hex:page}, 4096, 1]);          // 非变参：0x0
+callVariadic(dlsymAddr(h,'syscall').addr, [74, {hex:page}, 4096, 1]); // 期望也 0x0（2.4.20 时为假 EINVAL）
+// sysctl 真实 errno（补 P1"errno 定性"）：mib = {1,2}? kern.osproductversion 走 sysctlGet 对照
+syscallN(202, [mibHex, 2, bufHex, lenPtrHex, 0, 0]);  // 失败时看 errno：EPERM=沙盒真拒
+```
+
+**红线不变**：只支持整型/指针返回；变参只适配"第 0 个命名参数"形态（syscall/printf 族）。
 
 ## 16. 环境与网络（V2.4.13 新增 / V2.4.14 改端点分类）★
 
