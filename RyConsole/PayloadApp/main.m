@@ -1754,6 +1754,29 @@ NSString *RYEnvironmentStateJSON(void) {
     return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{\"clean\":false}";
 }
 
+// ---- V2.4.18 新增：凭据原语 envCred —— 专供 AI/脚本快速检查当前身份 ----
+//   返回 uid/euid/gid/egid/groupCount/groups（原始数值全部保留，如 501 等平台常量不丢）
+NSString *RYCredJSON(void) {
+    uid_t uid = getuid(), euid = geteuid();
+    gid_t gid = getgid(), egid = getegid();
+    gid_t groups[16]; int ng = getgroups(16, groups);
+    if (ng < 0) ng = 0;
+    NSMutableArray *garr = [NSMutableArray array];
+    for (int gi = 0; gi < ng; gi++) [garr addObject:@(groups[gi])];
+    // 人话提示：iOS 越狱/自签 AppStore 外 App 通常跑在 mobile(501)；其它 UID 原样回显数值
+    NSString *login = (uid == 501) ? @"mobile" : [NSString stringWithFormat:@"uid_%d", (int)uid];
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"uid"] = @(uid);
+    d[@"euid"] = @(euid);
+    d[@"gid"] = @(gid);
+    d[@"egid"] = @(egid);
+    d[@"groupCount"] = @(ng);
+    d[@"groups"] = garr;
+    d[@"login"] = login;
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
+    return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{}";
+}
+
 // 重置环境：清共享字典、归零原子槽、回收竞态批次 —— 避免重启 RyConsole。
 // ★ V2.4.15 设计修正：**默认不停服务端**（stopServer=NO）。
 //   监听进程是「工作台」：电脑端连着它干活；旧实现无条件 RYAutorunStop() 会一并掐断连接，
@@ -1918,6 +1941,8 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
 
             // ---- V2.4.13 环境 / 网络原语 ----
             ctx[@"envState"]      = ^{ return RYEnvironmentStateJSON(); };
+            // ★ V2.4.18：凭据原语（专查 uid/euid/gid/egid/所在组，原始数值保留）
+            ctx[@"envCred"]       = ^{ return RYCredJSON(); };
             // ★ V2.4.15：默认**不停服务端**（半自动工作流不该被重置打断）；要停就 envReset(true)
             ctx[@"envReset"]      = ^(NSNumber *stopServer){ return RYResetEnvironment([stopServer boolValue]); };
             ctx[@"envIP"]         = ^{ return RYInterfaceIPsJSON(); };
