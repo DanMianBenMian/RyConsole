@@ -1353,9 +1353,11 @@ static NSString *callPtrCommon(NSString *addrHex, NSArray *args, NSDictionary *o
         return [NSString stringWithFormat:@"{\"ok\":false,\"error\":\"[callPtr exception] %@\"}", reason];
     }
 
-    // ★ V2.4.21 变参路径：errno 紧跟调用捕获（同线程语义；后面任何 libc 调用都可能污染它）
+    // ★ V2.4.23：errno 紧跟调用捕获（同线程语义；后面任何 libc 调用都可能污染它）。
+    //   固定元数（callPtr）与变参（callVariadic/syscallN）路径失败统一附 errno，满足
+    //   bugreport_callptr_multarg_2423 验收（kill 坏 pid 须回 errno=3 ESRCH）。
     int callErrno = 0;
-    if (variadic && r == (uintptr_t)-1) callErrno = errno;
+    if (r == (uintptr_t)-1) callErrno = errno;
 
     // 回传 {buf:} 缓冲内容（base64）。key 用「出现顺序」序号 buf0/buf1…，与参数槽位无关，
     // 方便后续脚本按固定 key 解析（第 k 个缓冲恒为 out.bufK）。
@@ -1375,10 +1377,9 @@ static NSString *callPtrCommon(NSString *addrHex, NSArray *args, NSDictionary *o
     for (NSValue *bv in inbufs) free([bv pointerValue]);
 
     NSString *variadicExtra = @"";
-    if (variadic) {
-        variadicExtra = (r == (uintptr_t)-1)
-            ? [NSString stringWithFormat:@",\"variadic\":true,\"ret\":-1,\"errno\":%d", callErrno]
-            : @",\"variadic\":true";
+    if (variadic) variadicExtra = @",\"variadic\":true";
+    if (r == (uintptr_t)-1) {
+        variadicExtra = [variadicExtra stringByAppendingFormat:@",\"ret\":-1,\"errno\":%d", callErrno];
     }
     if (outs.length) {
         return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\"%@,\"out\":{%@}}",
@@ -1387,13 +1388,17 @@ static NSString *callPtrCommon(NSString *addrHex, NSArray *args, NSDictionary *o
     return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\"%@}", (unsigned long long)r, variadicExtra];
 }
 
-// ★ V2.4.22：callPtr 现在也走变参通道（与 callVariadic/syscallN 同一条 ryVariadicCall）。
-//   原因：安全测试 Agent 只认文档里的「FFI 入口 = callPtr」，而 2.4.21 仍把它留在固定原型
-//   分支（variadic=NO），变参函数（syscall 等）≥1 实参依旧静默假 EINVAL → 反馈「FFI 没变」。
-//   现在 callPtr ≡ callVariadic：固定原型函数与变参函数走同一 ABI 上栈路径（arm64 ≤7 实参
-//   两路径寄存器布局一致，无副作用），文档入口统一修复，不依赖调用方改用新名字。
+// ★ V2.4.23 回归修复：callPtr 恢复到固定元数寄存器传参路径（variadic=NO）。
+//   2.4.22 把 callPtr 并入 ryVariadicCall 变参通道后，固定元数 libc 符号
+//   （memset/kill/mmap/proc_pidinfo/getattrlist 等）的 x1–x7 实参在真机错位为垃圾，
+//   多参调用整条失效（证据见 bugreport_callptr_multarg_2423.md：kill(14056,0) 与
+//   kill(999999,0) 返回逐字节相同 → x1 未送达）。
+//   结论：arm64 下固定元数目标应按 AAPCS 从 x0–x7 取参，不应走 va_list 上栈路径。
+//   现分工：callPtr ≡ 固定元数入口（覆盖 95% 用例，含 syscall：其 number 在 x0、其余在
+//   x1–x7，同样只需正确填 x0–x7）；真正需 va_list 的变参目标（printf 等）走 callVariadic，
+//   受控 syscall 走 syscallN。失败统一附 errno。
 static NSString *callPtrNative(NSString *addrHex, NSArray *args, NSDictionary *opts) {
-    return callPtrCommon(addrHex, args, opts, YES);
+    return callPtrCommon(addrHex, args, opts, NO);
 }
 
 // ★ V2.4.21 callVariadic：变参函数调用入口（syscall/printf 族）。
