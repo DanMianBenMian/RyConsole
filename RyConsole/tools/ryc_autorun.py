@@ -199,8 +199,11 @@ def cmd_run(args):
         return 1
 
     jid = sub.get("id")
-    interval = (sub.get("pollIntervalMs") or int(POLL_INTERVAL * 1000)) / 1000.0
-    max_polls = sub.get("maxPolls") or MAX_POLLS
+    # 优先级：CLI --interval/--max-polls > 服务端建议值 > 内置默认
+    interval = args.interval if getattr(args, "interval", None) else (
+        (sub.get("pollIntervalMs") or int(POLL_INTERVAL * 1000)) / 1000.0)
+    max_polls = args.max_polls if getattr(args, "max_polls", None) else (
+        sub.get("maxPolls") or MAX_POLLS)
 
     if not args.quiet and not args.json:
         print("已提交 id=%s，开始轮询（每 %.0fs，最多 %d 次）..." % (jid, interval, max_polls))
@@ -277,6 +280,11 @@ def main():
     ap.add_argument("--timeout-ms", type=int, default=15000, help="eval 的执行超时（毫秒）")
     ap.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     ap.add_argument("--quiet", action="store_true", help="不打印轮询过程")
+    # ★ 2026-09-25：自定义轮询（run 用）。给了就覆盖服务端建议值。
+    ap.add_argument("--interval", type=float, default=None,
+                    help="run 的轮询间隔秒数（默认取服务端 pollIntervalMs，再退 3s）")
+    ap.add_argument("--max-polls", type=int, default=None,
+                    help="run 的最大轮询次数（默认取服务端 maxPolls，再退 12）；长探针调大，如 --max-polls 100")
     args = ap.parse_args()
 
     handlers = {"ping": cmd_ping, "eval": cmd_eval, "submit": cmd_submit,
