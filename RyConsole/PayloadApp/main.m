@@ -2032,6 +2032,7 @@ static JSContext *g_rmtCtx = nil;
 static dispatch_queue_t g_rmtQueue = nil;
 static NSString *g_rmtCurId = nil;   // 正在执行的 push_js id（异常回传要用）
 static NSString *g_rmtState = @"idle";
+static NSString *g_rmtLastError = nil;  // 最近一次断开原因（build57 回传 UI）
 
 static NSString *rmtNormalizeURL(NSString *in) {
     NSString *u = [in stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -2060,6 +2061,7 @@ static void rmtTeardown(NSString *reason) {
     if (g_rmtTask) { [g_rmtTask cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil]; g_rmtTask = nil; }
     g_rmtCtx = nil;
     g_rmtState = @"idle";
+    if (reason.length) g_rmtLastError = [reason copy];   // 断开原因回传给 UI（build57）
     NSLog(@"[remote] teardown: %@", reason);
 }
 
@@ -2139,6 +2141,7 @@ static NSString *rmtStart(NSString *baseURL, NSString *token) {
     if (!url) { g_rmtCtx = nil; return @"{\"ok\":false,\"error\":\"ws url 构造失败\"}"; }
     g_rmtTask = [g_rmtSession webSocketTaskWithURL:url];
     g_rmtState = @"connecting";
+    g_rmtLastError = nil;
     [g_rmtTask resume];
     rmtSend(@{@"type": @"auth", @"token": token ?: @""});
     rmtReceive();
@@ -2150,7 +2153,10 @@ static NSString *rmtStart(NSString *baseURL, NSString *token) {
 
 static NSString *rmtStatus(void) {
     NSUInteger n = g_rmtCtx ? 1 : 0;
-    return [NSString stringWithFormat:@"{\"state\":\"%@\",\"ctx\":%@}", g_rmtState, n ? @"true" : @"false"];
+    NSDictionary *d = @{@"state": g_rmtState, @"ctx": @(n != 0), @"lastError": g_rmtLastError ?: @""};
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
+    return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding]
+              : [NSString stringWithFormat:@"{\"state\":\"%@\",\"ctx\":%@,\"lastError\":\"\"}", g_rmtState, n ? @"true" : @"false"];
 }
 
 // V2.4.24：跨文件导出 —— MainShell 的 RYRemotePane（Autorun 页内「远程」分页）调用
