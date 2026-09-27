@@ -368,9 +368,23 @@ extern NSString *RYRemoteStatus(void);
     }
     id o = [NSJSONSerialization JSONObjectWithData:[s dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
     NSString *state = [o isKindOfClass:[NSDictionary class]] ? (NSString *)((NSDictionary *)o[@"state"] ?: @"?") : @"?";
+    NSString *lastErr = [o isKindOfClass:[NSDictionary class]] ? ((NSDictionary *)o[@"lastError"] ?: @"") : @"";
+
+    // V2.4.24 build57：按钮状态与真实状态强同步（自动断开后不再残留「断开」）
+    NSString *want = [state isEqualToString:@"idle"] ? @"连接" : @"断开";
+    if (![self.connBtn.currentTitle isEqualToString:want]) {
+        [self.connBtn setTitle:want forState:UIControlStateNormal];
+        [self appendLog:[NSString stringWithFormat:@"[local] 已自动断开（%@）", lastErr.length ? lastErr : state]];
+    }
+
     if ([state isEqualToString:@"idle"]) {
-        self.statusLabel.text = @"状态：未连接";
-        self.statusLabel.textColor = RY_MUTED;
+        if (lastErr.length) {
+            self.statusLabel.text = [NSString stringWithFormat:@"断开：%@", lastErr];
+            self.statusLabel.textColor = RY_RED;
+        } else {
+            self.statusLabel.text = @"状态：未连接";
+            self.statusLabel.textColor = RY_MUTED;
+        }
     } else if ([state isEqualToString:@"connected"]) {
         self.statusLabel.text = @"状态：已连接 ✓";
         self.statusLabel.textColor = RY_GREEN;
