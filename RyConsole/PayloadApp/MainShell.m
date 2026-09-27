@@ -298,7 +298,7 @@ extern NSString *RYRemoteStatus(void);
         self.tokField.secureTextEntry = YES;
         self.tokField.backgroundColor = RY_PANEL2;
         self.tokField.textColor = RY_TEXT;
-        [self.addSubview:self.tokField];
+        [self addSubview:self.tokField];
 
         NSString *sa = [[NSUserDefaults standardUserDefaults] stringForKey:@"ryc_remote_addr"];
         NSString *st = [[NSUserDefaults standardUserDefaults] stringForKey:@"ryc_remote_token"];
