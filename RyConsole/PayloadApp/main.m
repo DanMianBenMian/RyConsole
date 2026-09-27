@@ -2052,7 +2052,7 @@ static void rmtSend(NSDictionary *dict) {
     if (!t) return;
     NSData *jd = [NSJSONSerialization dataWithJSONObject:dict options:0 error:NULL];
     if (!jd) return;
-    [t sendMessage:[[NSURLSessionMessage alloc] initWithData:jd]
+    [t sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithData:jd]
                  completionHandler:^(NSError *err) { if (err) NSLog(@"[remote] send err: %@", err); }];
 }
 
@@ -2137,7 +2137,7 @@ static NSString *rmtStart(NSString *baseURL, NSString *token) {
     g_rmtSession = [NSURLSession sessionWithConfiguration:cfg];
     NSURL *url = [NSURL URLWithString:urlStr];
     if (!url) { g_rmtCtx = nil; return @"{\"ok\":false,\"error\":\"ws url 构造失败\"}"; }
-    g_rmtTask = [g_rmtSession WebSocketTaskWithURL:url];
+    g_rmtTask = [g_rmtSession webSocketTaskWithURL:url];
     g_rmtState = @"connecting";
     [g_rmtTask resume];
     rmtSend(@{@"type": @"auth", @"token": token ?: @""});
