@@ -2019,6 +2019,140 @@ NSString *RYResetEnvironment(BOOL stopServer) {
     return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{\"ok\":true}";
 }
 
+#pragma mark - 远程连接（Remote Device Mode · V2.4.24）
+// iPad 主动出站连 RyConsoleServer（<base>/ws/device），收 push_js 在专用 JSContext 执行、流式回传。
+// 设计要点：
+//  - JSContext 非线程安全 → 专用串行队列 g_rmtQueue 跑所有 eval；WS 回调统一派发过去
+//  - ctx 生命周期与连接绑定，断开即销毁
+//  - print()/console.* 转为 {"type":"log"} 流式回传；每个 push_js 回 {"type":"result"}
+//  - 免真后台保活：App 退后台连接会断（iOS 限制），前台使用场景不受影响
+static NSURLSession *g_rmtSession = nil;
+static NSURLSessionWebSocketTask *g_rmtTask = nil;
+static JSContext *g_rmtCtx = nil;
+static dispatch_queue_t g_rmtQueue = nil;
+static NSString *g_rmtCurId = nil;   // 正在执行的 push_js id（异常回传要用）
+static NSString *g_rmtState = @"idle";
+
+static NSString *rmtNormalizeURL(NSString *in) {
+    NSString *u = [in stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (u.length == 0) return nil;
+    if (![u hasPrefix:@"http://"] && ![u hasPrefix:@"https://"]) u = [@"https://" stringByAppendingString:u];
+    NSURL *pu = [NSURL URLWithString:u];
+    if (!pu || !pu.host) return nil;
+    NSString *scheme = [pu.scheme.lowercaseString isEqualToString:@"https"] ? @"wss" : @"ws";
+    NSString *auth = [NSString stringWithFormat:@"%@://%@", scheme, pu.host];
+    if (pu.port) auth = [auth stringByAppendingFormat:@":%@", [pu.port stringValue]];
+    NSString *path = (pu.path.length > 1) ? pu.path : @"";
+    while ([path hasSuffix:@"/"]) path = [path substringToIndex:path.length - 1];
+    return [auth stringByAppendingString:[path stringByAppendingString:@"/ws/device"]];
+}
+
+static void rmtSend(NSDictionary *dict) {
+    NSURLSessionWebSocketTask *t = g_rmtTask;
+    if (!t) return;
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:dict options:0 error:NULL];
+    if (!jd) return;
+    [t sendMessage:[[NSURLSessionMessage alloc] initWithData:jd]
+                 completionHandler:^(NSError *err) { if (err) NSLog(@"[remote] send err: %@", err); }];
+}
+
+static void rmtTeardown(NSString *reason) {
+    if (g_rmtTask) { [g_rmtTask cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil]; g_rmtTask = nil; }
+    g_rmtCtx = nil;
+    g_rmtState = @"idle";
+    NSLog(@"[remote] teardown: %@", reason);
+}
+
+static NSString *rmtStop(void) {
+    BOOL was = ![g_rmtState isEqualToString:@"idle"];
+    rmtTeardown(@"user stop");
+    return [NSString stringWithFormat:@"{\"ok\":true,\"wasConnected\":%@}", was ? @"true" : @"false"];
+}
+
+static void rmtReceive(void);
+static void rmtReceive(void) {
+    NSURLSessionWebSocketTask *t = g_rmtTask;
+    if (!t) return;
+    [t receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *msg, NSError *err) {
+        if (!g_rmtTask) return;                       // 已被主动断开
+        if (err || !msg) { rmtTeardown(err.localizedDescription ?: @"closed"); return; }
+        NSString *text = (msg.type == NSURLSessionWebSocketMessageTypeString) ? msg.string
+                         : [[NSString alloc] initWithData:msg.data encoding:NSUTF8StringEncoding];
+        if (text.length) {
+            NSData *jd = [text dataUsingEncoding:NSUTF8StringEncoding];
+            NSDictionary *m = [NSJSONSerialization JSONObjectWithData:jd options:0 error:NULL];
+            if ([m isKindOfClass:[NSDictionary class]] && [m[@"type"] isEqualToString:@"push_js"]) {
+                NSString *pid = [NSString stringWithFormat:@"%@", m[@"id"] ?: @""];
+                NSString *code = [NSString stringWithFormat:@"%@", m[@"code"] ?: @""];
+                dispatch_async(g_rmtQueue, ^{
+                    if (!g_rmtCtx) return;
+                    g_rmtCurId = pid;
+                    JSValue *res = [g_rmtCtx evaluateScript:code];
+                    NSString *out;
+                    BOOL ok = (g_rmtCtx.exception == nil);
+                    if (!ok) {
+                        out = [NSString stringWithFormat:@"[JS Error] %@", [g_rmtCtx.exception description]];
+                        g_rmtCtx.exception = nil;   // 已随 result 回传，清掉防累积
+                    } else {
+                        out = (res && ![res isUndefined]) ? [res description] : @"(undefined)";
+                    }
+                    if (out.length > 65536) out = [[out substringToIndex:65536] stringByAppendingString:@"\n...[truncated 64KB]"];
+                    rmtSend(@{@"type": @"result", @"id": pid, @"ok": @(ok), @"output": out});
+                    g_rmtCurId = nil;
+                });
+            }
+        }
+        rmtReceive();                                  // 重新挂接收循环
+    }];
+}
+
+static NSString *rmtStart(NSString *baseURL, NSString *token) {
+    if (g_rmtTask) rmtStop();
+    NSString *urlStr = rmtNormalizeURL(baseURL);
+    if (!urlStr) return @"{\"ok\":false,\"error\":\"地址无法解析\"}";
+    if (!g_rmtQueue) g_rmtQueue = dispatch_queue_create("ryc.remote.js", DISPATCH_QUEUE_SERIAL);
+
+    // 专用 JSContext：print/console 流式回传；全套原语 + 桥库 + engine
+    g_rmtCtx = [[JSContext alloc] init];
+    g_rmtCtx.name = @"ryc-remote";
+    g_rmtCtx.exceptionHandler = ^(JSContext *c, JSValue *e) {
+        NSString *out = [NSString stringWithFormat:@"[JS Error] %@", [e description]];
+        if (g_rmtCurId) rmtSend(@{@"type": @"result", @"id": g_rmtCurId, @"ok": @NO, @"output": out});
+        c.exception = nil;
+    };
+    g_rmtCtx[@"print"] = ^(id arg) {
+        NSMutableArray *parts = [NSMutableArray array];
+        if ([arg isKindOfClass:[NSArray class]]) { for (id a in arg) [parts addObject:[a description]]; }
+        else if (arg != nil && ![arg isEqual:[NSNull null]]) { [parts addObject:[arg description]]; }
+        rmtSend(@{@"type": @"log", @"text": [parts componentsJoinedByString:@" "]});
+    };
+    [g_rmtCtx evaluateScript:@"var console={log:function(){print.apply(null,arguments);},error:function(){print.apply(null,arguments);},info:function(){print.apply(null,arguments);},warn:function(){print.apply(null,arguments);}};"];
+    installPrimitives(g_rmtCtx);
+    loadBridgeFiles(g_rmtCtx);
+    NSString *eng = loadEngineSource();
+    if (eng && [eng length]) [g_rmtCtx evaluateScript:eng];
+
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    cfg.timeoutIntervalForRequest = 20;
+    g_rmtSession = [NSURLSession sessionWithConfiguration:cfg];
+    NSURL *url = [NSURL URLWithString:urlStr];
+    if (!url) { g_rmtCtx = nil; return @"{\"ok\":false,\"error\":\"ws url 构造失败\"}"; }
+    g_rmtTask = [g_rmtSession WebSocketTaskWithURL:url];
+    g_rmtState = @"connecting";
+    [g_rmtTask resume];
+    rmtSend(@{@"type": @"auth", @"token": token ?: @""});
+    rmtReceive();
+
+    NSDictionary *st = @{@"ok": @YES, @"url": urlStr, @"state": g_rmtState};
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:st options:0 error:NULL];
+    return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{\"ok\":true}";
+}
+
+static NSString *rmtStatus(void) {
+    NSUInteger n = g_rmtCtx ? 1 : 0;
+    return [NSString stringWithFormat:@"{\"state\":\"%@\",\"ctx\":%@}", g_rmtState, n ? @"true" : @"false"];
+}
+
 static void installPrimitives(JSContext *ctx) {
 ctx[@"runCommand"]=^NSString*(NSString *cmd){
                 FILE *fp=popen([cmd UTF8String],"r");
@@ -2072,6 +2206,10 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"canOpenURL"]=^(NSString *scheme){ return canOpenURLStr(scheme); };
             ctx[@"openURL"]=^(NSString *url){ return openURLStr(url); };
             ctx[@"installIPA"]=^(NSString *url){ return installIPANative(url); };
+            // 远程连接（V2.4.24）：iPad 主动出站连 RyConsoleServer
+            ctx[@"remoteConnect"]    = ^(NSString *baseURL, NSString *token){ return rmtStart(baseURL, token); };
+            ctx[@"remoteDisconnect"] = ^NSString*(void){ return rmtStop(); };
+            ctx[@"remoteStatus"]     = ^NSString*(void){ return rmtStatus(); };
             ctx[@"getPasteboard"]=^NSString*{ return getPasteboardStr(); };
             ctx[@"setPasteboard"]=^(NSString *s){ return setPasteboardStr(s); };
             ctx[@"appInfo"]=^NSString*{ return appInfoStr(); };
@@ -3524,12 +3662,116 @@ void RYResourceManagerRefresh(UIViewController *vc) {
 - (void)alert:(NSString *)msg { UIAlertController *a = [UIAlertController alertControllerWithTitle:nil message:msg preferredStyle:UIAlertControllerStyleAlert]; [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]]; [self presentViewController:a animated:YES completion:nil]; }
 @end
 
+// ---- 远程连接（RyConsoleServer 主机端；iPad 主动出站，外出也能遥控家里电脑）----
+@interface RemoteVC : UIViewController
+@property (nonatomic, strong) UITextField *addrField;
+@property (nonatomic, strong) UITextField *tokField;
+@property (nonatomic, strong) UITextView *logView;
+@property (nonatomic, strong) UIButton *connBtn;
+@property (nonatomic, strong) NSTimer *statusTimer;
+@end
+@implementation RemoteVC
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    self.title = @"远程连接";
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(close)];
+    UILabel *l1 = [[UILabel alloc] init]; l1.translatesAutoresizingMaskIntoConstraints = NO; l1.text = @"服务端地址"; l1.font = [UIFont systemFontOfSize:14];
+    _addrField = [[UITextField alloc] init]; _addrField.translatesAutoresizingMaskIntoConstraints = NO;
+    _addrField.borderStyle = UITextBorderStyleRoundedRect; _addrField.font = [UIFont systemFontOfSize:14];
+    _addrField.placeholder = @"https://xxxx.trycloudflare.com 或 http://192.168.x.x:8765";
+    _addrField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    _addrField.autocorrectionType = UITextAutocorrectionTypeNo;
+    _addrField.keyboardType = UIKeyboardTypeURL;
+    UILabel *l2 = [[UILabel alloc] init]; l2.translatesAutoresizingMaskIntoConstraints = NO; l2.text = @"访问口令 token"; l2.font = [UIFont systemFontOfSize:14];
+    _tokField = [[UITextField alloc] init]; _tokField.translatesAutoresizingMaskIntoConstraints = NO;
+    _tokField.borderStyle = UITextBorderStyleRoundedRect; _tokField.font = [UIFont systemFontOfSize:13];
+    _tokField.placeholder = @"server config.json 里的 token";
+    _tokField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    _tokField.autocorrectionType = UITextAutocorrectionTypeNo;
+    NSString *sa = [[NSUserDefaults standardUserDefaults] stringForKey:@"ryc_remote_addr"];
+    NSString *st = [[NSUserDefaults standardUserDefaults] stringForKey:@"ryc_remote_token"];
+    if (sa.length) _addrField.text = sa;
+    if (st.length) _tokField.text = st;
+    _connBtn = [UIButton buttonWithType:UIButtonTypeSystem]; _connBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [_connBtn setTitle:@"连接" forState:UIControlStateNormal]; _connBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    [_connBtn setBackgroundColor:[UIColor systemGreenColor]]; [_connBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _connBtn.layer.cornerRadius = 10; [_connBtn addTarget:self action:@selector(onToggle) forControlEvents:UIControlEventTouchUpInside];
+    _logView = [[UITextView alloc] init]; _logView.translatesAutoresizingMaskIntoConstraints = NO;
+    _logView.editable = NO; _logView.font = [UIFont fontWithName:@"Menlo" size:11] ?: [UIFont systemFontOfSize:11];
+    _logView.backgroundColor = [UIColor secondarySystemBackgroundColor]; _logView.layer.cornerRadius = 8;
+    _logView.text = @"iPad 主动出站连接电脑端 RyConsoleServer。\n地址每次重启服务可能变化（quick tunnel）。\n";
+    [self.view addSubview:l1]; [self.view addSubview:_addrField]; [self.view addSubview:l2];
+    [self.view addSubview:_tokField]; [self.view addSubview:_connBtn]; [self.view addSubview:_logView];
+    [NSLayoutConstraint activateConstraints:@[
+        [l1.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:16],
+        [l1.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [_addrField.topAnchor constraintEqualToAnchor:l1.bottomAnchor constant:8],
+        [_addrField.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [_addrField.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+        [l2.topAnchor constraintEqualToAnchor:_addrField.bottomAnchor constant:14],
+        [l2.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [_tokField.topAnchor constraintEqualToAnchor:l2.bottomAnchor constant:8],
+        [_tokField.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [_tokField.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+        [_connBtn.topAnchor constraintEqualToAnchor:_tokField.bottomAnchor constant:16],
+        [_connBtn.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [_connBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+        [_connBtn.heightAnchor constraintEqualToConstant:46],
+        [_logView.topAnchor constraintEqualToAnchor:_connBtn.bottomAnchor constant:12],
+        [_logView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [_logView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+        [_logView.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
+    ]];
+    _statusTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *_) {
+        if (self->_logView.superview == nil) return;
+        static NSString *last = nil;
+        NSString *s = rmtStatus();
+        if (![s isEqualToString:last ?: @""]) {
+            last = [s copy];
+            [self appendLog:[NSString stringWithFormat:@"[status] %@", s]];
+        }
+    }];
+}
+- (void)appendLog:(NSString *)line {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self->_logView.text = [self->_logView.text stringByAppendingString:[line stringByAppendingString:@"\n"]];
+        NSRange r = NSMakeRange(self->_logView.text.length, 0);
+        [self->_logView scrollRangeToVisible:r];
+    });
+}
+- (void)onToggle {
+    [self.view endEditing:YES];
+    if (![g_rmtState isEqualToString:@"idle"]) {
+        rmtStop();
+        [_connBtn setTitle:@"连接" forState:UIControlStateNormal];
+        [_connBtn setBackgroundColor:[UIColor systemGreenColor]];
+        [self appendLog:@"[local] 已断开"];
+        return;
+    }
+    NSString *addr = [_addrField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *tok = [_tokField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (addr.length == 0) { [self alert:@"请输入服务端地址"]; return; }
+    if (tok.length == 0) { [self alert:@"请输入访问口令 token"]; return; }
+    [[NSUserDefaults standardUserDefaults] setObject:addr forKey:@"ryc_remote_addr"];
+    [[NSUserDefaults standardUserDefaults] setObject:tok forKey:@"ryc_remote_token"];
+    [_connBtn setTitle:@"断开" forState:UIControlStateNormal];
+    [_connBtn setBackgroundColor:[UIColor systemRedColor]];
+    NSString *res = rmtStart(addr, tok);
+    [self appendLog:[NSString stringWithFormat:@"[local] %@", res]];
+    [self appendLog:@"[local] 若 10 秒后状态仍非 connected/online，检查地址与 token（服务端日志也会显示设备上线）"];
+}
+- (void)close { [_statusTimer invalidate]; [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)alert:(NSString *)msg { UIAlertController *a = [UIAlertController alertControllerWithTitle:nil message:msg preferredStyle:UIAlertControllerStyleAlert]; [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]]; [self presentViewController:a animated:YES completion:nil]; }
+@end
+
 // ---- 主控制台（代码框 + 执行 + 资源管理器 + LocalSend）----
 @interface InputVC : UIViewController
 @property (nonatomic, strong) UITextView *codeInput;
 @property (nonatomic, strong) UIButton *execBtn;
 @property (nonatomic, strong) UIButton *rmBtn;
 @property (nonatomic, strong) UIButton *lsBtn;
+@property (nonatomic, strong) UIButton *rcBtn;
 @property (nonatomic, assign) BOOL engineChecked;
 @end
 @implementation InputVC
@@ -3556,6 +3798,11 @@ void RYResourceManagerRefresh(UIViewController *vc) {
     [_lsBtn setBackgroundColor:[UIColor systemIndigoColor]]; [_lsBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     _lsBtn.layer.cornerRadius = 10; [_lsBtn addTarget:self action:@selector(openLocalSend) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_lsBtn];
+    _rcBtn = [UIButton buttonWithType:UIButtonTypeSystem]; _rcBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [_rcBtn setTitle:@"远程" forState:UIControlStateNormal]; _rcBtn.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    [_rcBtn setBackgroundColor:[UIColor systemTealColor]]; [_rcBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _rcBtn.layer.cornerRadius = 10; [_rcBtn addTarget:self action:@selector(openRemote) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_rcBtn];
     [NSLayoutConstraint activateConstraints:@[
         [_codeInput.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:12],
         [_codeInput.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
@@ -3566,16 +3813,27 @@ void RYResourceManagerRefresh(UIViewController *vc) {
         [_rmBtn.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
         [_rmBtn.heightAnchor constraintEqualToConstant:48],
         [_lsBtn.leadingAnchor constraintEqualToAnchor:_rmBtn.trailingAnchor constant:6],
-        [_lsBtn.trailingAnchor constraintEqualToAnchor:_execBtn.leadingAnchor constant:-6],
+        [_lsBtn.trailingAnchor constraintEqualToAnchor:_rcBtn.leadingAnchor constant:-6],
         [_lsBtn.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
         [_lsBtn.heightAnchor constraintEqualToConstant:48],
-        [_execBtn.leadingAnchor constraintEqualToAnchor:_lsBtn.trailingAnchor constant:6],
+        [_rcBtn.leadingAnchor constraintEqualToAnchor:_lsBtn.trailingAnchor constant:6],
+        [_rcBtn.trailingAnchor constraintEqualToAnchor:_execBtn.leadingAnchor constant:-6],
+        [_rcBtn.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
+        [_rcBtn.heightAnchor constraintEqualToConstant:48],
+        [_execBtn.leadingAnchor constraintEqualToAnchor:_rcBtn.trailingAnchor constant:6],
         [_execBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
         [_execBtn.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
         [_execBtn.heightAnchor constraintEqualToConstant:48],
         [_rmBtn.widthAnchor constraintEqualToAnchor:_lsBtn.widthAnchor],
-        [_lsBtn.widthAnchor constraintEqualToAnchor:_execBtn.widthAnchor],
+        [_lsBtn.widthAnchor constraintEqualToAnchor:_rcBtn.widthAnchor],
+        [_rcBtn.widthAnchor constraintEqualToAnchor:_execBtn.widthAnchor],
     ]];
+}
+- (void)openRemote {
+    RemoteVC *r = [[RemoteVC alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:r];
+    nav.modalPresentationStyle = UIModalPresentationFormSheet;
+    [self presentViewController:nav animated:YES completion:nil];
 }
 - (void)onExec { _execBtn.enabled = NO; [_execBtn setTitle:@"执行中…" forState:UIControlStateNormal]; RunCode(self, _codeInput.text); [self performSelector:@selector(reEnable) withObject:nil afterDelay:0.6]; }
 - (void)reEnable { _execBtn.enabled = YES; [_execBtn setTitle:@"执行" forState:UIControlStateNormal]; }
