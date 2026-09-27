@@ -2034,6 +2034,10 @@ static NSString *g_rmtCurId = nil;   // 正在执行的 push_js id（异常回�
 static NSString *g_rmtState = @"idle";
 static NSString *g_rmtLastError = nil;  // 最近一次断开原因（build57 回传 UI）
 static NSString *g_rmtToken = nil;      // didOpen 后才发 auth（build58：握手完成前不发不收）
+static NSInteger g_rmtGen = 0;          // 会话代际：stop/teardown 时自增，作废悬空重试与旧回调
+static NSInteger g_rmtAttempt = 0;      // 当前会话内的连接尝试次数
+static const NSInteger g_rmtAttemptMax = 3;  // 握手失败最多重试次数（iPadOS beta didOpen 误触）
+static NSString *g_rmtURL = nil;        // 重试用的归一化地址
 
 static NSString *rmtNormalizeURL(NSString *in) {
     NSString *u = [in stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -2059,6 +2063,7 @@ static void rmtSend(NSDictionary *dict) {
 }
 
 static void rmtTeardown(NSString *reason) {
+    g_rmtGen++;   // 作废本会话悬空的重试/旧回调
     if (g_rmtTask) { [g_rmtTask cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil]; g_rmtTask = nil; }
     g_rmtCtx = nil;
     g_rmtState = @"idle";
@@ -2072,37 +2077,54 @@ static NSString *rmtStop(void) {
     return [NSString stringWithFormat:@"{\"ok\":true,\"wasConnected\":%@}", was ? @"true" : @"false"];
 }
 
+static void rmtFailWhileConnecting(NSString *reason, NSInteger gen);
+static void rmtConnectOnce(NSInteger gen);
 static void rmtReceive(void);
 static void rmtReceive(void) {
     NSURLSessionWebSocketTask *t = g_rmtTask;
     if (!t) return;
     [t receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *msg, NSError *err) {
-        if (!g_rmtTask) return;                       // 已被主动断开
-        if (err || !msg) { rmtTeardown(err.localizedDescription ?: @"closed"); return; }
+        if (t != g_rmtTask) return;                   // 已是新会话/重试，丢弃旧回调（防 beta 串台）
+        if (err || !msg) {
+            // 未收到 welcome 就出错 = 握手实际未完成（iPadOS beta didOpen 误触）→ 触发重试
+            if ([g_rmtState isEqualToString:@"connected"])
+                rmtTeardown(err.localizedDescription ?: @"closed");
+            else
+                rmtFailWhileConnecting(err.localizedDescription ?: @"closed", g_rmtGen);
+            return;
+        }
         NSString *text = (msg.type == NSURLSessionWebSocketMessageTypeString) ? msg.string
                          : [[NSString alloc] initWithData:msg.data encoding:NSUTF8StringEncoding];
         if (text.length) {
             NSData *jd = [text dataUsingEncoding:NSUTF8StringEncoding];
             NSDictionary *m = [NSJSONSerialization JSONObjectWithData:jd options:0 error:NULL];
-            if ([m isKindOfClass:[NSDictionary class]] && [m[@"type"] isEqualToString:@"push_js"]) {
-                NSString *pid = [NSString stringWithFormat:@"%@", m[@"id"] ?: @""];
-                NSString *code = [NSString stringWithFormat:@"%@", m[@"code"] ?: @""];
-                dispatch_async(g_rmtQueue, ^{
-                    if (!g_rmtCtx) return;
-                    g_rmtCurId = pid;
-                    JSValue *res = [g_rmtCtx evaluateScript:code];
-                    NSString *out;
-                    BOOL ok = (g_rmtCtx.exception == nil);
-                    if (!ok) {
-                        out = [NSString stringWithFormat:@"[JS Error] %@", [g_rmtCtx.exception description]];
-                        g_rmtCtx.exception = nil;   // 已随 result 回传，清掉防累积
-                    } else {
-                        out = (res && ![res isUndefined]) ? [res description] : @"(undefined)";
-                    }
-                    if (out.length > 65536) out = [[out substringToIndex:65536] stringByAppendingString:@"\n...[truncated 64KB]"];
-                    rmtSend(@{@"type": @"result", @"id": pid, @"ok": @(ok), @"output": out});
-                    g_rmtCurId = nil;
-                });
+            if ([m isKindOfClass:[NSDictionary class]]) {
+                NSString *mt = m[@"type"];
+                if ([mt isEqualToString:@"welcome"]) {
+                    // ★ 真·连上：必须收到服务端 welcome，而非依赖 didOpen（build59 修正 beta 误触）
+                    g_rmtState = @"connected";
+                    g_rmtLastError = @"";
+                    NSLog(@"[remote] server welcome received -> connected");
+                } else if ([mt isEqualToString:@"push_js"]) {
+                    NSString *pid = [NSString stringWithFormat:@"%@", m[@"id"] ?: @""];
+                    NSString *code = [NSString stringWithFormat:@"%@", m[@"code"] ?: @""];
+                    dispatch_async(g_rmtQueue, ^{
+                        if (!g_rmtCtx) return;
+                        g_rmtCurId = pid;
+                        JSValue *res = [g_rmtCtx evaluateScript:code];
+                        NSString *out;
+                        BOOL ok = (g_rmtCtx.exception == nil);
+                        if (!ok) {
+                            out = [NSString stringWithFormat:@"[JS Error] %@", [g_rmtCtx.exception description]];
+                            g_rmtCtx.exception = nil;   // 已随 result 回传，清掉防累积
+                        } else {
+                            out = (res && ![res isUndefined]) ? [res description] : @"(undefined)";
+                        }
+                        if (out.length > 65536) out = [[out substringToIndex:65536] stringByAppendingString:@"\n...[truncated 64KB]"];
+                        rmtSend(@{@"type": @"result", @"id": pid, @"ok": @(ok), @"output": out});
+                        g_rmtCurId = nil;
+                    });
+                }
             }
         }
         rmtReceive();                                  // 重新挂接收循环
@@ -2117,8 +2139,7 @@ static void rmtReceive(void) {
 - (void)URLSession:(NSURLSession *)session webSocketTask:(NSURLSessionWebSocketTask *)task
 didOpenWithProtocol:(NSString *)protocol {
     if (task != g_rmtTask) return;
-    NSLog(@"[remote] handshake done (didOpen), sending auth");
-    g_rmtState = @"connected";
+    NSLog(@"[remote] didOpen (handshake may be premature on iOS27b); sending auth, wait for welcome");
     rmtSend(@{@"type": @"auth", @"token": g_rmtToken ?: @""});
     rmtReceive();
 }
@@ -2131,17 +2152,43 @@ didCloseWithCode:(NSURLSessionWebSocketCloseCode)code reason:(NSData *)reason {
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
 didCompleteWithError:(NSError *)error {
     if (task != g_rmtTask || !error) return;   // 正常关闭/主动取消时 g_rmtTask 已置 nil
-    rmtTeardown(error.localizedDescription ?: @"连接失败");
+    if ([g_rmtState isEqualToString:@"connected"])
+        rmtTeardown(error.localizedDescription ?: @"连接已断开");
+    else
+        rmtFailWhileConnecting(error.localizedDescription ?: @"连接失败", g_rmtGen);
 }
 @end
 static RYRemoteWSDelegate *g_rmtWSDelegate = nil;
 
-static NSString *rmtStart(NSString *baseURL, NSString *token) {
-    if (g_rmtTask) rmtStop();
-    NSString *urlStr = rmtNormalizeURL(baseURL);
-    if (!urlStr) return @"{\"ok\":false,\"error\":\"地址无法解析\"}";
-    if (!g_rmtQueue) g_rmtQueue = dispatch_queue_create("ryc.remote.js", DISPATCH_QUEUE_SERIAL);
+static void rmtScheduleRetry(NSInteger gen) {
+    if (gen != g_rmtGen) return;
+    if (g_rmtAttempt >= g_rmtAttemptMax) {
+        rmtTeardown(@"连接失败：已重试多次仍未完成握手（检查地址/网络/system 版本）");
+        return;
+    }
+    g_rmtLastError = [NSString stringWithFormat:@"握手失败，1.5 秒后重试（第 %ld/%ld 次）",
+                      (long)g_rmtAttempt, (long)g_rmtAttemptMax];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)1500 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        if (gen == g_rmtGen && [g_rmtState isEqualToString:@"connecting"])
+            rmtConnectOnce(gen);
+    });
+}
 
+static void rmtFailWhileConnecting(NSString *reason, NSInteger gen) {
+    if (gen != g_rmtGen) return;
+    if (g_rmtAttempt >= g_rmtAttemptMax) {
+        rmtTeardown([NSString stringWithFormat:@"%@（已重试 %ld 次）", reason, (long)g_rmtAttemptMax]);
+        return;
+    }
+    rmtScheduleRetry(gen);
+}
+
+// build59：单次连接尝试。每次重建 JSContext；连上与否以「收到服务端 welcome」为准（见 rmtReceive）。
+static void rmtConnectOnce(NSInteger gen) {
+    if (gen != g_rmtGen) return;
+    if (g_rmtTask) { [g_rmtTask cancel]; g_rmtTask = nil; }
+    g_rmtAttempt++;
     // 专用 JSContext：print/console 流式回传；全套原语 + 桥库 + engine
     g_rmtCtx = [[JSContext alloc] init];
     g_rmtCtx.name = @"ryc-remote";
@@ -2166,20 +2213,31 @@ static NSString *rmtStart(NSString *baseURL, NSString *token) {
     cfg.timeoutIntervalForRequest = 20;
     if (!g_rmtWSDelegate) g_rmtWSDelegate = [[RYRemoteWSDelegate alloc] init];
     g_rmtSession = [NSURLSession sessionWithConfiguration:cfg delegate:g_rmtWSDelegate delegateQueue:nil];
-    NSURL *url = [NSURL URLWithString:urlStr];
-    if (!url) { g_rmtCtx = nil; return @"{\"ok\":false,\"error\":\"ws url 构造失败\"}"; }
-    g_rmtToken = [token copy];
+    NSURL *url = [NSURL URLWithString:g_rmtURL];
+    if (!url) { g_rmtCtx = nil; return; }
     g_rmtTask = [g_rmtSession webSocketTaskWithURL:url];
     g_rmtState = @"connecting";
-    g_rmtLastError = nil;
+    g_rmtLastError = [NSString stringWithFormat:@"连接中（第 %ld/%ld 次尝试）",
+                      (long)g_rmtAttempt, (long)g_rmtAttemptMax];
     [g_rmtTask resume];
-    // auth + receive 全部延后到 didOpen（见 RYRemoteWSDelegate）；这里只挂握手超时兜底
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)15 * NSEC_PER_SEC),
+    // 每次尝试单独挂握手超时兜底（仅在仍 connecting 时生效；welcome 到达即转为 connected）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)12 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        if (g_rmtTask && [g_rmtState isEqualToString:@"connecting"])
-            rmtTeardown(@"连接超时：15 秒内 WSS 握手未完成（检查地址/网络后重试）");
+        if (gen == g_rmtGen && [g_rmtState isEqualToString:@"connecting"])
+            rmtFailWhileConnecting(@"连接超时：12 秒内未收到服务端 welcome", gen);
     });
+}
 
+static NSString *rmtStart(NSString *baseURL, NSString *token) {
+    if (g_rmtTask) rmtStop();
+    NSString *urlStr = rmtNormalizeURL(baseURL);
+    if (!urlStr) return @"{\"ok\":false,\"error\":\"地址无法解析\"}";
+    if (!g_rmtQueue) g_rmtQueue = dispatch_queue_create("ryc.remote.js", DISPATCH_QUEUE_SERIAL);
+    g_rmtGen++;                          // 作废旧会话的悬空回调/重试
+    g_rmtURL = [urlStr copy];
+    g_rmtToken = [token copy];
+    g_rmtAttempt = 0;
+    rmtConnectOnce(g_rmtGen);
     NSDictionary *st = @{@"ok": @YES, @"url": urlStr, @"state": g_rmtState};
     NSData *jd = [NSJSONSerialization dataWithJSONObject:st options:0 error:NULL];
     return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{\"ok\":true}";
