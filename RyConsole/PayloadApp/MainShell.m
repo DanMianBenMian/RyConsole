@@ -245,6 +245,171 @@ static void ryScrollToBottom(UITextView *tv) {
 
 #pragma mark - Autorun
 
+// ---- V2.4.24 远程连接分页（核心在 main.m rmt* 静态区，跨文件导出三个 C 函数）----
+extern NSString *RYRemoteStart(NSString *url, NSString *token);
+extern NSString *RYRemoteStop(void);
+extern NSString *RYRemoteStatus(void);
+
+@interface RYRemotePane : UIView
+@property (nonatomic, strong) UITextField *urlField;
+@property (nonatomic, strong) UITextField *tokField;
+@property (nonatomic, strong) UIButton *connBtn;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) UITextView *logView;
+@property (nonatomic, strong) NSTimer *timer;
+- (void)appendLog:(NSString *)line;
+- (void)pollStatus;
+@end
+
+@implementation RYRemotePane
+
+- (id)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = RY_BG;
+
+        UILabel *l1 = ryLabel(@"服务端地址", 11.0f, RY_MUTED, NO);
+        l1.tag = 9200;
+        [self addSubview:l1];
+
+        self.urlField = [[UITextField alloc] init];
+        self.urlField.tag = 9201;
+        self.urlField.borderStyle = UITextBorderStyleRoundedRect;
+        self.urlField.font = ryMono(11.0f);
+        self.urlField.placeholder = @"https://xxxx.trycloudflare.com 或 http://192.168.x.x:8765";
+        self.urlField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        self.urlField.autocorrectionType = UITextAutocorrectionTypeNo;
+        self.urlField.keyboardType = UIKeyboardTypeURL;
+        self.urlField.backgroundColor = RY_PANEL2;
+        self.urlField.textColor = RY_TEXT;
+        [self addSubview:self.urlField];
+
+        UILabel *l2 = ryLabel(@"访问口令 token", 11.0f, RY_MUTED, NO);
+        l2.tag = 9202;
+        [self addSubview:l2];
+
+        self.tokField = [[UITextField alloc] init];
+        self.tokField.tag = 9203;
+        self.tokField.borderStyle = UITextBorderStyleRoundedRect;
+        self.tokField.font = ryMono(11.0f);
+        self.tokField.placeholder = @"server config.json 里的 token";
+        self.tokField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        self.tokField.autocorrectionType = UITextAutocorrectionTypeNo;
+        self.tokField.secureTextEntry = YES;
+        self.tokField.backgroundColor = RY_PANEL2;
+        self.tokField.textColor = RY_TEXT;
+        [self.addSubview:self.tokField];
+
+        NSString *sa = [[NSUserDefaults standardUserDefaults] stringForKey:@"ryc_remote_addr"];
+        NSString *st = [[NSUserDefaults standardUserDefaults] stringForKey:@"ryc_remote_token"];
+        if (sa.length) self.urlField.text = sa;
+        if (st.length) self.tokField.text = st;
+
+        self.connBtn = ryButton(@"连接", self, @selector(onToggle));
+        self.connBtn.tag = 9204;
+        [self addSubview:self.connBtn];
+
+        self.statusLabel = ryLabel(@"状态：未连接", 11.0f, RY_MUTED, YES);
+        self.statusLabel.tag = 9205;
+        [self addSubview:self.statusLabel];
+
+        UIView *logPanel = ryPanel(self);
+        logPanel.tag = 9210;
+        UILabel *ll = ryLabel(@"连接日志", 11.0f, RY_MUTED, NO);
+        ll.tag = 9211;
+        [logPanel addSubview:ll];
+        self.logView = ryTextView(NO);
+        self.logView.tag = 9212;
+        self.logView.text = @"iPad 主动出站连接电脑端 RyConsoleServer。\n地址每次重启服务可能变化（quick tunnel）。\n";
+        [logPanel addSubview:self.logView];
+
+        __weak RYRemotePane *weakSelf = self;
+        self.timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+            [weakSelf pollStatus];
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
+    }
+    return self;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = self.bounds.size.width;
+    CGFloat h = self.bounds.size.height;
+
+    [[self viewWithTag:9200] setFrame:CGRectMake(10.0f, 6.0f, 140.0f, 14.0f)];
+    [[self viewWithTag:9201] setFrame:CGRectMake(kPad, 22.0f, w - kPad * 2, 30.0f)];
+    [[self viewWithTag:9202] setFrame:CGRectMake(10.0f, 58.0f, 140.0f, 14.0f)];
+    [[self viewWithTag:9203] setFrame:CGRectMake(kPad, 74.0f, w - kPad * 2, 30.0f)];
+    [[self viewWithTag:9204] setFrame:CGRectMake(kPad, 110.0f, 96.0f, 30.0f)];
+    [[self viewWithTag:9205] setFrame:CGRectMake(kPad + 104.0f, 117.0f, w - kPad * 2 - 104.0f, 16.0f)];
+
+    CGFloat ly = 148.0f;
+    UIView *logPanel = [self viewWithTag:9210];
+    logPanel.frame = CGRectMake(kPad, ly, w - kPad * 2, h - ly - kPad);
+    [[logPanel viewWithTag:9211] setFrame:CGRectMake(10.0f, 5.0f, 120.0f, 14.0f)];
+    [[logPanel viewWithTag:9212] setFrame:CGRectMake(8.0f, 22.0f, logPanel.bounds.size.width - 16.0f, logPanel.bounds.size.height - 30.0f)];
+}
+
+- (void)appendLog:(NSString *)line {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self->_logView.text = [self->_logView.text stringByAppendingString:[line stringByAppendingString:@"\n"]];
+        NSRange r = NSMakeRange(self->_logView.text.length, 0);
+        [self->_logView scrollRangeToVisible:r];
+    });
+}
+
+- (void)pollStatus {
+    NSString *s = RYRemoteStatus();
+    static NSString *last = nil;
+    if (![s isEqualToString:last ?: @""]) {
+        last = [s copy];
+        [self appendLog:[NSString stringWithFormat:@"[status] %@", s]];
+    }
+    id o = [NSJSONSerialization JSONObjectWithData:[s dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
+    NSString *state = [o isKindOfClass:[NSDictionary class]] ? (NSString *)((NSDictionary *)o[@"state"] ?: @"?") : @"?";
+    if ([state isEqualToString:@"idle"]) {
+        self.statusLabel.text = @"状态：未连接";
+        self.statusLabel.textColor = RY_MUTED;
+    } else if ([state isEqualToString:@"connected"]) {
+        self.statusLabel.text = @"状态：已连接 ✓";
+        self.statusLabel.textColor = RY_GREEN;
+    } else {
+        self.statusLabel.text = [NSString stringWithFormat:@"状态：%@…", state];
+        self.statusLabel.textColor = RY_AMBER;
+    }
+}
+
+- (void)onToggle {
+    [self.urlField resignFirstResponder];
+    [self.tokField resignFirstResponder];
+    NSString *s = RYRemoteStatus();
+    if (![s containsString:@"\"state\":\"idle\""]) {
+        RYRemoteStop();
+        [self.connBtn setTitle:@"连接" forState:UIControlStateNormal];
+        [self appendLog:@"[local] 已断开"];
+        return;
+    }
+    NSString *addr = [self.urlField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *tok = [self.tokField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (addr.length == 0) { [self alert:@"请输入服务端地址"]; return; }
+    if (tok.length == 0)  { [self alert:@"请输入访问口令 token"]; return; }
+    [[NSUserDefaults standardUserDefaults] setObject:addr forKey:@"ryc_remote_addr"];
+    [[NSUserDefaults standardUserDefaults] setObject:tok forKey:@"ryc_remote_token"];
+    [self.connBtn setTitle:@"断开" forState:UIControlStateNormal];
+    NSString *res = RYRemoteStart(addr, tok);
+    [self appendLog:[NSString stringWithFormat:@"[local] %@", res]];
+    [self appendLog:@"[local] 若 10 秒后状态仍非 connected，检查地址与 token（服务端日志会显示设备上线）"];
+}
+
+- (void)alert:(NSString *)msg {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:nil message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [RYTopVCForPresent() presentViewController:a animated:YES completion:nil];
+}
+
+@end
+
 @interface RYAutorunPane : UIView
 @property (nonatomic, strong) UILabel *dot;
 @property (nonatomic, strong) UILabel *statusLabel;
@@ -254,6 +419,8 @@ static void ryScrollToBottom(UITextView *tv) {
 @property (nonatomic, strong) UITextView *codeView;
 @property (nonatomic, strong) UITextView *outView;
 @property (nonatomic, strong) UIButton *toggleBtn;
+@property (nonatomic, strong) UISegmentedControl *seg;      // V2.4.24：监听 | 远程 分页
+@property (nonatomic, strong) RYRemotePane *remotePane;
 - (void)refresh;
 - (void)copyPicked:(NSDictionary *)item;   // V2.4.17：弹窗选中后落到剪贴板
 @end
@@ -337,6 +504,21 @@ static void ryScrollToBottom(UITextView *tv) {
         self.outView.tag = 9133;
         [outPanel addSubview:self.outView];
 
+        // ---- V2.4.24：分页（监听 | 远程）—— 不加侧栏新栏目，Autorun 内部切页 ----
+        self.seg = [[UISegmentedControl alloc] initWithItems:@[@"监听", @"远程"]];
+        self.seg.translatesAutoresizingMaskIntoConstraints = NO;
+        self.seg.selectedSegmentIndex = 0;
+        [self.seg addTarget:self action:@selector(segChanged) forControlEvents:UIControlEventValueChanged];
+        self.seg.selectedSegmentTintColor = RY_ACCENT;
+        self.seg.backgroundColor = RY_PANEL;
+        [self.seg setTitleTextAttributes:@{NSForegroundColorAttributeName: RY_TEXT} forState:UIControlStateNormal];
+        [self.seg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor]} forState:UIControlStateSelected];
+        [self addSubview:self.seg];
+
+        self.remotePane = [[RYRemotePane alloc] init];
+        self.remotePane.hidden = YES;
+        [self addSubview:self.remotePane];
+
         __weak RYAutorunPane *weakSelf = self;
         RYAutorunObserve(^{ [weakSelf refresh]; });
         [self refresh];
@@ -350,8 +532,13 @@ static void ryScrollToBottom(UITextView *tv) {
     CGFloat h = self.bounds.size.height;
     BOOL compact = (w < 500.0f);   // iPhone 竖屏 / 紧凑宽度
 
+    // V2.4.24：顶部 seg 占一行，监听页整体下移；远程页覆盖 seg 以下区域
+    self.seg.frame = CGRectMake(kPad, 10.0f, w - kPad * 2, 32.0f);
+    CGFloat top = 10.0f + 32.0f + 8.0f;
+    self.remotePane.frame = CGRectMake(kPad, top, w - kPad * 2, h - top - kPad);
+
     UIView *strip = [self viewWithTag:9100];
-    strip.frame = CGRectMake(kPad, 10.0f, w - kPad * 2, 56.0f);
+    strip.frame = CGRectMake(kPad, top, w - kPad * 2, 56.0f);
     CGFloat sw = strip.bounds.size.width;
     [self.dot setFrame:CGRectMake(12.0f, 8.0f, 14.0f, 18.0f)];
     [self.pill setFrame:CGRectMake(sw - 12.0f - 78.0f, 8.0f, 78.0f, 19.0f)];
@@ -367,7 +554,7 @@ static void ryScrollToBottom(UITextView *tv) {
         [self.peerLabel setFrame:CGRectMake(12.0f, 31.0f, sw - 24.0f, 15.0f)];
     }
 
-    CGFloat ty = 10.0f + 56.0f + 8.0f;
+    CGFloat ty = top + 56.0f + 8.0f;
     [self.toggleBtn setFrame:CGRectMake(kPad, ty, 96.0f, 30.0f)];
     [[self viewWithTag:9111] setFrame:CGRectMake(kPad + 104.0f, ty, 60.0f, 30.0f)];
     [[self viewWithTag:9112] setFrame:CGRectMake(kPad + 172.0f, ty, 76.0f, 30.0f)];
@@ -399,6 +586,15 @@ static void ryScrollToBottom(UITextView *tv) {
         [outPath setFrame:CGRectMake(outPanel.bounds.size.width - 250.0f, 5.0f, 240.0f, 14.0f)];
     }
     [[outPanel viewWithTag:9133] setFrame:CGRectMake(8.0f, 22.0f, outPanel.bounds.size.width - 16.0f, outPanel.bounds.size.height - 30.0f)];
+}
+
+- (void)segChanged {
+    BOOL remote = (self.seg.selectedSegmentIndex == 1);
+    self.remotePane.hidden = !remote;
+    for (NSInteger t = 9100; t <= 9133; t++) {     // 监听页全部子视图（含面板内子项）
+        UIView *v = [self viewWithTag:t];
+        if (v) v.hidden = remote;
+    }
 }
 
 - (void)refresh {
