@@ -2153,6 +2153,11 @@ static NSString *rmtStatus(void) {
     return [NSString stringWithFormat:@"{\"state\":\"%@\",\"ctx\":%@}", g_rmtState, n ? @"true" : @"false"];
 }
 
+// V2.4.24：跨文件导出 —— MainShell 的 RYRemotePane（Autorun 页内「远程」分页）调用
+NSString *RYRemoteStart(NSString *url, NSString *token) { return rmtStart(url, token); }
+NSString *RYRemoteStop(void)  { return rmtStop(); }
+NSString *RYRemoteStatus(void){ return rmtStatus(); }
+
 static void installPrimitives(JSContext *ctx) {
 ctx[@"runCommand"]=^NSString*(NSString *cmd){
                 FILE *fp=popen([cmd UTF8String],"r");
@@ -3662,116 +3667,12 @@ void RYResourceManagerRefresh(UIViewController *vc) {
 - (void)alert:(NSString *)msg { UIAlertController *a = [UIAlertController alertControllerWithTitle:nil message:msg preferredStyle:UIAlertControllerStyleAlert]; [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]]; [self presentViewController:a animated:YES completion:nil]; }
 @end
 
-// ---- 远程连接（RyConsoleServer 主机端；iPad 主动出站，外出也能遥控家里电脑）----
-@interface RemoteVC : UIViewController
-@property (nonatomic, strong) UITextField *addrField;
-@property (nonatomic, strong) UITextField *tokField;
-@property (nonatomic, strong) UITextView *logView;
-@property (nonatomic, strong) UIButton *connBtn;
-@property (nonatomic, strong) NSTimer *statusTimer;
-@end
-@implementation RemoteVC
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
-    self.title = @"远程连接";
-    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(close)];
-    UILabel *l1 = [[UILabel alloc] init]; l1.translatesAutoresizingMaskIntoConstraints = NO; l1.text = @"服务端地址"; l1.font = [UIFont systemFontOfSize:14];
-    _addrField = [[UITextField alloc] init]; _addrField.translatesAutoresizingMaskIntoConstraints = NO;
-    _addrField.borderStyle = UITextBorderStyleRoundedRect; _addrField.font = [UIFont systemFontOfSize:14];
-    _addrField.placeholder = @"https://xxxx.trycloudflare.com 或 http://192.168.x.x:8765";
-    _addrField.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    _addrField.autocorrectionType = UITextAutocorrectionTypeNo;
-    _addrField.keyboardType = UIKeyboardTypeURL;
-    UILabel *l2 = [[UILabel alloc] init]; l2.translatesAutoresizingMaskIntoConstraints = NO; l2.text = @"访问口令 token"; l2.font = [UIFont systemFontOfSize:14];
-    _tokField = [[UITextField alloc] init]; _tokField.translatesAutoresizingMaskIntoConstraints = NO;
-    _tokField.borderStyle = UITextBorderStyleRoundedRect; _tokField.font = [UIFont systemFontOfSize:13];
-    _tokField.placeholder = @"server config.json 里的 token";
-    _tokField.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    _tokField.autocorrectionType = UITextAutocorrectionTypeNo;
-    NSString *sa = [[NSUserDefaults standardUserDefaults] stringForKey:@"ryc_remote_addr"];
-    NSString *st = [[NSUserDefaults standardUserDefaults] stringForKey:@"ryc_remote_token"];
-    if (sa.length) _addrField.text = sa;
-    if (st.length) _tokField.text = st;
-    _connBtn = [UIButton buttonWithType:UIButtonTypeSystem]; _connBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [_connBtn setTitle:@"连接" forState:UIControlStateNormal]; _connBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    [_connBtn setBackgroundColor:[UIColor systemGreenColor]]; [_connBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    _connBtn.layer.cornerRadius = 10; [_connBtn addTarget:self action:@selector(onToggle) forControlEvents:UIControlEventTouchUpInside];
-    _logView = [[UITextView alloc] init]; _logView.translatesAutoresizingMaskIntoConstraints = NO;
-    _logView.editable = NO; _logView.font = [UIFont fontWithName:@"Menlo" size:11] ?: [UIFont systemFontOfSize:11];
-    _logView.backgroundColor = [UIColor secondarySystemBackgroundColor]; _logView.layer.cornerRadius = 8;
-    _logView.text = @"iPad 主动出站连接电脑端 RyConsoleServer。\n地址每次重启服务可能变化（quick tunnel）。\n";
-    [self.view addSubview:l1]; [self.view addSubview:_addrField]; [self.view addSubview:l2];
-    [self.view addSubview:_tokField]; [self.view addSubview:_connBtn]; [self.view addSubview:_logView];
-    [NSLayoutConstraint activateConstraints:@[
-        [l1.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:16],
-        [l1.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
-        [_addrField.topAnchor constraintEqualToAnchor:l1.bottomAnchor constant:8],
-        [_addrField.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
-        [_addrField.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
-        [l2.topAnchor constraintEqualToAnchor:_addrField.bottomAnchor constant:14],
-        [l2.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
-        [_tokField.topAnchor constraintEqualToAnchor:l2.bottomAnchor constant:8],
-        [_tokField.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
-        [_tokField.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
-        [_connBtn.topAnchor constraintEqualToAnchor:_tokField.bottomAnchor constant:16],
-        [_connBtn.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
-        [_connBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
-        [_connBtn.heightAnchor constraintEqualToConstant:46],
-        [_logView.topAnchor constraintEqualToAnchor:_connBtn.bottomAnchor constant:12],
-        [_logView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
-        [_logView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
-        [_logView.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
-    ]];
-    _statusTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *_) {
-        if (self->_logView.superview == nil) return;
-        static NSString *last = nil;
-        NSString *s = rmtStatus();
-        if (![s isEqualToString:last ?: @""]) {
-            last = [s copy];
-            [self appendLog:[NSString stringWithFormat:@"[status] %@", s]];
-        }
-    }];
-}
-- (void)appendLog:(NSString *)line {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self->_logView.text = [self->_logView.text stringByAppendingString:[line stringByAppendingString:@"\n"]];
-        NSRange r = NSMakeRange(self->_logView.text.length, 0);
-        [self->_logView scrollRangeToVisible:r];
-    });
-}
-- (void)onToggle {
-    [self.view endEditing:YES];
-    if (![g_rmtState isEqualToString:@"idle"]) {
-        rmtStop();
-        [_connBtn setTitle:@"连接" forState:UIControlStateNormal];
-        [_connBtn setBackgroundColor:[UIColor systemGreenColor]];
-        [self appendLog:@"[local] 已断开"];
-        return;
-    }
-    NSString *addr = [_addrField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    NSString *tok = [_tokField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (addr.length == 0) { [self alert:@"请输入服务端地址"]; return; }
-    if (tok.length == 0) { [self alert:@"请输入访问口令 token"]; return; }
-    [[NSUserDefaults standardUserDefaults] setObject:addr forKey:@"ryc_remote_addr"];
-    [[NSUserDefaults standardUserDefaults] setObject:tok forKey:@"ryc_remote_token"];
-    [_connBtn setTitle:@"断开" forState:UIControlStateNormal];
-    [_connBtn setBackgroundColor:[UIColor systemRedColor]];
-    NSString *res = rmtStart(addr, tok);
-    [self appendLog:[NSString stringWithFormat:@"[local] %@", res]];
-    [self appendLog:@"[local] 若 10 秒后状态仍非 connected/online，检查地址与 token（服务端日志也会显示设备上线）"];
-}
-- (void)close { [_statusTimer invalidate]; [self dismissViewControllerAnimated:YES completion:nil]; }
-- (void)alert:(NSString *)msg { UIAlertController *a = [UIAlertController alertControllerWithTitle:nil message:msg preferredStyle:UIAlertControllerStyleAlert]; [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]]; [self presentViewController:a animated:YES completion:nil]; }
-@end
-
 // ---- 主控制台（代码框 + 执行 + 资源管理器 + LocalSend）----
 @interface InputVC : UIViewController
 @property (nonatomic, strong) UITextView *codeInput;
 @property (nonatomic, strong) UIButton *execBtn;
 @property (nonatomic, strong) UIButton *rmBtn;
 @property (nonatomic, strong) UIButton *lsBtn;
-@property (nonatomic, strong) UIButton *rcBtn;
 @property (nonatomic, assign) BOOL engineChecked;
 @end
 @implementation InputVC
@@ -3798,11 +3699,6 @@ void RYResourceManagerRefresh(UIViewController *vc) {
     [_lsBtn setBackgroundColor:[UIColor systemIndigoColor]]; [_lsBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     _lsBtn.layer.cornerRadius = 10; [_lsBtn addTarget:self action:@selector(openLocalSend) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_lsBtn];
-    _rcBtn = [UIButton buttonWithType:UIButtonTypeSystem]; _rcBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [_rcBtn setTitle:@"远程" forState:UIControlStateNormal]; _rcBtn.titleLabel.font = [UIFont boldSystemFontOfSize:17];
-    [_rcBtn setBackgroundColor:[UIColor systemTealColor]]; [_rcBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    _rcBtn.layer.cornerRadius = 10; [_rcBtn addTarget:self action:@selector(openRemote) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:_rcBtn];
     [NSLayoutConstraint activateConstraints:@[
         [_codeInput.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:12],
         [_codeInput.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
@@ -3813,27 +3709,16 @@ void RYResourceManagerRefresh(UIViewController *vc) {
         [_rmBtn.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
         [_rmBtn.heightAnchor constraintEqualToConstant:48],
         [_lsBtn.leadingAnchor constraintEqualToAnchor:_rmBtn.trailingAnchor constant:6],
-        [_lsBtn.trailingAnchor constraintEqualToAnchor:_rcBtn.leadingAnchor constant:-6],
+        [_lsBtn.trailingAnchor constraintEqualToAnchor:_execBtn.leadingAnchor constant:-6],
         [_lsBtn.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
         [_lsBtn.heightAnchor constraintEqualToConstant:48],
-        [_rcBtn.leadingAnchor constraintEqualToAnchor:_lsBtn.trailingAnchor constant:6],
-        [_rcBtn.trailingAnchor constraintEqualToAnchor:_execBtn.leadingAnchor constant:-6],
-        [_rcBtn.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
-        [_rcBtn.heightAnchor constraintEqualToConstant:48],
-        [_execBtn.leadingAnchor constraintEqualToAnchor:_rcBtn.trailingAnchor constant:6],
+        [_execBtn.leadingAnchor constraintEqualToAnchor:_lsBtn.trailingAnchor constant:6],
         [_execBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
         [_execBtn.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
         [_execBtn.heightAnchor constraintEqualToConstant:48],
         [_rmBtn.widthAnchor constraintEqualToAnchor:_lsBtn.widthAnchor],
-        [_lsBtn.widthAnchor constraintEqualToAnchor:_rcBtn.widthAnchor],
-        [_rcBtn.widthAnchor constraintEqualToAnchor:_execBtn.widthAnchor],
+        [_lsBtn.widthAnchor constraintEqualToAnchor:_execBtn.widthAnchor],
     ]];
-}
-- (void)openRemote {
-    RemoteVC *r = [[RemoteVC alloc] init];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:r];
-    nav.modalPresentationStyle = UIModalPresentationFormSheet;
-    [self presentViewController:nav animated:YES completion:nil];
 }
 - (void)onExec { _execBtn.enabled = NO; [_execBtn setTitle:@"执行中…" forState:UIControlStateNormal]; RunCode(self, _codeInput.text); [self performSelector:@selector(reEnable) withObject:nil afterDelay:0.6]; }
 - (void)reEnable { _execBtn.enabled = YES; [_execBtn setTitle:@"执行" forState:UIControlStateNormal]; }
