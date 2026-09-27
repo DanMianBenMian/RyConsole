@@ -2033,6 +2033,7 @@ static dispatch_queue_t g_rmtQueue = nil;
 static NSString *g_rmtCurId = nil;   // 正在执行的 push_js id（异常回传要用）
 static NSString *g_rmtState = @"idle";
 static NSString *g_rmtLastError = nil;  // 最近一次断开原因（build57 回传 UI）
+static NSString *g_rmtToken = nil;      // didOpen 后才发 auth（build58：握手完成前不发不收）
 
 static NSString *rmtNormalizeURL(NSString *in) {
     NSString *u = [in stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -2108,6 +2109,33 @@ static void rmtReceive(void) {
     }];
 }
 
+// build58：WSS 握手完成前不能挂 receive/send（iOS 会直接报 NSPOSIXErrorDomain 57
+// "Socket is not connected"，请求根本不出网）。必须等 didOpenWithProtocol 再收发。
+@interface RYRemoteWSDelegate : NSObject <NSURLSessionWebSocketDelegate>
+@end
+@implementation RYRemoteWSDelegate
+- (void)URLSession:(NSURLSession *)session webSocketTask:(NSURLSessionWebSocketTask *)task
+didOpenWithProtocol:(NSString *)protocol {
+    if (task != g_rmtTask) return;
+    NSLog(@"[remote] handshake done (didOpen), sending auth");
+    g_rmtState = @"connected";
+    rmtSend(@{@"type": @"auth", @"token": g_rmtToken ?: @""});
+    rmtReceive();
+}
+- (void)URLSession:(NSURLSession *)session webSocketTask:(NSURLSessionWebSocketTask *)task
+didCloseWithCode:(NSURLSessionWebSocketCloseCode)code reason:(NSData *)reason {
+    if (task != g_rmtTask) return;
+    NSString *rs = reason.length ? [[NSString alloc] initWithData:reason encoding:NSUTF8StringEncoding] : nil;
+    rmtTeardown(rs.length ? [NSString stringWithFormat:@"服务端关闭(%@)", rs] : @"服务端关闭");
+}
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+didCompleteWithError:(NSError *)error {
+    if (task != g_rmtTask || !error) return;   // 正常关闭/主动取消时 g_rmtTask 已置 nil
+    rmtTeardown(error.localizedDescription ?: @"连接失败");
+}
+@end
+static RYRemoteWSDelegate *g_rmtWSDelegate = nil;
+
 static NSString *rmtStart(NSString *baseURL, NSString *token) {
     if (g_rmtTask) rmtStop();
     NSString *urlStr = rmtNormalizeURL(baseURL);
@@ -2136,15 +2164,21 @@ static NSString *rmtStart(NSString *baseURL, NSString *token) {
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.timeoutIntervalForRequest = 20;
-    g_rmtSession = [NSURLSession sessionWithConfiguration:cfg];
+    if (!g_rmtWSDelegate) g_rmtWSDelegate = [[RYRemoteWSDelegate alloc] init];
+    g_rmtSession = [NSURLSession sessionWithConfiguration:cfg delegate:g_rmtWSDelegate delegateQueue:nil];
     NSURL *url = [NSURL URLWithString:urlStr];
     if (!url) { g_rmtCtx = nil; return @"{\"ok\":false,\"error\":\"ws url 构造失败\"}"; }
+    g_rmtToken = [token copy];
     g_rmtTask = [g_rmtSession webSocketTaskWithURL:url];
     g_rmtState = @"connecting";
     g_rmtLastError = nil;
     [g_rmtTask resume];
-    rmtSend(@{@"type": @"auth", @"token": token ?: @""});
-    rmtReceive();
+    // auth + receive 全部延后到 didOpen（见 RYRemoteWSDelegate）；这里只挂握手超时兜底
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)15 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        if (g_rmtTask && [g_rmtState isEqualToString:@"connecting"])
+            rmtTeardown(@"连接超时：15 秒内 WSS 握手未完成（检查地址/网络后重试）");
+    });
 
     NSDictionary *st = @{@"ok": @YES, @"url": urlStr, @"state": g_rmtState};
     NSData *jd = [NSJSONSerialization dataWithJSONObject:st options:0 error:NULL];
