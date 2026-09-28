@@ -2033,6 +2033,8 @@ static dispatch_queue_t g_rmtQueue = nil;
 static NSString *g_rmtCurId = nil;   // 正在执行的 push_js id（异常回传要用）
 static NSString *g_rmtState = @"idle";
 static NSString *g_rmtLastError = nil;  // 最近一次断开原因（build57 回传 UI）
+static NSString *g_rmtLastCode = nil;   // build61：最近一次 PC 推来的代码（远程页「收到的代码」区显示）
+static NSTimer *g_rmtPingTimer = nil;   // build61：WS 模式保活定时器（sendPing 心跳）
 static NSString *g_rmtToken = nil;      // didOpen 后才发 auth（build58：握手完成前不发不收）
 static NSInteger g_rmtGen = 0;          // 会话代际：stop/teardown 时自增，作废悬空重试与旧回调
 static NSInteger g_rmtAttempt = 0;      // 当前会话内的连接尝试次数
@@ -2097,9 +2099,28 @@ static void rmtTeardown(NSString *reason) {
     g_rmtDID = nil; g_rmtLPToken = nil;
     g_rmtMode = @"ws";
     g_rmtCtx = nil;
+    rmtStopPing();   // build61：停保活定时器
     g_rmtState = @"idle";
     if (reason.length) g_rmtLastError = [reason copy];   // 断开原因回传给 UI（build57）
     NSLog(@"[remote] teardown: %@", reason);
+}
+
+// build61：WS 模式保活 —— 每 20s 发一次 ping，NAT/防火墙层面保温，防空闲被回收。
+// （LP 模式天然靠 in-flight 的 poll 保温，无需额外心跳。）
+static void rmtStopPing(void) {
+    if (g_rmtPingTimer) { [g_rmtPingTimer invalidate]; g_rmtPingTimer = nil; }
+}
+static void rmtStartPing(void) {
+    if (!g_rmtTask) return;
+    rmtStopPing();
+    g_rmtPingTimer = [NSTimer timerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) {
+        if (g_rmtTask && [g_rmtState isEqualToString:@"connected"]) {
+            [g_rmtTask sendPingWithPongReceiveHandler:^(NSError *err) {
+                if (err) NSLog(@"[remote] ping/pong error: %@", err);
+            }];
+        }
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:g_rmtPingTimer forMode:NSRunLoopCommonModes];
 }
 
 static NSString *rmtStop(void) {
@@ -2118,6 +2139,8 @@ static void rmtMakeContext(void);
 static void rmtExecuteJS(NSString *pid, NSString *code);
 static void rmtHandleMessage(NSDictionary *m);
 static void rmtLPPoll(NSInteger gen);
+static void rmtStartPing(void);               // build61：WS 保活
+static void rmtStopPing(void);
 // 统一消息处理：WS 收包与 LP poll 共用（welcome/push_js）
 static void rmtHandleMessage(NSDictionary *m) {
     if (![m isKindOfClass:[NSDictionary class]]) return;
@@ -2126,10 +2149,12 @@ static void rmtHandleMessage(NSDictionary *m) {
         // ★ 真·连上：必须收到服务端 welcome，而非依赖 didOpen（build59 修正 beta 误触）
         g_rmtState = @"connected";
         g_rmtLastError = @"";
+        if ([g_rmtMode isEqualToString:@"ws"]) rmtStartPing();   // build61：WS 模式启动保活心跳
         NSLog(@"[remote] server welcome received -> connected");
     } else if ([mt isEqualToString:@"push_js"]) {
         NSString *pid = [NSString stringWithFormat:@"%@", m[@"id"] ?: @""];
         NSString *code = [NSString stringWithFormat:@"%@", m[@"code"] ?: @""];
+        g_rmtLastCode = [code copy];   // build61：记录 PC 推来的代码，供远程页「收到的代码」区显示
         dispatch_async(g_rmtQueue, ^{
             rmtExecuteJS(pid, code);
         });
@@ -2413,6 +2438,8 @@ static NSString *rmtStatus(void) {
 NSString *RYRemoteStart(NSString *url, NSString *token) { return rmtStart(url, token); }
 NSString *RYRemoteStop(void)  { return rmtStop(); }
 NSString *RYRemoteStatus(void){ return rmtStatus(); }
+NSString *RYRemoteLastCode(void) { return g_rmtLastCode ?: @""; }   // build61：远程页「收到的代码」
+BOOL RYRemoteIsActive(void) { return ![g_rmtState isEqualToString:@"idle"]; }  // build61：互斥查询
 
 static void installPrimitives(JSContext *ctx) {
 ctx[@"runCommand"]=^NSString*(NSString *cmd){
