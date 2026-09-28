@@ -19,6 +19,8 @@ import SwiftUI
 import WidgetKit
 
 private let kAccent = Color(red: 0.20, green: 0.90, blue: 0.62)   // 与 App 的 RY_GREEN 同色系
+/// 远程连接强调色（天蓝），与监听绿区分开，一眼能认出是「连接 PC」而不是「监听」
+private let kRemoteAccent = Color(red: 0.35, green: 0.72, blue: 1.0)
 
 /// 紧凑态里是否同时显示连接数。
 /// ⚠️ 默认 **0 = 只显示图标**：原生 iPhone 灵动岛放两个元素没问题，
@@ -33,6 +35,7 @@ private let kCompactIconSize: CGFloat = 12
 struct RyConsoleWidgetBundle: WidgetBundle {
     var body: some Widget {
         RYListenLiveActivity()
+        RyRemoteLiveActivity()
     }
 }
 
@@ -142,6 +145,124 @@ struct RYListenLiveActivity: Widget {
             // 之前挂了 "ryconsole://listen"，但 App 没注册这个 URL scheme ——
             // 在"强开灵动岛"的环境里点它会走到未注册 scheme 的处理路径（从灵动岛回 App 崩的嫌疑点）。
             // 去掉后点击仍由系统默认行为回到本 App，且不留隐患。
+        }
+    }
+}
+
+// MARK: - 远程连接（连接 PC）实时活动
+//  与监听活动平行并存；二者互斥，同一时刻最多一个在跑。
+//  呈现形态：
+//   · 灵动岛紧凑态：云图标（天蓝）
+//   · 灵动岛展开态："远程连接中" + 服务端主机 + 收到段数 + 已连接时长 + 通道模式
+//   · 锁屏 / 通知中心横幅：云图标 + "远程连接中" + 服务端 / 段数 / 通道
+struct RyRemoteLiveActivity: Widget {
+
+    var body: some WidgetConfiguration {
+        ActivityConfiguration(for: RyRemoteAttributes.self) { context in
+
+            // ---- 锁屏 / 通知中心 ----
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle().fill(kRemoteAccent.opacity(0.18)).frame(width: 40, height: 40)
+                    Image(systemName: "icloud")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(kRemoteAccent)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(context.state.alert.isEmpty ? "远程连接中" : "⚠️ 请求权限")
+                        .font(.system(size: 15, weight: .semibold))
+                    if !context.state.alert.isEmpty {
+                        Text(context.state.alert)
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(.orange)
+                            .lineLimit(2)
+                    }
+                    HStack(spacing: 8) {
+                        Label(context.state.server.isEmpty ? "—" : context.state.server,
+                              systemImage: "globe")
+                        Label("\(context.state.codes) 段", systemImage: "doc.plaintext")
+                        Label(context.state.mode == "ws" ? "WS" : "长轮询",
+                              systemImage: "wave.3.right")
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+                }
+                Spacer()
+                Text(context.state.startedAt, style: .timer)
+                    .font(.system(size: 13, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .padding(14)
+            .activityBackgroundTint(Color.black.opacity(0.72))
+            .activitySystemActionForegroundColor(kRemoteAccent)
+
+        } dynamicIsland: { context in
+
+            DynamicIsland {
+                // ---- 展开态 ----
+                DynamicIslandExpandedRegion(.leading) {
+                    Image(systemName: "icloud")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(kRemoteAccent)
+                        .padding(.leading, 4)
+                }
+                DynamicIslandExpandedRegion(.trailing) {
+                    Text(context.state.server.isEmpty ? "—" : context.state.server)
+                        .font(.system(size: 12, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(kRemoteAccent)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.5)
+                        .padding(.trailing, 4)
+                }
+                DynamicIslandExpandedRegion(.center) {
+                    Text("远程连接中")
+                        .font(.system(size: 15, weight: .semibold))
+                }
+                DynamicIslandExpandedRegion(.bottom) {
+                    HStack(spacing: 10) {
+                        Label("\(context.state.codes) 段", systemImage: "doc.plaintext")
+                        Text(context.state.startedAt, style: .timer)
+                            .monospacedDigit()
+                        Label(context.state.mode == "ws" ? "WS" : "长轮询",
+                              systemImage: "wave.3.right")
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 2)
+                }
+            } compactLeading: {
+                // ---- 紧凑态（左）：云图标（固定尺寸，不参与撑宽）----
+                Image(systemName: "icloud")
+                    .font(.system(size: kCompactIconSize, weight: .semibold))
+                    .foregroundStyle(kRemoteAccent)
+                    .frame(width: kCompactIconSize + 4, height: kCompactIconSize + 4)
+                    .fixedSize()
+
+            } compactTrailing: {
+                // ---- 紧凑态（右）：默认留空（与监听同规则，避免强开灵动岛被撑变形）----
+                if kCompactShowsHits == 1 {
+                    Text("\(context.state.codes)")
+                        .font(.system(size: kCompactIconSize, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(kRemoteAccent)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                        .fixedSize()
+                } else {
+                    EmptyView()
+                }
+
+            } minimal: {
+                Image(systemName: "icloud")
+                    .font(.system(size: kCompactIconSize, weight: .semibold))
+                    .foregroundStyle(kRemoteAccent)
+                    .fixedSize()
+            }
+            .keylineTint(kRemoteAccent)
         }
     }
 }
