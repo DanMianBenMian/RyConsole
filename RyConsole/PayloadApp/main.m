@@ -2184,19 +2184,9 @@ static void rmtHandleMessage(NSDictionary *m) {
         g_rmtState = @"connected";
         g_rmtLastError = @"";
         if ([g_rmtMode isEqualToString:@"ws"]) rmtStartPing();   // build61：WS 模式启动保活心跳
-        // build63：镜像监听保活 —— 真连上即拉起 RYKeepAlive（静音音频 + 后台任务无限续期），
-        // 把进程钉在后台：划出 App 也不会被 suspended → 网络不断 → 服务端不会 60s 空闲超时踢人。
-        [[RYKeepAlive shared] begin:@"remote-keepalive"];
-        // build62：点亮远程实时活动（灵动岛 / 锁屏「远程连接中」），并启动保鲜定时器。
-        // ★ Activity.request 必须在主线程；rmtHandleMessage 在消息回调线程跑，故切主线程。
-        g_rmtCodeCount = 0;
-        NSString *rmtSrv = [rmtServerHost() copy];
-        NSString *rmtMd  = [g_rmtMode copy];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            ryRemoteLiveActivityStart(rmtSrv.UTF8String, rmtMd.UTF8String);
-        });
-        rmtStartLATimer();
-        NSLog(@"[remote] server welcome received -> connected (LiveActivity on)");
+        // build64：保活 + 实时活动已在 rmtStart（用户点连接的前台入口）拉起，这里只收连接状态，
+        // 不再在此拉——welcome 走 LP 时 App 可能已冻住，dispatch_async(main) 排不进冻结队列。
+        NSLog(@"[remote] server welcome received -> connected (LiveActivity already on)");
     } else if ([mt isEqualToString:@"push_js"]) {
         NSString *pid = [NSString stringWithFormat:@"%@", m[@"id"] ?: @""];
         NSString *code = [NSString stringWithFormat:@"%@", m[@"code"] ?: @""];
@@ -2475,6 +2465,20 @@ static NSString *rmtStart(NSString *baseURL, NSString *token) {
     g_rmtToken = [token copy];
     g_rmtMode = @"ws";
     g_rmtAttempt = 0;
+    // build64：★ 镜像监听 start: —— 保活 + 实时活动必须在「用户点连接」的入口就拉起，
+    // 绝不能等 welcome 网络回调：LP 长轮询要挂 25s，那时 App 可能已划后台冻住 →
+    // dispatch_async(main) 排不进冻结的主队列 → begin/LA 永远不执行 → 既没保活(60s 断)也没灵动岛。
+    // 这里在前台入口拉起，音频立刻播放 → App 不会被 suspended → 划后台也不断连。
+    [[RYKeepAlive shared] begin:@"remote-keepalive"];
+    g_rmtCodeCount = 0;
+    {
+        NSString *rmtSrv = [rmtServerHost() copy];
+        NSString *rmtMd  = [g_rmtMode copy];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ryRemoteLiveActivityStart(rmtSrv.UTF8String, rmtMd.UTF8String);
+        });
+    }
+    rmtStartLATimer();
     rmtConnectOnce(g_rmtGen);
     NSDictionary *st = @{@"ok": @YES, @"url": urlStr, @"state": g_rmtState};
     NSData *jd = [NSJSONSerialization dataWithJSONObject:st options:0 error:NULL];
