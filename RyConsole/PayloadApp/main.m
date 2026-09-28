@@ -2084,6 +2084,7 @@ static void rmtSend(NSDictionary *dict) {
 }
 
 // 双模式回传路由：WS 模式走 WebSocket 帧，LP 模式走普通 HTTPS POST
+static void rmtLPSend(NSDictionary *dict);   // 前置声明：rmtDeliver 定义早于后文
 static void rmtDeliver(NSDictionary *dict) {
     if ([g_rmtMode isEqualToString:@"lp"]) rmtLPSend(dict);
     else rmtSend(dict);
