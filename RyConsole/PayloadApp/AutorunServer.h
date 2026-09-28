@@ -38,6 +38,9 @@ NSString *RYAutorunStop(void);
 // 当前状态（JSON 字符串）
 NSString *RYAutorunStatus(void);
 
+// build61：监听是否正在运行（互斥「监听/远程」开关用，避免重复解析 JSON）
+BOOL RYAutorunRunning(void);
+
 // 最近的日志文本（给 JS 侧读取）
 NSString *RYAutorunLogText(void);
 
