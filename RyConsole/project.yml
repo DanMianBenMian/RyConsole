@@ -24,7 +24,7 @@ targets:
         # ---- 版本号单一事实源（V2.3.0 起）：UI 左上角 / statusJSON / appInfo 都从 Bundle 读这里 ----
         # ★ 此前 UI 左上角是硬编码 @"v1.1"，Info.plist 里又没有版本键 → 永远显示 v1.1
         CFBundleShortVersionString: "2.4.24"
-        CFBundleVersion: "61"
+        CFBundleVersion: "62"
         UIFileSharingEnabled: true
         UISupportsDocumentBrowser: true
         LSSupportsOpeningDocumentsInPlace: true
@@ -97,6 +97,7 @@ targets:
     sources:
       - path: PayloadApp/Widget
       - path: PayloadApp/RyListenAttributes.swift   # 与主 App 共享的活动模型（两边各编一份）
+      - path: PayloadApp/RyRemoteAttributes.swift   # 远程连接活动模型（与监听同规则，双 target 共享）
     info:
       path: PayloadApp/Widget/Info.plist
       properties:
