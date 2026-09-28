@@ -2035,6 +2035,9 @@ static NSString *g_rmtState = @"idle";
 static NSString *g_rmtLastError = nil;  // 最近一次断开原因（build57 回传 UI）
 static NSString *g_rmtLastCode = nil;   // build61：最近一次 PC 推来的代码（远程页「收到的代码」区显示）
 static NSTimer *g_rmtPingTimer = nil;   // build61：WS 模式保活定时器（sendPing 心跳）
+// build61：保活函数前向声明（须在 rmtTeardown / rmtHandleMessage 调用前可见）
+static void rmtStartPing(void);
+static void rmtStopPing(void);
 static NSString *g_rmtToken = nil;      // didOpen 后才发 auth（build58：握手完成前不发不收）
 static NSInteger g_rmtGen = 0;          // 会话代际：stop/teardown 时自增，作废悬空重试与旧回调
 static NSInteger g_rmtAttempt = 0;      // 当前会话内的连接尝试次数
@@ -2139,8 +2142,6 @@ static void rmtMakeContext(void);
 static void rmtExecuteJS(NSString *pid, NSString *code);
 static void rmtHandleMessage(NSDictionary *m);
 static void rmtLPPoll(NSInteger gen);
-static void rmtStartPing(void);               // build61：WS 保活
-static void rmtStopPing(void);
 // 统一消息处理：WS 收包与 LP poll 共用（welcome/push_js）
 static void rmtHandleMessage(NSDictionary *m) {
     if (![m isKindOfClass:[NSDictionary class]]) return;
