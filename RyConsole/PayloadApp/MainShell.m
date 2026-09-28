@@ -16,6 +16,10 @@
 #import <stdlib.h>
 #import <math.h>
 
+// build61：远程连接查询函数原型（main.m 导出，供本文件调用；与 RYAutorunRunning 同机制）
+NSString *RYRemoteLastCode(void);
+BOOL RYRemoteIsActive(void);
+
 // 取当前可 present 的顶层 VC（文件级，供各个 Pane 共用）
 static UIViewController *RYTopVCForPresent(void) {
     UIWindow *key = nil;
