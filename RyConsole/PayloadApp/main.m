@@ -32,6 +32,7 @@
 #import "AutorunServer.h"
 #import "KeepAlive.h"
 #import "LiveActivityBridge.h"
+#import "RemoteLiveActivityBridge.h"   // 远程连接实时活动（灵动岛）桥：rmtHandleMessage/rmtTeardown 驱动
 #import "RyExec.h"
 #import "RYPermLog.h"
 #import "MainShell.h"
@@ -2038,6 +2039,10 @@ static NSTimer *g_rmtPingTimer = nil;   // build61：WS 模式保活定时器（
 // build61：保活函数前向声明（须在 rmtTeardown / rmtHandleMessage 调用前可见）
 static void rmtStartPing(void);
 static void rmtStopPing(void);
+// build62：远程连接实时活动（灵动岛）驱动 —— 模仿监听保活：连接即点亮、心跳续保鲜、断开即熄
+static void rmtStartLATimer(void);
+static void rmtStopLATimer(void);
+static NSString *rmtServerHost(void);
 static NSString *g_rmtToken = nil;      // didOpen 后才发 auth（build58：握手完成前不发不收）
 static NSInteger g_rmtGen = 0;          // 会话代际：stop/teardown 时自增，作废悬空重试与旧回调
 static NSInteger g_rmtAttempt = 0;      // 当前会话内的连接尝试次数
@@ -2049,6 +2054,8 @@ static NSString *g_rmtDID = nil;        // 长轮询会话 id（服务端 regist
 static NSString *g_rmtLPToken = nil;    // 长轮询会话令牌
 static NSURLSession *g_rmtLPSession = nil;
 static NSInteger g_rmtLPFails = 0;      // 长轮询连续失败计数
+static NSInteger g_rmtCodeCount = 0;    // build62：远程实时活动「收到代码段数」指标
+static NSTimer *g_rmtLATimer = nil;     // build62：远程实时活动保鲜定时器（每 60s touch 一次）
 
 static NSString *rmtNormalizeURL(NSString *in) {
     NSString *u = [in stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -2103,6 +2110,9 @@ static void rmtTeardown(NSString *reason) {
     g_rmtMode = @"ws";
     g_rmtCtx = nil;
     rmtStopPing();   // build61：停保活定时器
+    rmtStopLATimer();                 // build62：停实时活动保鲜定时器
+    ryRemoteLiveActivityStop();       // build62：灵动岛同时熄掉
+    g_rmtCodeCount = 0;
     g_rmtState = @"idle";
     if (reason.length) g_rmtLastError = [reason copy];   // 断开原因回传给 UI（build57）
     NSLog(@"[remote] teardown: %@", reason);
@@ -2124,6 +2134,28 @@ static void rmtStartPing(void) {
         }
     }];
     [[NSRunLoop mainRunLoop] addTimer:g_rmtPingTimer forMode:NSRunLoopCommonModes];
+}
+
+// build62：远程连接实时活动（灵动岛）保鲜定时器 —— 模仿监听保活脉冲：
+// 每 60s 调一次 ryRemoteLiveActivityTouch() 续保鲜期（数字不动），保证"还在连接"期间活动绝不 stale。
+// WS / LP 两种模式通用（WS 另有 20s sendPing 保温，但那不碰实时活动）。
+static void rmtStopLATimer(void) {
+    if (g_rmtLATimer) { [g_rmtLATimer invalidate]; g_rmtLATimer = nil; }
+}
+static void rmtStartLATimer(void) {
+    rmtStopLATimer();
+    g_rmtLATimer = [NSTimer timerWithTimeInterval:60.0 repeats:YES block:^(NSTimer *t) {
+        if (![g_rmtState isEqualToString:@"idle"]) ryRemoteLiveActivityTouch();
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:g_rmtLATimer forMode:NSRunLoopCommonModes];
+}
+
+// build62：取当前连接的服务端主机（隧道地址或 LP base 的 host），给实时活动标题/展开态展示
+static NSString *rmtServerHost(void) {
+    NSString *u = [g_rmtMode isEqualToString:@"lp"] ? g_rmtLPBase : g_rmtURL;
+    if (!u.length) return @"";
+    NSURL *pu = [NSURL URLWithString:u];
+    return pu.host ?: @"";
 }
 
 static NSString *rmtStop(void) {
@@ -2151,11 +2183,20 @@ static void rmtHandleMessage(NSDictionary *m) {
         g_rmtState = @"connected";
         g_rmtLastError = @"";
         if ([g_rmtMode isEqualToString:@"ws"]) rmtStartPing();   // build61：WS 模式启动保活心跳
-        NSLog(@"[remote] server welcome received -> connected");
+        // build62：点亮远程实时活动（灵动岛 / 锁屏「远程连接中」），并启动保鲜定时器
+        g_rmtCodeCount = 0;
+        ryRemoteLiveActivityStart(rmtServerHost().UTF8String, g_rmtMode.UTF8String);
+        rmtStartLATimer();
+        NSLog(@"[remote] server welcome received -> connected (LiveActivity on)");
     } else if ([mt isEqualToString:@"push_js"]) {
         NSString *pid = [NSString stringWithFormat:@"%@", m[@"id"] ?: @""];
         NSString *code = [NSString stringWithFormat:@"%@", m[@"code"] ?: @""];
         g_rmtLastCode = [code copy];   // build61：记录 PC 推来的代码，供远程页「收到的代码」区显示
+        // build62：实时活动「收到段数」+ 最近代码预览（截断，避免超长代码撑爆灵动岛）
+        g_rmtCodeCount++;
+        NSString *lc = g_rmtLastCode;
+        if (lc.length > 80) lc = [lc substringToIndex:80];
+        ryRemoteLiveActivityUpdate((int32_t)g_rmtCodeCount, lc.UTF8String);
         dispatch_async(g_rmtQueue, ^{
             rmtExecuteJS(pid, code);
         });
@@ -4222,6 +4263,8 @@ UIViewController *RYMakeLegacyConsoleVC(void) {
     // 清掉"上次进程被强杀"残留的灵动岛：强杀不会给我们任何回调，只能在下次启动补刀
     int32_t swept = ryLiveActivitySweep();
     if (swept > 0) NSLog(@"[LiveActivity] 启动时清掉 %d 个残留活动", (int)swept);
+    int32_t sweptR = ryRemoteLiveActivitySweep();
+    if (sweptR > 0) NSLog(@"[RemoteLiveActivity] 启动时清掉 %d 个残留活动", (int)sweptR);
 
     // Autorun 执行器提前注册：这样面板直接点「启动」也能工作（不必先跑过一段 JS）
     RYAutorunSetEval(^NSString*(NSString *js){ return RYAutorunRunCapture(js); });
@@ -4239,6 +4282,7 @@ UIViewController *RYMakeLegacyConsoleVC(void) {
 - (void)applicationWillTerminate:(UIApplication *)application {
     @try {
         ryLiveActivityStop();
+        ryRemoteLiveActivityStop();
         [[RYKeepAlive shared] end];
         NSLog(@"[RyConsole] willTerminate：保活与实时活动已收尾");
     } @catch (NSException *e) {
