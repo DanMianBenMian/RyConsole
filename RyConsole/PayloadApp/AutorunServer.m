@@ -870,6 +870,10 @@ NSString *RYAutorunStatus(void) {
     return [[RYAutorunServer shared] statusJSON];
 }
 
+BOOL RYAutorunRunning(void) {
+    return [RYAutorunServer shared].running;
+}
+
 NSString *RYAutorunLogText(void) {
     RYAutorunServer *s = [RYAutorunServer shared];
     [s.lock lock];
