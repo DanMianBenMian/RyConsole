@@ -2037,7 +2037,13 @@ static NSString *g_rmtToken = nil;      // didOpen 后才发 auth（build58：�
 static NSInteger g_rmtGen = 0;          // 会话代际：stop/teardown 时自增，作废悬空重试与旧回调
 static NSInteger g_rmtAttempt = 0;      // 当前会话内的连接尝试次数
 static const NSInteger g_rmtAttemptMax = 3;  // 握手失败最多重试次数（iPadOS beta didOpen 误触）
-static NSString *g_rmtURL = nil;        // 重试用的归一化地址
+static NSString *g_rmtURL = nil;        // 重试用的归一化地址（ws://.../ws/device）
+static NSString *g_rmtMode = @"ws";     // 通道模式："ws" | "lp"（长轮询降级，build60）
+static NSString *g_rmtLPBase = nil;     // 长轮询用 base（https://host[:port][/path]）
+static NSString *g_rmtDID = nil;        // 长轮询会话 id（服务端 register 下发）
+static NSString *g_rmtLPToken = nil;    // 长轮询会话令牌
+static NSURLSession *g_rmtLPSession = nil;
+static NSInteger g_rmtLPFails = 0;      // 长轮询连续失败计数
 
 static NSString *rmtNormalizeURL(NSString *in) {
     NSString *u = [in stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -2053,6 +2059,21 @@ static NSString *rmtNormalizeURL(NSString *in) {
     return [auth stringByAppendingString:[path stringByAppendingString:@"/ws/device"]];
 }
 
+// 长轮询用的 base（不带 /ws/device 后缀）
+static NSString *rmtNormalizeBase(NSString *in) {
+    NSString *u = [in stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (u.length == 0) return nil;
+    if (![u hasPrefix:@"http://"] && ![u hasPrefix:@"https://"]) u = [@"https://" stringByAppendingString:u];
+    NSURL *pu = [NSURL URLWithString:u];
+    if (!pu || !pu.host) return nil;
+    NSMutableString *b = [NSMutableString stringWithFormat:@"%@://%@", pu.scheme.lowercaseString, pu.host];
+    if (pu.port) [b appendFormat:@":%@", [pu.port stringValue]];
+    NSString *path = (pu.path.length > 1) ? pu.path : @"";
+    while ([path hasSuffix:@"/"]) path = [path substringToIndex:path.length - 1];
+    [b appendString:path];
+    return b;
+}
+
 static void rmtSend(NSDictionary *dict) {
     NSURLSessionWebSocketTask *t = g_rmtTask;
     if (!t) return;
@@ -2062,9 +2083,18 @@ static void rmtSend(NSDictionary *dict) {
                  completionHandler:^(NSError *err) { if (err) NSLog(@"[remote] send err: %@", err); }];
 }
 
+// 双模式回传路由：WS 模式走 WebSocket 帧，LP 模式走普通 HTTPS POST
+static void rmtDeliver(NSDictionary *dict) {
+    if ([g_rmtMode isEqualToString:@"lp"]) rmtLPSend(dict);
+    else rmtSend(dict);
+}
+
 static void rmtTeardown(NSString *reason) {
     g_rmtGen++;   // 作废本会话悬空的重试/旧回调
     if (g_rmtTask) { [g_rmtTask cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil]; g_rmtTask = nil; }
+    if (g_rmtLPSession) { [g_rmtLPSession invalidateAndCancel]; g_rmtLPSession = nil; }
+    g_rmtDID = nil; g_rmtLPToken = nil;
+    g_rmtMode = @"ws";
     g_rmtCtx = nil;
     g_rmtState = @"idle";
     if (reason.length) g_rmtLastError = [reason copy];   // 断开原因回传给 UI（build57）
@@ -2080,6 +2110,49 @@ static NSString *rmtStop(void) {
 static void rmtFailWhileConnecting(NSString *reason, NSInteger gen);
 static void rmtConnectOnce(NSInteger gen);
 static void rmtReceive(void);
+static void rmtDeliver(NSDictionary *dict);   // 双模式回传：ws→rmtSend / lp→rmtLPSend
+static void rmtLPSend(NSDictionary *dict);
+static void rmtLPStart(NSInteger gen);        // WS 重试耗尽后的长轮询降级入口
+static void rmtMakeContext(void);
+static void rmtExecuteJS(NSString *pid, NSString *code);
+static void rmtHandleMessage(NSDictionary *m);
+static void rmtLPPoll(NSInteger gen);
+// 统一消息处理：WS 收包与 LP poll 共用（welcome/push_js）
+static void rmtHandleMessage(NSDictionary *m) {
+    if (![m isKindOfClass:[NSDictionary class]]) return;
+    NSString *mt = m[@"type"];
+    if ([mt isEqualToString:@"welcome"]) {
+        // ★ 真·连上：必须收到服务端 welcome，而非依赖 didOpen（build59 修正 beta 误触）
+        g_rmtState = @"connected";
+        g_rmtLastError = @"";
+        NSLog(@"[remote] server welcome received -> connected");
+    } else if ([mt isEqualToString:@"push_js"]) {
+        NSString *pid = [NSString stringWithFormat:@"%@", m[@"id"] ?: @""];
+        NSString *code = [NSString stringWithFormat:@"%@", m[@"code"] ?: @""];
+        dispatch_async(g_rmtQueue, ^{
+            rmtExecuteJS(pid, code);
+        });
+    }
+}
+
+// 在 g_rmtQueue 上执行（调用方负责 dispatch），结果经 rmtDeliver 双模式回传
+static void rmtExecuteJS(NSString *pid, NSString *code) {
+    if (!g_rmtCtx) return;
+    g_rmtCurId = pid;
+    JSValue *res = [g_rmtCtx evaluateScript:code];
+    NSString *out;
+    BOOL ok = (g_rmtCtx.exception == nil);
+    if (!ok) {
+        out = [NSString stringWithFormat:@"[JS Error] %@", [g_rmtCtx.exception description]];
+        g_rmtCtx.exception = nil;   // 已随 result 回传，清掉防累积
+    } else {
+        out = (res && ![res isUndefined]) ? [res description] : @"(undefined)";
+    }
+    if (out.length > 65536) out = [[out substringToIndex:65536] stringByAppendingString:@"\n...[truncated 64KB]"];
+    rmtDeliver(@{@"type": @"result", @"id": pid, @"ok": @(ok), @"output": out});
+    g_rmtCurId = nil;
+}
+
 static void rmtReceive(void) {
     NSURLSessionWebSocketTask *t = g_rmtTask;
     if (!t) return;
@@ -2098,34 +2171,7 @@ static void rmtReceive(void) {
         if (text.length) {
             NSData *jd = [text dataUsingEncoding:NSUTF8StringEncoding];
             NSDictionary *m = [NSJSONSerialization JSONObjectWithData:jd options:0 error:NULL];
-            if ([m isKindOfClass:[NSDictionary class]]) {
-                NSString *mt = m[@"type"];
-                if ([mt isEqualToString:@"welcome"]) {
-                    // ★ 真·连上：必须收到服务端 welcome，而非依赖 didOpen（build59 修正 beta 误触）
-                    g_rmtState = @"connected";
-                    g_rmtLastError = @"";
-                    NSLog(@"[remote] server welcome received -> connected");
-                } else if ([mt isEqualToString:@"push_js"]) {
-                    NSString *pid = [NSString stringWithFormat:@"%@", m[@"id"] ?: @""];
-                    NSString *code = [NSString stringWithFormat:@"%@", m[@"code"] ?: @""];
-                    dispatch_async(g_rmtQueue, ^{
-                        if (!g_rmtCtx) return;
-                        g_rmtCurId = pid;
-                        JSValue *res = [g_rmtCtx evaluateScript:code];
-                        NSString *out;
-                        BOOL ok = (g_rmtCtx.exception == nil);
-                        if (!ok) {
-                            out = [NSString stringWithFormat:@"[JS Error] %@", [g_rmtCtx.exception description]];
-                            g_rmtCtx.exception = nil;   // 已随 result 回传，清掉防累积
-                        } else {
-                            out = (res && ![res isUndefined]) ? [res description] : @"(undefined)";
-                        }
-                        if (out.length > 65536) out = [[out substringToIndex:65536] stringByAppendingString:@"\n...[truncated 64KB]"];
-                        rmtSend(@{@"type": @"result", @"id": pid, @"ok": @(ok), @"output": out});
-                        g_rmtCurId = nil;
-                    });
-                }
-            }
+            rmtHandleMessage(m);
         }
         rmtReceive();                                  // 重新挂接收循环
     }];
@@ -2147,7 +2193,13 @@ didOpenWithProtocol:(NSString *)protocol {
 didCloseWithCode:(NSURLSessionWebSocketCloseCode)code reason:(NSData *)reason {
     if (task != g_rmtTask) return;
     NSString *rs = reason.length ? [[NSString alloc] initWithData:reason encoding:NSUTF8StringEncoding] : nil;
-    rmtTeardown(rs.length ? [NSString stringWithFormat:@"服务端关闭(%@)", rs] : @"服务端关闭");
+    NSString *msg = rs.length ? [NSString stringWithFormat:@"服务端关闭(%@)", rs] : @"服务端关闭";
+    if ([g_rmtState isEqualToString:@"connected"])
+        rmtTeardown(msg);
+    else {
+        g_rmtLastError = msg;   // 未收到 welcome 就被关：记原因并走重试/降级（build60 修复）
+        rmtFailWhileConnecting(msg, g_rmtGen);
+    }
 }
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
 didCompleteWithError:(NSError *)error {
@@ -2178,7 +2230,10 @@ static void rmtScheduleRetry(NSInteger gen) {
 static void rmtFailWhileConnecting(NSString *reason, NSInteger gen) {
     if (gen != g_rmtGen) return;
     if (g_rmtAttempt >= g_rmtAttemptMax) {
-        rmtTeardown([NSString stringWithFormat:@"%@（已重试 %ld 次）", reason, (long)g_rmtAttemptMax]);
+        // WS 重试耗尽 → 自动降级长轮询（纯普通 HTTPS 请求，抗"只拦 WS"的网络，build60）
+        g_rmtLastError = [NSString stringWithFormat:@"%@；WS 不通，自动切换长轮询模式...", reason];
+        NSLog(@"[remote] WS retries exhausted -> switching to long-polling");
+        rmtLPStart(gen);
         return;
     }
     rmtScheduleRetry(gen);
@@ -2189,25 +2244,7 @@ static void rmtConnectOnce(NSInteger gen) {
     if (gen != g_rmtGen) return;
     if (g_rmtTask) { [g_rmtTask cancel]; g_rmtTask = nil; }
     g_rmtAttempt++;
-    // 专用 JSContext：print/console 流式回传；全套原语 + 桥库 + engine
-    g_rmtCtx = [[JSContext alloc] init];
-    g_rmtCtx.name = @"ryc-remote";
-    g_rmtCtx.exceptionHandler = ^(JSContext *c, JSValue *e) {
-        NSString *out = [NSString stringWithFormat:@"[JS Error] %@", [e description]];
-        if (g_rmtCurId) rmtSend(@{@"type": @"result", @"id": g_rmtCurId, @"ok": @NO, @"output": out});
-        c.exception = nil;
-    };
-    g_rmtCtx[@"print"] = ^(id arg) {
-        NSMutableArray *parts = [NSMutableArray array];
-        if ([arg isKindOfClass:[NSArray class]]) { for (id a in arg) [parts addObject:[a description]]; }
-        else if (arg != nil && ![arg isEqual:[NSNull null]]) { [parts addObject:[arg description]]; }
-        rmtSend(@{@"type": @"log", @"text": [parts componentsJoinedByString:@" "]});
-    };
-    [g_rmtCtx evaluateScript:@"var console={log:function(){print.apply(null,arguments);},error:function(){print.apply(null,arguments);},info:function(){print.apply(null,arguments);},warn:function(){print.apply(null,arguments);}};"];
-    installPrimitives(g_rmtCtx);
-    loadBridgeFiles(g_rmtCtx);
-    NSString *eng = loadEngineSource();
-    if (eng && [eng length]) [g_rmtCtx evaluateScript:eng];
+    rmtMakeContext();   // 专用 JSContext：print/console 流式回传；全套原语 + 桥库 + engine
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.timeoutIntervalForRequest = 20;
@@ -2228,14 +2265,133 @@ static void rmtConnectOnce(NSInteger gen) {
     });
 }
 
+static void rmtMakeContext(void) {
+    g_rmtCtx = [[JSContext alloc] init];
+    g_rmtCtx.name = @"ryc-remote";
+    g_rmtCtx.exceptionHandler = ^(JSContext *c, JSValue *e) {
+        NSString *out = [NSString stringWithFormat:@"[JS Error] %@", [e description]];
+        if (g_rmtCurId) rmtDeliver(@{@"type": @"result", @"id": g_rmtCurId, @"ok": @NO, @"output": out});
+        c.exception = nil;
+    };
+    g_rmtCtx[@"print"] = ^(id arg) {
+        NSMutableArray *parts = [NSMutableArray array];
+        if ([arg isKindOfClass:[NSArray class]]) { for (id a in arg) [parts addObject:[a description]]; }
+        else if (arg != nil && ![arg isEqual:[NSNull null]]) { [parts addObject:[arg description]]; }
+        rmtDeliver(@{@"type": @"log", @"text": [parts componentsJoinedByString:@" "]});
+    };
+    [g_rmtCtx evaluateScript:@"var console={log:function(){print.apply(null,arguments);},error:function(){print.apply(null,arguments);},info:function(){print.apply(null,arguments);},warn:function(){print.apply(null,arguments);}};"];
+    installPrimitives(g_rmtCtx);
+    loadBridgeFiles(g_rmtCtx);
+    NSString *eng = loadEngineSource();
+    if (eng && [eng length]) [g_rmtCtx evaluateScript:eng];
+}
+
+// ---- 长轮询（long-polling）降级通道（build60）----
+// 适用场景：学校 4G 等网络 TLS 握手能过但掐 WS 数据帧。全部走普通 HTTPS 请求：
+//   register 一次拿 did/lpToken → 循环 GET poll（服务端挂起至有消息/25s 超时）→ POST send 回传。
+// 任意时刻都有一个 in-flight 请求，NAT 映射天然保温，无需额外心跳。
+static void rmtLPSend(NSDictionary *dict) {
+    if (!g_rmtLPBase || !g_rmtDID || !g_rmtLPSession) return;
+    NSMutableDictionary *m = [dict mutableCopy];
+    m[@"did"] = g_rmtDID;
+    m[@"lptoken"] = g_rmtLPToken;
+    NSData *body = [NSJSONSerialization dataWithJSONObject:m options:0 error:NULL];
+    if (!body) return;
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:
+        [NSURL URLWithString:[g_rmtLPBase stringByAppendingString:@"/lp/device/send"]]];
+    rq.HTTPMethod = @"POST";
+    [rq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    rq.HTTPBody = body;
+    NSURLSessionDataTask *tk = [g_rmtLPSession dataTaskWithRequest:rq completionHandler:nil];
+    [tk resume];
+}
+
+static void rmtLPStart(NSInteger gen) {
+    if (gen != g_rmtGen) return;
+    if (g_rmtTask) { [g_rmtTask cancel]; g_rmtTask = nil; }
+    if (g_rmtLPSession) { [g_rmtLPSession invalidateAndCancel]; g_rmtLPSession = nil; }
+    if (!g_rmtQueue) g_rmtQueue = dispatch_queue_create("ryc.remote.js", DISPATCH_QUEUE_SERIAL);
+    if (!g_rmtCtx) rmtMakeContext();
+    g_rmtMode = @"lp";
+    g_rmtState = @"connecting";
+    g_rmtLPFails = 0;
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    cfg.timeoutIntervalForRequest = 40;   // poll 最长挂 25s，40s 预算足够
+    g_rmtLPSession = [NSURLSession sessionWithConfiguration:cfg];
+
+    NSData *body = [NSJSONSerialization dataWithJSONObject:
+        @{@"token": g_rmtToken ?: @"", @"name": @"ipad-ryconsole"} options:0 error:NULL];
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:
+        [NSURL URLWithString:[g_rmtLPBase stringByAppendingString:@"/lp/device/register"]]];
+    rq.HTTPMethod = @"POST";
+    [rq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    rq.HTTPBody = body;
+    [[g_rmtLPSession dataTaskWithRequest:rq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if (gen != g_rmtGen) return;
+        if (err || !data) {
+            rmtTeardown([NSString stringWithFormat:@"长轮询注册失败：%@",
+                         err.localizedDescription ?: @"无响应（检查地址）"]);
+            return;
+        }
+        NSDictionary *m = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+        if (![m isKindOfClass:[NSDictionary class]] || ![m[@"ok"] boolValue]) {
+            NSString *why = [m isKindOfClass:[NSDictionary class]]
+                            ? [NSString stringWithFormat:@"%@", m[@"error"]] : @"响应异常";
+            rmtTeardown([NSString stringWithFormat:@"长轮询注册被拒：%@", why]);
+            return;
+        }
+        g_rmtDID = [NSString stringWithFormat:@"%@", m[@"did"] ?: @""];
+        g_rmtLPToken = [NSString stringWithFormat:@"%@", m[@"lpToken"] ?: @""];
+        g_rmtState = @"connected";
+        g_rmtLastError = @"";
+        NSLog(@"[remote] LP registered did=%@ -> connected", g_rmtDID);
+        rmtLPPoll(gen);
+    }] resume];
+}
+
+static void rmtLPPoll(NSInteger gen) {
+    if (gen != g_rmtGen || ![g_rmtMode isEqualToString:@"lp"] || !g_rmtLPSession) return;
+    NSString *u = [NSString stringWithFormat:@"%@/lp/device/poll?did=%@&lptoken=%@&wait=25",
+                   g_rmtLPBase, g_rmtDID, g_rmtLPToken];
+    [[g_rmtLPSession dataTaskWithURL:[NSURL URLWithString:u]
+        completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if (gen != g_rmtGen || ![g_rmtMode isEqualToString:@"lp"]) return;
+        if (err || !data) {
+            g_rmtLPFails++;
+            if (g_rmtLPFails > 5) {
+                rmtTeardown(@"长轮询连续失败（网络中断？）");
+                return;
+            }
+            g_rmtLastError = [NSString stringWithFormat:@"长轮询抖动，1 秒后重试（%ld/5）", (long)g_rmtLPFails];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)1 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                if (gen == g_rmtGen) rmtLPPoll(gen);
+            });
+            return;
+        }
+        NSDictionary *m = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+        if (![m isKindOfClass:[NSDictionary class]] || ![m[@"ok"] boolValue]) {
+            rmtTeardown(@"长轮询会话已失效（服务端重启？重新点连接即可）");
+            return;
+        }
+        g_rmtLPFails = 0;
+        NSArray *msgs = m[@"msgs"];
+        for (NSDictionary *one in msgs) rmtHandleMessage(one);
+        rmtLPPoll(gen);   // 立即续挂下一轮
+    }] resume];
+}
+
 static NSString *rmtStart(NSString *baseURL, NSString *token) {
-    if (g_rmtTask) rmtStop();
+    if (g_rmtTask || g_rmtLPSession) rmtStop();
     NSString *urlStr = rmtNormalizeURL(baseURL);
-    if (!urlStr) return @"{\"ok\":false,\"error\":\"地址无法解析\"}";
+    NSString *baseStr = rmtNormalizeBase(baseURL);
+    if (!urlStr || !baseStr) return @"{\"ok\":false,\"error\":\"地址无法解析\"}";
     if (!g_rmtQueue) g_rmtQueue = dispatch_queue_create("ryc.remote.js", DISPATCH_QUEUE_SERIAL);
     g_rmtGen++;                          // 作废旧会话的悬空回调/重试
     g_rmtURL = [urlStr copy];
+    g_rmtLPBase = [baseStr copy];        // 长轮询降级备用（build60）
     g_rmtToken = [token copy];
+    g_rmtMode = @"ws";
     g_rmtAttempt = 0;
     rmtConnectOnce(g_rmtGen);
     NSDictionary *st = @{@"ok": @YES, @"url": urlStr, @"state": g_rmtState};
@@ -2245,7 +2401,8 @@ static NSString *rmtStart(NSString *baseURL, NSString *token) {
 
 static NSString *rmtStatus(void) {
     NSUInteger n = g_rmtCtx ? 1 : 0;
-    NSDictionary *d = @{@"state": g_rmtState, @"ctx": @(n != 0), @"lastError": g_rmtLastError ?: @""};
+    NSDictionary *d = @{@"state": g_rmtState, @"ctx": @(n != 0), @"mode": g_rmtMode ?: @"ws",
+                        @"lastError": g_rmtLastError ?: @""};
     NSData *jd = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
     return jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding]
               : [NSString stringWithFormat:@"{\"state\":\"%@\",\"ctx\":%@,\"lastError\":\"\"}", g_rmtState, n ? @"true" : @"false"];
