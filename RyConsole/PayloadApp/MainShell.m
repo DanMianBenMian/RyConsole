@@ -255,10 +255,13 @@ extern NSString *RYRemoteStatus(void);
 @property (nonatomic, strong) UITextField *tokField;
 @property (nonatomic, strong) UIButton *connBtn;
 @property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UITextView *logView;
+@property (nonatomic, strong) UILabel *modeDot;       // build61：远程保活图标（☁️），区别于监听 ●
+@property (nonatomic, strong) UITextView *codeView;   // build61：收到的代码（上半区）
+@property (nonatomic, strong) UITextView *logView;    // 连接日志（下半区）
 @property (nonatomic, strong) NSTimer *timer;
 - (void)appendLog:(NSString *)line;
 - (void)pollStatus;
+- (void)doStartRemote;                                // build61：互斥确认后的真正启动
 @end
 
 @implementation RYRemotePane
@@ -313,9 +316,25 @@ extern NSString *RYRemoteStatus(void);
         self.statusLabel.tag = 9205;
         [self addSubview:self.statusLabel];
 
+        // build61：远程保活图标（☁️），与监听页 ● 区分
+        self.modeDot = ryLabel(@"☁️", 13.0f, RY_MUTED, NO);
+        self.modeDot.tag = 9206;
+        [self addSubview:self.modeDot];
+
+        // build61：收到的代码（上半区）
+        UIView *codePanel = ryPanel(self);
+        codePanel.tag = 9220;
+        UILabel *cl = ryLabel(@"收到的代码", 11.0f, RY_MUTED, NO);
+        cl.tag = 9221;
+        [codePanel addSubview:cl];
+        self.codeView = ryTextView(NO);
+        self.codeView.tag = 9222;
+        self.codeView.text = @"（等待 PC 端下发代码…）";
+        [codePanel addSubview:self.codeView];
+
         UIView *logPanel = ryPanel(self);
         logPanel.tag = 9210;
-        UILabel *ll = ryLabel(@"连接日志", 11.0f, RY_MUTED, NO);
+        UILabel *ll = ryLabel(@"连接日志 / 执行输出", 11.0f, RY_MUTED, NO);
         ll.tag = 9211;
         [logPanel addSubview:ll];
         self.logView = ryTextView(NO);
@@ -342,11 +361,21 @@ extern NSString *RYRemoteStatus(void);
     [[self viewWithTag:9202] setFrame:CGRectMake(10.0f, 58.0f, 140.0f, 14.0f)];
     [[self viewWithTag:9203] setFrame:CGRectMake(kPad, 74.0f, w - kPad * 2, 30.0f)];
     [[self viewWithTag:9204] setFrame:CGRectMake(kPad, 110.0f, 96.0f, 30.0f)];
-    [[self viewWithTag:9205] setFrame:CGRectMake(kPad + 104.0f, 117.0f, w - kPad * 2 - 104.0f, 16.0f)];
+    [[self viewWithTag:9206] setFrame:CGRectMake(kPad + 104.0f, 116.0f, 18.0f, 18.0f)];  // ☁️ 保活图标
+    [[self viewWithTag:9205] setFrame:CGRectMake(kPad + 126.0f, 117.0f, w - kPad * 2 - 126.0f, 16.0f)];
 
+    // build61：下方拆成上下两块 —— 上=收到的代码，下=连接日志
     CGFloat ly = 148.0f;
+    CGFloat codeH = floorf((h - ly - kPad) * 0.40f);
+    if (codeH < 80.0f) codeH = 80.0f;
+    UIView *codePanel = [self viewWithTag:9220];
+    codePanel.frame = CGRectMake(kPad, ly, w - kPad * 2, codeH);
+    [[codePanel viewWithTag:9221] setFrame:CGRectMake(10.0f, 5.0f, 120.0f, 14.0f)];
+    [[codePanel viewWithTag:9222] setFrame:CGRectMake(8.0f, 22.0f, codePanel.bounds.size.width - 16.0f, codePanel.bounds.size.height - 30.0f)];
+
+    CGFloat ly2 = ly + codeH + 8.0f;
     UIView *logPanel = [self viewWithTag:9210];
-    logPanel.frame = CGRectMake(kPad, ly, w - kPad * 2, h - ly - kPad);
+    logPanel.frame = CGRectMake(kPad, ly2, w - kPad * 2, h - ly2 - kPad);
     [[logPanel viewWithTag:9211] setFrame:CGRectMake(10.0f, 5.0f, 120.0f, 14.0f)];
     [[logPanel viewWithTag:9212] setFrame:CGRectMake(8.0f, 22.0f, logPanel.bounds.size.width - 16.0f, logPanel.bounds.size.height - 30.0f)];
 }
@@ -385,13 +414,20 @@ extern NSString *RYRemoteStatus(void);
             self.statusLabel.text = @"状态：未连接";
             self.statusLabel.textColor = RY_MUTED;
         }
+        self.modeDot.textColor = RY_MUTED;
     } else if ([state isEqualToString:@"connected"]) {
         self.statusLabel.text = @"状态：已连接 ✓";
         self.statusLabel.textColor = RY_GREEN;
+        self.modeDot.textColor = RY_GREEN;   // 远程保活图标亮绿
     } else {
         self.statusLabel.text = [NSString stringWithFormat:@"状态：%@…", state];
         self.statusLabel.textColor = RY_AMBER;
+        self.modeDot.textColor = RY_AMBER;
     }
+
+    // build61：收到的代码（PC 推来的 push_js）同步到上半区
+    NSString *rc = RYRemoteLastCode();
+    self.codeView.text = rc.length > 0 ? rc : @"（等待 PC 端下发代码…）";
 }
 
 - (void)onToggle {
@@ -404,6 +440,23 @@ extern NSString *RYRemoteStatus(void);
         [self appendLog:@"[local] 已断开"];
         return;
     }
+    // build61：互斥 —— 监听与远程只能开一个；开远程前若监听在跑，提示并踢掉监听
+    if (RYAutorunRunning()) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"监听与远程只能开一个"
+            message:@"开启远程连接会停止当前「监听」，确定吗？" preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        [a addAction:[UIAlertAction actionWithTitle:@"确定，断开监听" style:UIAlertActionStyleDestructive
+            handler:^(UIAlertAction *ac) {
+                RYAutorunStop();
+                [self doStartRemote];
+            }]];
+        [RYTopVCForPresent() presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    [self doStartRemote];
+}
+
+- (void)doStartRemote {
     NSString *addr = [self.urlField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     NSString *tok = [self.tokField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (addr.length == 0) { [self alert:@"请输入服务端地址"]; return; }
@@ -698,6 +751,20 @@ extern NSString *RYRemoteStatus(void);
     if ([sd[@"running"] boolValue]) {
         RYAutorunStop();
     } else {
+        // build61：互斥 —— 启动监听会断开远程；若远程已连，提示并踢掉远程
+        if (RYRemoteIsActive()) {
+            UIAlertController *a = [UIAlertController alertControllerWithTitle:@"监听与远程只能开一个"
+                message:@"启动监听会断开当前「远程连接」，确定吗？" preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+            [a addAction:[UIAlertAction actionWithTitle:@"确定，断开远程" style:UIAlertActionStyleDestructive
+                handler:^(UIAlertAction *ac) {
+                    RYRemoteStop();
+                    RYAutorunStart((int)port, nil, nil);
+                    [self refresh];
+                }]];
+            [RYTopVCForPresent() presentViewController:a animated:YES completion:nil];
+            return;
+        }
         RYAutorunStart((int)port, nil, nil);
     }
     [self refresh];
