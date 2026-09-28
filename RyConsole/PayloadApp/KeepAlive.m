@@ -19,7 +19,8 @@
 //
 
 #import "KeepAlive.h"
-#import "LiveActivityBridge.h"   // 脉冲里给灵动岛续保鲜期（ryLiveActivityTouch）
+#import "LiveActivityBridge.h"          // 脉冲里给监听灵动岛续保鲜期（ryLiveActivityTouch）
+#import "RemoteLiveActivityBridge.h"    // build63：顺带给远程连接灵动岛续保鲜期（ryRemoteLiveActivityTouch）
 
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
@@ -291,7 +292,10 @@ static NSData *ryKeepAliveWavData(void) {
             [self beginBgTask];
         }
         // 每 ~6 分钟给灵动岛续一次保鲜期（数字不动），避免"还在监听却被标成陈旧"
-        if (self.pulseCount % 45 == 0) ryLiveActivityTouch();
+        if (self.pulseCount % 45 == 0) {
+            ryLiveActivityTouch();
+            ryRemoteLiveActivityTouch();   // build63：远程连接活动（若没在跑则 no-op）
+        }
     } @catch (NSException *e) {
         NSLog(@"[KeepAlive] pulse 异常（已吞）: %@", e.reason);
     }
