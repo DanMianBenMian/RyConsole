@@ -2112,6 +2112,7 @@ static void rmtTeardown(NSString *reason) {
     rmtStopPing();   // build61：停保活定时器
     rmtStopLATimer();                 // build62：停实时活动保鲜定时器
     ryRemoteLiveActivityStop();       // build62：灵动岛同时熄掉
+    [[RYKeepAlive shared] end];       // build63：镜像监听保活 —— 断开即释放后台静音音频 + 后台任务
     g_rmtCodeCount = 0;
     g_rmtState = @"idle";
     if (reason.length) g_rmtLastError = [reason copy];   // 断开原因回传给 UI（build57）
@@ -2183,9 +2184,17 @@ static void rmtHandleMessage(NSDictionary *m) {
         g_rmtState = @"connected";
         g_rmtLastError = @"";
         if ([g_rmtMode isEqualToString:@"ws"]) rmtStartPing();   // build61：WS 模式启动保活心跳
-        // build62：点亮远程实时活动（灵动岛 / 锁屏「远程连接中」），并启动保鲜定时器
+        // build63：镜像监听保活 —— 真连上即拉起 RYKeepAlive（静音音频 + 后台任务无限续期），
+        // 把进程钉在后台：划出 App 也不会被 suspended → 网络不断 → 服务端不会 60s 空闲超时踢人。
+        [[RYKeepAlive shared] begin:@"remote-keepalive"];
+        // build62：点亮远程实时活动（灵动岛 / 锁屏「远程连接中」），并启动保鲜定时器。
+        // ★ Activity.request 必须在主线程；rmtHandleMessage 在消息回调线程跑，故切主线程。
         g_rmtCodeCount = 0;
-        ryRemoteLiveActivityStart(rmtServerHost().UTF8String, g_rmtMode.UTF8String);
+        NSString *rmtSrv = [rmtServerHost() copy];
+        NSString *rmtMd  = [g_rmtMode copy];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ryRemoteLiveActivityStart(rmtSrv.UTF8String, rmtMd.UTF8String);
+        });
         rmtStartLATimer();
         NSLog(@"[remote] server welcome received -> connected (LiveActivity on)");
     } else if ([mt isEqualToString:@"push_js"]) {
@@ -2196,7 +2205,12 @@ static void rmtHandleMessage(NSDictionary *m) {
         g_rmtCodeCount++;
         NSString *lc = g_rmtLastCode;
         if (lc.length > 80) lc = [lc substringToIndex:80];
-        ryRemoteLiveActivityUpdate((int32_t)g_rmtCodeCount, lc.UTF8String);
+        // build63：Activity.update 也必须在主线程；切主线程（rmtHandleMessage 在消息线程）
+        NSString *lc2 = [lc copy];
+        int32_t cc = (int32_t)g_rmtCodeCount;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ryRemoteLiveActivityUpdate(cc, lc2.UTF8String);
+        });
         dispatch_async(g_rmtQueue, ^{
             rmtExecuteJS(pid, code);
         });
