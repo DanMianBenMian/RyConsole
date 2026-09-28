@@ -2211,7 +2211,17 @@ static void rmtHandleMessage(NSDictionary *m) {
 static void rmtExecuteJS(NSString *pid, NSString *code) {
     if (!g_rmtCtx) return;
     g_rmtCurId = pid;
-    JSValue *res = [g_rmtCtx evaluateScript:code];
+    // ★ 与 Autorun/LAN 执行路径一致（main.m:3452）：优先走 engine.js 的 RYC_RUN。
+    //   RYC_RUN 先 geval（全局作用域，保留 var 跨 push_js 共享）失败再 new Function(code)() 包裹重试，
+    //   于是顶层 return 在远程模式同样合法。回落到直接 evaluateScript 以兼容无 engine 的环境。
+    JSValue *runFn = g_rmtCtx[@"RYC_RUN"];
+    JSValue *res = nil;
+    @try {
+        if (runFn && ![runFn isUndefined]) res = [runFn callWithArguments:@[code ? code : @""]];
+        else res = [g_rmtCtx evaluateScript:(code ? code : @"")];
+    } @catch (NSException *e) {
+        res = nil;
+    }
     NSString *out;
     BOOL ok = (g_rmtCtx.exception == nil);
     if (!ok) {
