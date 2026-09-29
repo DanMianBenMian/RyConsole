@@ -2035,6 +2035,21 @@ static NSString *g_rmtCurId = nil;   // 正在执行的 push_js id（异常回�
 static NSString *g_rmtState = @"idle";
 static NSString *g_rmtLastError = nil;  // 最近一次断开原因（build57 回传 UI）
 static NSString *g_rmtLastCode = nil;   // build61：最近一次 PC 推来的代码（远程页「收到的代码」区显示）
+// build66：本机日志环形缓冲 —— 探针收到 / print 输出 / 结果回传事件，供远程页「连接日志」面板轮询 drain。
+//   此前这些事件只 rmtDeliver 回 PC，本地面板永远看不到（用户 2026-09-29 报的）。
+static NSMutableArray *g_rmtLogLines = nil;
+static NSString *rmtLogTrunc(NSString *s, NSUInteger max) {   // 安全截断（不劈开代理对 / 组合字符）
+    if (s.length <= max) return s;
+    NSRange r = [s rangeOfComposedCharacterSequenceAtIndex:max - 1];
+    return [[s substringToIndex:NSMaxRange(r)] stringByAppendingString:@"…"];
+}
+static void rmtLogAdd(NSString *line) {
+    if (!g_rmtLogLines) g_rmtLogLines = [NSMutableArray array];
+    @synchronized (g_rmtLogLines) {
+        if ([g_rmtLogLines count] >= 400) [g_rmtLogLines removeObjectAtIndex:0];   // 环形：防刷屏撑爆内存
+        [g_rmtLogLines addObject:line];
+    }
+}
 static NSTimer *g_rmtPingTimer = nil;   // build61：WS 模式保活定时器（sendPing 心跳）
 // build61：保活函数前向声明（须在 rmtTeardown / rmtHandleMessage 调用前可见）
 static void rmtStartPing(void);
@@ -2191,6 +2206,7 @@ static void rmtHandleMessage(NSDictionary *m) {
         NSString *pid = [NSString stringWithFormat:@"%@", m[@"id"] ?: @""];
         NSString *code = [NSString stringWithFormat:@"%@", m[@"code"] ?: @""];
         g_rmtLastCode = [code copy];   // build61：记录 PC 推来的代码，供远程页「收到的代码」区显示
+        rmtLogAdd([NSString stringWithFormat:@"[探针] 收到 push_js id=%@ · %lu 字符", pid, (unsigned long)code.length]);   // build66：本地面板也可见
         // build62：实时活动「收到段数」+ 最近代码预览（截断，避免超长代码撑爆灵动岛）
         g_rmtCodeCount++;
         NSString *lc = g_rmtLastCode;
@@ -2232,6 +2248,8 @@ static void rmtExecuteJS(NSString *pid, NSString *code) {
     }
     if (out.length > 65536) out = [[out substringToIndex:65536] stringByAppendingString:@"\n...[truncated 64KB]"];
     rmtDeliver(@{@"type": @"result", @"id": pid, @"ok": @(ok), @"output": out});
+    rmtLogAdd([NSString stringWithFormat:@"[回传] result id=%@ ok=%@ → %@",
+               pid, ok ? @"true" : @"false", rmtLogTrunc(out, 600)]);   // build66：结果回传本地面板可见
     g_rmtCurId = nil;
 }
 
@@ -2359,7 +2377,9 @@ static void rmtMakeContext(void) {
         NSMutableArray *parts = [NSMutableArray array];
         if ([arg isKindOfClass:[NSArray class]]) { for (id a in arg) [parts addObject:[a description]]; }
         else if (arg != nil && ![arg isEqual:[NSNull null]]) { [parts addObject:[arg description]]; }
-        rmtDeliver(@{@"type": @"log", @"text": [parts componentsJoinedByString:@" "]});
+        NSString *txt = [parts componentsJoinedByString:@" "];
+        rmtLogAdd([NSString stringWithFormat:@"[输出] %@", rmtLogTrunc(txt, 2000)]);   // build66：print 输出本地面板可见
+        rmtDeliver(@{@"type": @"log", @"text": txt});
     };
     [g_rmtCtx evaluateScript:@"var console={log:function(){print.apply(null,arguments);},error:function(){print.apply(null,arguments);},info:function(){print.apply(null,arguments);},warn:function(){print.apply(null,arguments);}};"];
     installPrimitives(g_rmtCtx);
@@ -2508,6 +2528,16 @@ static NSString *rmtStatus(void) {
 NSString *RYRemoteStart(NSString *url, NSString *token) { return rmtStart(url, token); }
 NSString *RYRemoteStop(void)  { return rmtStop(); }
 NSString *RYRemoteStatus(void){ return rmtStatus(); }
+// build66：跨文件导出 —— 远程页 1s 轮询时把新增的 [探针]/[输出]/[回传] 事件取走显示（取走即清空）
+NSString *RYRemoteDrainLogs(void) {
+    if (!g_rmtLogLines) return @"";
+    NSMutableString *out = [NSMutableString string];
+    @synchronized (g_rmtLogLines) {
+        for (NSString *l in g_rmtLogLines) [out appendFormat:@"%@\n", l];
+        [g_rmtLogLines removeAllObjects];
+    }
+    return out;
+}
 NSString *RYRemoteLastCode(void) { return g_rmtLastCode ?: @""; }   // build61：远程页「收到的代码」
 BOOL RYRemoteIsActive(void) { return ![g_rmtState isEqualToString:@"idle"]; }  // build61：互斥查询
 
