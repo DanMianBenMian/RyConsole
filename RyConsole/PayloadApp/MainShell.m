@@ -253,6 +253,7 @@ static void ryScrollToBottom(UITextView *tv) {
 extern NSString *RYRemoteStart(NSString *url, NSString *token);
 extern NSString *RYRemoteStop(void);
 extern NSString *RYRemoteStatus(void);
+extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日志（[探针]/[输出]/[回传]），取走即清空
 
 @interface RYRemotePane : UIView
 @property (nonatomic, strong) UITextField *urlField;
@@ -393,6 +394,8 @@ extern NSString *RYRemoteStatus(void);
 }
 
 - (void)pollStatus {
+    NSString *pending = RYRemoteDrainLogs();   // build66：探针收到 / print 输出 / 结果回传 落到连接日志面板
+    if (pending.length) [self appendLog:pending];
     NSString *s = RYRemoteStatus();
     static NSString *last = nil;
     if (![s isEqualToString:last ?: @""]) {
@@ -1142,6 +1145,11 @@ extern NSString *RYRemoteStatus(void);
     __weak RYShellVC *weakSelf = self;
     RYAutorunObserve(^{ [weakSelf refreshSideStatus]; });
 
+    // build66：1s 轮询刷新侧栏状态 —— 远程状态变化没有 observer，只能轮询（与远程页 pollStatus 同款机制）
+    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+        [weakSelf refreshSideStatus];
+    }];
+
     [self select:0];
 
     // 键盘避让
@@ -1287,10 +1295,27 @@ extern NSString *RYRemoteStatus(void);
                                           options:0 error:NULL];
     if ([o isKindOfClass:[NSDictionary class]]) sd = (NSDictionary *)o;
     BOOL running = [sd[@"running"] boolValue];
-    self.sideStatus.text = running
-        ? [NSString stringWithFormat:@"● 监听中 :%d", [sd[@"port"] intValue]]
-        : @"● 未启动";
-    self.sideStatus.textColor = running ? RY_GREEN : RY_MUTED;
+    if (running) {
+        self.sideStatus.text = [NSString stringWithFormat:@"● 监听中 :%d", [sd[@"port"] intValue]];
+        self.sideStatus.textColor = RY_GREEN;
+        return;
+    }
+    // build66：远程连接也点亮侧栏状态 —— 此前只看监听，远程连着仍显示「未启动」（用户 2026-09-29 报的）
+    //   远程状态变化不触发 RYAutorunObserve，由 RYShellVC 的 1s 轮询定时器驱动本方法刷新。
+    id ro = [NSJSONSerialization JSONObjectWithData:[RYRemoteStatus() dataUsingEncoding:NSUTF8StringEncoding]
+                                           options:0 error:NULL];
+    NSString *rs = ([ro isKindOfClass:[NSDictionary class]]
+                    ? (NSString *)((NSDictionary *)ro[@"state"] ?: @"idle") : @"idle");
+    if ([rs isEqualToString:@"connected"]) {
+        self.sideStatus.text = @"● 远程已连接";
+        self.sideStatus.textColor = RY_GREEN;
+    } else if ([rs isEqualToString:@"connecting"]) {
+        self.sideStatus.text = @"● 远程连接中";
+        self.sideStatus.textColor = RY_AMBER;
+    } else {
+        self.sideStatus.text = @"● 未启动";
+        self.sideStatus.textColor = RY_MUTED;
+    }
 }
 
 - (void)onKeyboard:(NSNotification *)n {
