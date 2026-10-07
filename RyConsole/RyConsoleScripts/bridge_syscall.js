@@ -145,7 +145,14 @@ function errnoName(n) { return serrno(n); }
 //   xnu 的行为：sopt_name 当作 mib[0]，输出缓冲区**头 4 字节**被当作 mib[1] 读取。
 //
 //   用法：sysctlSock(ctl, name, bufSize?)  ← 例 sysctlSock(1 /*CTL_KERN*/, 1 /*KERN_VERSION*/, 512)
-//   ★ 未经真机验证：第一次跑先看第 1 步 socket 的返回（fd<0 说明这条路现代 iOS 已被封）。
+//
+//  2026-10-07 iPadOS 27B2 真机实测（iPad10 / RyConsole 沙盒）：
+//    · socket(AF_SYSCTL=2, SOCK_DGRAM, 0) **建得成功**（拿到合法 fd）—— 没堵 socket 创建；
+//    · 但 getsockopt(117) 一律回 EINVAL(22)，与 ctl/name 取值无关 → AF_SYSCTL 通路在本固件上**走不通**。
+//    · 对照：sysctl(202) 直接调也大面积 EPERM(1) —— seatbelt 对 SYS_sysctl 号按 **mib 白名单** 过滤，
+//      白名单外一律 EPERM（白名单内的 kern.osversion 能读，kern.version / hw.memsize 被拒）。
+//    ⇒ 结论：别指望 syscall(202) 当通用 sysctl，读系统值用现成的 sysctlGet()；
+//      syscall 原语本身仍然可用（open(5) 实测真进内核、errno 正确回传）。
 // ---------------------------------------------------------------------------
 function sysctlSock(ctl, name, bufSize) {
   ctl  = parseInt(ctl, 10);
