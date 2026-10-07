@@ -24,6 +24,18 @@ function alloc(n) {
   var r = J(callPtr(c.addr, [1, n]));
   return (r && r.ok === true) ? parseInt(r.value, 16) : 0;
 }
+// memWrite 只吃 hex/b64，不吃 number 数组 —— bridge_syscall 里已有一份，这里兜底再定义一次
+if (typeof rycU32le !== "function") {
+  rycU32le = function (n) { return ("0000000" + (((n | 0) >>> 0).toString(16))).slice(-8); };
+  rycU64le = function (n) { return rycU32le(n) + rycU32le(0); };
+  rycAsciiHex = function (s) {
+    var h = "";
+    for (var i = 0; i < s.length; i++) { var c = s.charCodeAt(i) & 0xff; h += ("0" + c.toString(16)).slice(-2); }
+    return h;
+  };
+  rycReadU32 = function (h) { return (h && h.length >= 8) ? parseInt(h.slice(0, 8), 16) >>> 0 : 0; };
+}
+function readU32(addr) { try { return rycReadU32(memRead(addr, 8)); } catch (e) { return 0; } }
 
 // ---------- ① 速查 ----------
 print("[1] 号表/errno 速查");
@@ -56,14 +68,12 @@ ck(String(syscallName(12345)).indexOf("未收录") === 0, "未收录如实报未
   print("[4] syscall(202, mib={CTL_KERN=1, KERN_VERSION=1}, 2, buf, oldlen)");
   var mib = alloc(8), buf = alloc(512), lp = alloc(8);
   if (!mib || !buf || !lp) { ck(false, "分配 mib/buf/len 缓冲", "calloc 失败"); return; }
-  memWrite(mib, [1, 0, 0, 0, 1, 0, 0, 0]);            // mib[0]=1 CTL_KERN, mib[1]=1 KERN_VERSION
-  memWrite(lp,  [512, 0, 0, 0, 0, 0, 0, 0]);         // oldlen = 512
-  var r = J(syscall(202, mib, 2, buf, lp, 0, 0));
+  memWrite(mib, rycU64le(1) + rycU32le(1));          // mib = {CTL_KERN=1, KERN_VERSION=1}（8 字节小端）
+  memWrite(lp,  rycU64le(512));                      // oldlen = 512
+  var r = J(syscall(202, mib, 2, buf, lp));   // number + a..d 正好四参，多余的 newp/newlen 留 0
   print("    " + JSON.stringify(r).slice(0, 200));
-  var raw = J(syscall(202, mib, 2, buf, lp, 0, 0));
   if (!r || r.ok !== true) { ck(false, "sysctl(202) 调用", JSON.stringify(r)); return; }
-  var len = 0;
-  try { var h = memRead(lp, 8); len = parseInt(h, 16); } catch (e) {}
+  var len = readU32(lp);                             // 内核回写后的真实长度
   var ver = "";
   try { ver = atob(memRead(buf, len > 0 ? len : 0)).replace(/\0.*$/, ""); } catch (e) {}
   print("    len=" + len + "  version=\"" + ver + "\"");
@@ -75,13 +85,13 @@ ck(String(syscallName(12345)).indexOf("未收录") === 0, "未收录如实报未
   print("[5] syscall(5=open, \"/nonexistent_zzz\") —— 期望 -1 + errno=2 ENOENT");
   var p = alloc(24);
   if (!p) { ck(false, "构造路径缓冲", "calloc 失败"); return; }
-  memWrite(p, [0x2f, 0x6e, 0x6f, 0x6e, 0x65, 0x78, 0x69, 0x73, 0x74, 0x65, 0x6e, 0x74, 0x5f, 0x7a, 0x7a, 0x7a, 0, 0, 0, 0, 0, 0, 0, 0]); // "/nonexistent_zzz"
-  var r = J(syscall(5, p, 0, 0, 0, 0));
+  memWrite(p, rycAsciiHex("/nonexistent_zzz") + "00000000");   // ASCII + NUL 结尾
+  var r = J(syscall(5, p, 0, 0, 0));         // open(path, flags, mode, …)
   print("    " + JSON.stringify(r).slice(0, 200));
   if (!r || r.ok !== true) { ck(false, "open syscall 返回", JSON.stringify(r)); return; }
   var isErr = (r.ret === -1 || parseInt(r.value, 16) === -1 || parseInt(r.value, 16) === 0xffffffffffffffff);
   print("    errno=" + r.errno + " → " + (r.errno ? serrno(r.errno) : "(无)"));
-  ck(isErr && r.errno === 2, "open 失败回 -1 + ENOENT", "errrno=" + r.errno + " 期望 2");
+  ck(isErr && r.errno === 2, "open 失败回 -1 + ENOENT", "errno=" + r.errno + " 期望 2");
 })();
 
 // ---------- ⑥ AF_SYSCTL socket 通路（未验证项，看 socket 那步）----------
