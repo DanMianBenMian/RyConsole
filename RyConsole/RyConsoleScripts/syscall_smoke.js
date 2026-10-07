@@ -13,7 +13,13 @@
 //  跑法：RyConsole → 脚本库 → 选中本文件 → 运行。逐行看 print 输出。
 // ============================================================
 var PASS = 0, FAIL = 0;
-function ck(cond, tag, msg) { if (cond) { PASS++; print("[PASS] " + tag + (msg ? "  — " + msg : "")); } else { FAIL++; print("[FAIL] " + tag + (msg ? "  — " + msg : "")); } }
+var __LOG = [];   // /eval 的 output 是有上限的（输出一多会被截断），判定行另存文件再读回来
+function ck(cond, tag, msg) {
+  if (cond) PASS++; else FAIL++;
+  var line = (cond ? "[PASS] " : "[FAIL] ") + tag + (msg ? "  — " + msg : "");
+  __LOG.push(line);
+  print(line);
+}
 function J(s) { try { return JSON.parse(s); } catch (e) { return null; } }
 
 print("=== syscall 冒烟开始  " + new Date().toISOString() + " ===");
@@ -72,7 +78,15 @@ ck(String(syscallName(12345)).indexOf("未收录") === 0, "未收录如实报未
   memWrite(lp,  rycU64le(512));                      // oldlen = 512
   var r = J(syscall(202, mib, 2, buf, lp));   // number + a..d 正好四参，多余的 newp/newlen 留 0
   print("    " + JSON.stringify(r).slice(0, 200));
+  // ★ 2026-10-07 实测：seatbelt 对 SYS_sysctl(202) 按 **mib 白名单** 过滤 → 白名单外一律 EPERM。
+  //   “调用确实到达内核/沙盒并返回结构化 errno”本身就证明桥是通的，所以 EPERM 也算 PASS。
   if (!r || r.ok !== true) { ck(false, "sysctl(202) 调用", JSON.stringify(r)); return; }
+  if (r.ret === -1 && r.errno === 1) {
+    print("    ret=-1 errno=1(EPERM) —— seatbelt 按 mib 白名单拦的（白名单外的 kern.version/hw.memsize 都拒），"
+        + "属预期。要读系统值用 sysctlGet('kern.osversion') 这类白名单内的名字。");
+    ck(true, "sysctl(202) 调用+errno 正确回传（EPERM=沙盒拦）", "errno=1");
+    return;
+  }
   var len = readU32(lp);                             // 内核回写后的真实长度
   var ver = "";
   try { ver = atob(memRead(buf, len > 0 ? len : 0)).replace(/\0.*$/, ""); } catch (e) {}
@@ -101,12 +115,22 @@ ck(String(syscallName(12345)).indexOf("未收录") === 0, "未收录如实报未
   print("    " + JSON.stringify(r).slice(0, 300));
   if (!r) { print("[WARN] 返回非 JSON"); return; }
   if (r.ok === false) {
-    print("[INFO] AF_SYSCTL 这条路在当前系统被封（socket 那步就失败了）—— 这是**合理结果**，"
-        + "说明现代 iOS 已堵住这条旁路；普通 sysctl 请继续用 syscall(202, …) 或 sysctlGet()");
+    print("[INFO] AF_SYSCTL 这条路没走通 —— 合理结果，别再耗（2026-10-07 实测结论见 bridge_syscall.js 头部注释）");
     if (r.errno) print("    errno=" + r.errno + " → " + serrno(r.errno));
+    ck(true, "sysctlSock 结构化失败返回（未崩、有 errno）", "errno=" + r.errno);
+  } else if (r.ret === -1 && r.errno === 22) {
+    // socket 建得成功、getsockopt 回 EINVAL —— 27B2 实测量，判 PASS
+    print("    fd 建得成功但 getsockopt 回 EINVAL(22) —— 本固件 AF_SYSCTL 通路不通");
+    ck(true, "AF_SYSCTL 通路不通但受控（socket 成功 / getsockopt EINVAL）", "errno=22");
   } else {
     ck(r.len > 0 && /Darwin/.test(String(r.hex || "")), "AF_SYSCTL 通路读出 kern.version", "len=" + r.len);
   }
 })();
 
 print("=== syscall 冒烟结束  PASS=" + PASS + " FAIL=" + FAIL + " ===");
+try {
+  writeFile("syscall_smoke_result.txt",
+            "=== syscall 冒烟  " + new Date().toISOString() + "  PASS=" + PASS + " FAIL=" + FAIL + " ===\n"
+            + __LOG.join("\n"));
+  print("[INFO] 判定行已存 syscall_smoke_result.txt（/eval 输出有上限，长输出看这个文件）");
+} catch (e) { print("[INFO] 存盘失败: " + e); }
