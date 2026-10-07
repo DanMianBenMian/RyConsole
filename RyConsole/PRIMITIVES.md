@@ -475,9 +475,14 @@ syscall(202, mib, 2, buf, lp, 0, 0);      // ← 就这一行
 `getsockopt(117)` 号进入同一套 sysctl 逻辑，有时能绕开那个检查点。xnu 的行为：`sopt_name` 当下 `mib[0]`，
 并把这个**输出缓冲区的头 4 字节**当作 `mib[1]` 读 —— 所以要先往 buf 写 `mib[1]` 再调。
 
-> ⚠ **未经真机验证**：代码按 xnu 语义写全了（socket → calloc/malloc → memWrite mib → getsockopt → 回读 → 关 fd），
-> 但第一次跑的重点是**看 socket 那一步的 errno** —— 现代 iOS 多半已经封死 AF_SYSCTL 这条路。
-> 封了就是合理结果，别硬凑；这时继续用 `syscall(202, …)` 或 `sysctlGet()` 即可。
+> **2026-10-07 iPadOS 27B2（iPad10 / RyConsole 沙盒）真机实测结论**：
+> `socket(AF_SYSCTL=2, SOCK_DGRAM, 0)` **建得成功**（拿到合法 fd），但 `getsockopt(117)` 一律回 `EINVAL(22)`，
+> 与 ctl/name 取值无关 → **AF_SYSCTL 通路在本固件上走不通，别再耗**。
+> 同一轮对照组说明了一件事：`sysctl(202)` 直接调也是大面积 `EPERM(1)` —— **seatbelt 对 `SYS_sysctl` 号按
+> **mib 白名单**过滤**，白名单外（`kern.version` / `hw.memsize`）一律 EPERM，白名单内（`kern.osversion`）能读
+> （实测 `sysctlGet("kern.osversion")` → `24A5370h`）。
+> ⇒ **读系统值用 `sysctlGet()`，别指望 `syscall(202)` 当通用 sysctl**；
+> syscall 原语本身仍然可用 —— `open(5)` 实测真进内核并正确回传 `errno=2 ENOENT`。
 
 **红线提醒**：沙盒在 syscall 号上普遍有检查点，返回 `EPERM(1)` / `ENOSYS(38)` 是**预期结果**，不是桥坏了。
 
