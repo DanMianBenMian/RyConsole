@@ -23,6 +23,21 @@ RYC_BRIDGES["bridge_syscall"] = BRIDGE_VERSION;
 function rycJ(s) { try { return JSON.parse(s); } catch (e) { return null; } }
 function rycNum(v) { var o = rycJ(v); return (o && o.ok === true && o.value) ? parseInt(o.value, 16) : NaN; }
 
+// ★ memWrite 只吃 hex 串 / "b64:…" / {b64:"…"}，**不吃 number 数组**（传数组会报
+//   "data 必须是 hex 串 / b64…"）。所以写内存一律先拼小端 hex。
+function rycU32le(n) { return ("0000000" + (((n | 0) >>> 0).toString(16))).slice(-8); }
+function rycU64le(n) { return rycU32le(n) + rycU32le(0); }        // 低 32 位 + 高 32 位（小端）
+function rycAsciiHex(s) {
+  var h = "";
+  for (var i = 0; i < s.length; i++) { var c = s.charCodeAt(i) & 0xff; h += ("0" + c.toString(16)).slice(-2); }
+  return h;
+}
+// 从缓冲里按小端读一个 u32（memRead 给的是 hex 串）
+function rycReadU32(hexStr) {
+  if (!hexStr || hexStr.length < 8) return 0;
+  return parseInt(hexStr.slice(0, 8), 16) >>> 0;
+}
+
 // ---------------------------------------------------------------------------
 //  主原语：syscall(number, a, b, c, d, opts?)
 //   · a..d 可以任意省略（传 undefined/null 的尾部会被裁掉）
@@ -146,26 +161,28 @@ function sysctlSock(ctl, name, bufSize) {
   }
 
   // ① socket(AF_SYSCTL=2, SOCK_DGRAM=2, protocol=0)
-  var so = rycNum(syscall(97, 2, 2, 0, 0));
-  if (isNaN(so) || so < 0) {
-    var se = rycJ(syscall(97, 2, 2, 0, 0));
+  //    ★ 这里用 syscall(97,2,2,0,0) 五参形态；getsockopt 要 6 个实参，超了 → 走 syscallRaw 直透 syscallN。
+  var soRaw = syscall(97, 2, 2, 0, 0);
+  var soo = rycJ(soRaw);
+  var so = rycNum(soRaw);
+  if (!soo || soo.ok !== true || isNaN(so) || so < 0 || so > 4096) {
     return fin(false, { error: "[sysctlSock error] socket(AF_SYSCTL,SOCK_DGRAM,0) 失败 —— AF_SYSCTL 这条路上现代 iOS 多半已封",
-                        errno: se && se.errno ? se.errno : null,
-                        why: se && se.errno ? serrno(se.errno) : "（无 errno 返回）", syscallNo: 97 });
+                        errno: soo && soo.errno ? soo.errno : null,
+                        why: soo && soo.errno ? serrno(soo.errno) : "（无 errno 返回）", syscallNo: 97 });
   }
   // ② 两块临时内存：buf（放 mib[1] 头 4 字节 + 收数据）、lenp（in/out 的长度变量）
   var cb = rycNum(callPtr(dlsymAddr(0, "calloc").addr, [1, sz]));
   var mb = rycNum(callPtr(dlsymAddr(0, "malloc").addr, [8]));
   if (isNaN(cb) || isNaN(mb)) return fin(false, { error: "[sysctlSock error] calloc/malloc 分配失败", fd: so });
-  // ③ len = sz
-  memWrite(mb, [sz & 0xff, (sz >>> 8) & 0xff, (sz >>> 16) & 0xff, (sz >>> 24) & 0xff, 0, 0, 0, 0]);
-  // ④ buf 头 4 字节 = mib[1]
-  memWrite(cb, [name & 0xff, (name >>> 8) & 0xff, (name >>> 16) & 0xff, (name >>> 24) & 0xff]);
-  // ⑤ getsockopt(fd, 0, mib[0]=ctl, buf, lenp)
-  var go = rycJ(syscall(117, so, 0, ctl, cb, mb, 0));
+  // ③ len = sz（size_t 8 字节小端）
+  memWrite(mb, rycU64le(sz));
+  // ④ buf 头 4 字节 = mib[1]（u32 小端）
+  memWrite(cb, rycU32le(name));
+  // ⑤ getsockopt(fd, 0, mib[0]=ctl, buf, lenp) —— 6 实参 → 走 syscallRaw 直透 syscallN
+  var go = rycJ(syscallRaw(117, [so, 0, ctl, cb, mb], null));
   var ret = (go && go.ok === true) ? (go.ret === -1 ? -1 : parseInt(go.value, 16)) : NaN;
   var outLen = 0;
-  try { var raw = atob(memRead(mb, 8)); outLen = (raw.charCodeAt(0) | (raw.charCodeAt(1) << 8) | (raw.charCodeAt(2) << 16) | (raw.charCodeAt(3) << 24)) >>> 0; } catch (e) {}
+  try { outLen = rycReadU32(memRead(mb, 8)); } catch (e) {}
   if (outLen > sz) outLen = sz;
   var payload = "";
   try { payload = memRead(cb, outLen > 0 ? outLen : 0); } catch (e) {}
