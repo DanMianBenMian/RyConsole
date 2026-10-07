@@ -108,7 +108,7 @@ var PRIM_DOC = [
            { n: "bufSize", t: "number", r: "可选，默认 512，上限 65536" }],
     ret: "{ok:true, ret, len, hex, errno}  —— hex 为输出缓冲的十六进制",
     errs: "socket(AF_SYSCTL,...) 失败 → {ok:false,\"error\":\"[sysctlSock error] …AF_SYSCTL 这条路上现代 iOS 多半已封\"}",
-    hint: "⚠ 未经真机验证：AF_SYSCTL(2) 域把 sysctl 逻辑伪装成 getsockopt(117) 号进内核，目的是绕开沙盒在 SYS_sysctl(202) 号上的检查点；xnu 会把输出缓冲区**头 4 字节**当 mib[1] 读，所以先往 buf 写 mib[1]。第一次跑先看 socket 那步的 errno —— 现代 iOS 多半已经封死这条路，封了就别硬凑" },
+    hint: "⚠ 已实测（27B2 / iPad10）：socket(AF_SYSCTL,SOCK_DGRAM,0) 建得成功，但 getsockopt 一律 EINVAL(22) —— **这条路在本固件走不通，别再耗**。顺带实测：seatbelt 对 SYS_sysctl(202) 号按 **mib 白名单**过滤，白名单外（kern.version/hw.memsize）一律 EPERM，白名单内（kern.osversion）能读 → 读系统值用 sysctlGet()" },
 
   // ---------- Stage2 竞态 harness（V2.4.3，RACE_plan_v2 方案A） ----------
   { cat: "竞态", name: "threadSpawn", sig: "threadSpawn(fnBodyStr, nWorkers)", err: "self",
