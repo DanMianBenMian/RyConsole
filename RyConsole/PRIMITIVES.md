@@ -13,6 +13,7 @@
 > | **V2.3.0** | **`callPtr`（C 函数指针调用/FFI）**——补齐 dlopen/dlsym 之后最后一环；规格见 `RYCONSOLE_CALLPTR_SPEC.md`（§14 有完整说明） |
 > | **V2.4.20** | **Tier 3 原生 Mach 竞态桥 9 桥**（`portAlloc/portInsertRight/portDealloc/portDestroy/portModRefs/portType` + `vmAlloc/vmDealloc` + `iokitCallPort`）+ `envCred` |
 > | **V2.4.21** | **变参 FFI 修复**：`callVariadic`（真·ABI 上栈 + errno 透传）、`syscallN`（号段校验 + csops 死亡名单）；`callPtr` 输出加 `bufAddr*`（详见 §15.5） |
+> | **V2.4.27** | **动态层新桥 `bridge_syscall.js`**：`syscall(number,a,b,c,d)` 签名糖、`syscallRaw`、`syscallName`、`/serrno/errnoName`、AF_SYSCTL 通路 `sysctlSock`（详见 §15.6，**不新增原生原语，原生保持 81 个**） |
 
 ## 通用约定
 
@@ -445,6 +446,40 @@ syscallN(202, [mibHex, 2, bufHex, lenPtrHex, 0, 0]);  // 失败时看 errno：EP
 ```
 
 **红线不变**：只支持整型/指针返回；变参只适配"第 0 个命名参数"形态（syscall/printf 族）。
+
+### 15.6 syscall 签名糖 —— `syscall(number, a, b, c, d)`（V2.4.27 · `bridge_syscall.js`）★
+
+> `syscallN` 已经能用，但它要手写 args 数组、还要数尾部 `null`。这一层只是**签名糖 + 号/errno 速查 + AF_SYSCTL 通路**，
+> 全部在动态层（桥热更新），**不动原生、不重编 IPA**。原生 `syscallN` 若哪天被摘掉，`syscall()` 自动降级到
+> `dlsymAddr(0,'syscall')` + `callVariadic`（再不行 `callPtr` 固定元数）两条兜底通道。
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| **`syscall`** | `(number, a, b, c, d, opts?) → syscallN 的 JSON` | 用户点名的形态。`a..d` 可任意省略（只有 `undefined`/`null` 的尾部才裁），**`0` 是合法实参不丢**。守卫与闸门都在原生层：号越界 / `csops(45)` 死亡名单先拦 |
+| **`syscallRaw`** | `(number, args, opts?)` | `syscallN` 直透；要精确控制槽位（比如留一个 `null` 占位）时用 |
+| **`syscallName`** | `(n) → "202 = sysctl"` | 号→名。只收**高置信**的二十余条；**未收录就如实说未收录，不编假名**。权威表在设备上：`readFile('/usr/include/sys/syscall_sw.h')` |
+| **`serrno`** / **`errnoName`** | `(e) → "EPERM 权限不足（沙盒/AMFI 拒绝）"` | errno→名+人话，核心 30 条；未收录给原始数字。完整表 `readFile('/usr/include/sys/errno.h')` |
+| **`sysctlSock`** | `(ctl, name, bufSize?) → {ok, ret, len, hex, errno}` | **AF_SYSCTL socket 通路**（见下） |
+
+```js
+// 读 kern.version：mib/oldlen 都用 calloc + memWrite 现造
+var mib = alloc(8), buf = alloc(512), lp = alloc(8);
+memWrite(mib, [1,0,0,0, 1,0,0,0]);        // mib = {CTL_KERN=1, KERN_VERSION=1}
+memWrite(lp,  [512,0,0,0, 0,0,0,0]);      // oldlen = 512
+syscall(202, mib, 2, buf, lp, 0, 0);      // ← 就这一行
+```
+
+#### `sysctlSock` —— AF_SYSCTL 通路（用户点名的备选方案）
+
+沙盒的检查点挂在 `SYS_sysctl(202)` **这个号**上；`socket(AF_SYSCTL=2, SOCK_DGRAM=2, 0)` 之后改从
+`getsockopt(117)` 号进入同一套 sysctl 逻辑，有时能绕开那个检查点。xnu 的行为：`sopt_name` 当下 `mib[0]`，
+并把这个**输出缓冲区的头 4 字节**当作 `mib[1]` 读 —— 所以要先往 buf 写 `mib[1]` 再调。
+
+> ⚠ **未经真机验证**：代码按 xnu 语义写全了（socket → calloc/malloc → memWrite mib → getsockopt → 回读 → 关 fd），
+> 但第一次跑的重点是**看 socket 那一步的 errno** —— 现代 iOS 多半已经封死 AF_SYSCTL 这条路。
+> 封了就是合理结果，别硬凑；这时继续用 `syscall(202, …)` 或 `sysctlGet()` 即可。
+
+**红线提醒**：沙盒在 syscall 号上普遍有检查点，返回 `EPERM(1)` / `ENOSYS(38)` 是**预期结果**，不是桥坏了。
 
 ## 16. 环境与网络（V2.4.13 新增 / V2.4.14 改端点分类）★
 
