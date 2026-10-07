@@ -99,6 +99,13 @@ var GUARDS = [
 
   { p: "callPtr", sig: "callPtr(addrHex, args?, opts?)",
     args: [{ n: "addrHex", k: "strNe" }, { n: "args", k: "arr", opt: true }, { n: "opts", k: "obj", opt: true }] },
+  // V2.4.27：syscall 是 JS 侧签名糖（bridge_syscall.js），尾部 a/b/c/d 可省 → 全部 opt
+  { p: "syscall", sig: "syscall(number, a, b, c, d, opts?)",
+    args: [{ n: "number", k: "num" }, { n: "a", k: "numOpt", opt: true },
+           { n: "b", k: "numOpt", opt: true }, { n: "c", k: "numOpt", opt: true },
+           { n: "d", k: "numOpt", opt: true }, { n: "opts", k: "obj", opt: true }] },
+  { p: "sysctlSock", sig: "sysctlSock(ctl, name, bufSize?)",
+    args: [{ n: "ctl", k: "num" }, { n: "name", k: "num" }, { n: "bufSize", k: "numOpt", opt: true }] },
   { p: "memRead", sig: "memRead(hexAddr, len)",
     args: [{ n: "hexAddr", k: "strNe" }, { n: "len", k: "num" }] },
   { p: "sysctlGet", sig: "sysctlGet(name)",
