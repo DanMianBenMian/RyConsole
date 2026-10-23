@@ -92,6 +92,11 @@ if (conn > 0) {
 | `iosurfaceGetValue` | `(handle, key) → string` | 读属性 |
 | `iosurfaceLookup` | `(cid: number) → number` | 按 ID 反查（跨进程可见性探测） |
 | `iosurfaceRelease` | `(handle) → string` | 释放 |
+| `iosurfaceBaseAddress` | `(handle) → object` | **V2.4.27** 取后备内存 `{base, allocSize, rowBytes, bytesPerElement, width, height}`（不 Lock，只读元数据） |
+| `iosurfaceLock` | `(handle, opts?) → object` | **V2.4.27** Lock；opts 省略=1(ReadOnly)。成功 `{kr:0, seed, base, allocSize, rowBytes}`，失败 `{kr:N}`（krWhy 反查） |
+| `iosurfaceUnlock` | `(handle) → object` | **V2.4.27** Unlock，回 `{kr:N}` |
+| `iosurfaceRead` | `(handle, off, len) → string` | **V2.4.27** 读后备内存，内部 ReadOnly Lock→边界检查→hex→Unlock；输出同 memRead（纯 hex） |
+| `iosurfaceWrite` | `(handle, off, data) → string` | **V2.4.27** 写后备内存，data 三形态（hex / `"b64:…"` / `{b64:"…"}`，同 memWrite）；内部 Lock→memcpy→Unlock；回 `{"ok":true,"written":N}` |
 
 ## 3. XPC / 系统服务 / dyld / 沙盒 / 钥匙串 / 进程 🟡
 
