@@ -84,6 +84,17 @@ var GUARDS = [
     args: [{ n: "handle", k: "num" }, { n: "key", k: "str", opt: true }, { n: "value", k: "str", opt: true }] },
   { p: "iosurfaceGetValue", sig: "iosurfaceGetValue(handle, key)",
     args: [{ n: "handle", k: "num" }, { n: "key", k: "str", opt: true }] },
+  // V2.4.27 WS1：后备内存观测通道
+  { p: "iosurfaceBaseAddress", sig: "iosurfaceBaseAddress(handle)",
+    args: [{ n: "handle", k: "num" }] },
+  { p: "iosurfaceLock", sig: "iosurfaceLock(handle, opts?)",
+    args: [{ n: "handle", k: "num" }, { n: "opts", k: "numOpt", opt: true }] },
+  { p: "iosurfaceUnlock", sig: "iosurfaceUnlock(handle)",
+    args: [{ n: "handle", k: "num" }] },
+  { p: "iosurfaceRead", sig: "iosurfaceRead(handle, off, len)",
+    args: [{ n: "handle", k: "num" }, { n: "off", k: "u32" }, { n: "len", k: "u32" }] },
+  { p: "iosurfaceWrite", sig: "iosurfaceWrite(handle, off, data)",
+    args: [{ n: "handle", k: "num" }, { n: "off", k: "u32" }, { n: "data", opt: true }] },
 
   { p: "iokitOpen", sig: "iokitOpen(cls, type)",
     args: [{ n: "cls", k: "strNe" }, { n: "type", k: "u32", opt: true }] },
