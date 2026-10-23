@@ -50,14 +50,13 @@ extern IOSurfaceID IOSurfaceGetID(IOSurfaceRef buffer);
 extern void IOSurfaceSetValue(IOSurfaceRef buffer, CFStringRef key, CFTypeRef value);
 extern CFTypeRef IOSurfaceCopyValue(IOSurfaceRef buffer, CFStringRef key);
 extern IOSurfaceRef IOSurfaceLookup(IOSurfaceID csid);
-// V2.4.27 WS1 追加声明（同前向声明理由：iOS SDK 无 IOSurface umbrella 头，符号由链接期提供）
+// V2.4.27 WS1 追加声明。注意：iOS 26.5 SDK 的 IOSurfaceRef.h 经
+// UIKit→CoreImage→CoreVideo 链已自动可见（build67 实证：Lock/Unlock 的 extern
+// 与 SDK 原型冲突报错）——Lock/Unlock 直接用 SDK 原型，不重复声明；
+// iOS 的 IOSurfaceUnlock 与 macOS 不同：kern_return_t IOSurfaceUnlock(ref, options, seed*)。
+// 下面两个 Getter SDK 未见导出声明，保留 extern（签名与 SDK 惯例一致，不冲突）：
 extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef buffer);
 extern size_t IOSurfaceGetBytesPerElement(IOSurfaceRef buffer);
-// IOSurfaceLock 的 options 实为 IOSurfaceLockOptions(enum→int)，按 uint32_t 声明 ABI 兼容；
-// 取值用字面量（同文件 :633 理由：不依赖 IOSurface.framework 导出的 kIOSurface* 常量符号）：
-//   1 = kIOSurfaceLockReadOnly  2 = kIOSurfaceLockAvoidSync
-extern kern_return_t IOSurfaceLock(IOSurfaceRef buffer, uint32_t options, uint32_t *seed);
-extern kern_return_t IOSurfaceUnlock(IOSurfaceRef buffer);
 
 // bootstrap_look_up 手动声明（app target 不公开 <servers/bootstrap.h>）
 extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *sp);
@@ -803,10 +802,10 @@ static NSDictionary *iosurfaceLockNative(NSNumber *handle, NSNumber *opts) {
     IOSurfaceRef surf = (__bridge IOSurfaceRef)(gSurfRegistry[handle]);
     if (!surf) return @{@"error": [NSString stringWithFormat:
                         @"[iosurfaceLock error] unknown handle %@（句柄来自 iosurfaceCreate()/iosurfaceLookup()）", handle]};
-    uint32_t options = 1; // 默认 kIOSurfaceLockReadOnly
+    uint32_t options = (uint32_t)kIOSurfaceLockReadOnly; // 省略 opts 时默认只读
     if (opts && [opts isKindOfClass:[NSNumber class]]) options = (uint32_t)[opts unsignedIntValue];
     uint32_t seed = 0;
-    kern_return_t kr = IOSurfaceLock(surf, options, &seed);
+    kern_return_t kr = IOSurfaceLock(surf, (IOSurfaceLockOptions)options, &seed);
     if (kr != KERN_SUCCESS) return @{@"kr": @((long)kr)};
     return @{
         @"kr": @0, @"seed": @(seed),
@@ -821,7 +820,7 @@ static NSDictionary *iosurfaceUnlockNative(NSNumber *handle) {
     IOSurfaceRef surf = (__bridge IOSurfaceRef)(gSurfRegistry[handle]);
     if (!surf) return @{@"error": [NSString stringWithFormat:
                         @"[iosurfaceUnlock error] unknown handle %@（句柄来自 iosurfaceCreate()/iosurfaceLookup()）", handle]};
-    kern_return_t kr = IOSurfaceUnlock(surf);
+    kern_return_t kr = IOSurfaceUnlock(surf, 0, NULL);
     return @{@"kr": @((long)kr)};
 }
 
@@ -840,13 +839,13 @@ static NSString *iosurfaceReadNative(NSNumber *handle, NSNumber *offN, NSNumber 
         return [NSString stringWithFormat:
                 @"[iosurfaceRead error] oob: off=%llu + len=%llu 超出 allocSize=%llu", off, len, alloc];
     uint32_t seed = 0;
-    kern_return_t kr = IOSurfaceLock(surf, 1 /*ReadOnly*/, &seed);
+    kern_return_t kr = IOSurfaceLock(surf, kIOSurfaceLockReadOnly, &seed);
     if (kr != KERN_SUCCESS) return [NSString stringWithFormat:
                 @"[iosurfaceRead error] IOSurfaceLock kr=%d", (int)kr];
     NSMutableString *hex = [NSMutableString stringWithCapacity:len * 2];
     const unsigned char *base = (const unsigned char *)IOSurfaceGetBaseAddress(surf);
     for (uint64_t i = 0; i < len; i++) [hex appendFormat:@"%02x", base[off + i]];
-    IOSurfaceUnlock(surf);
+    IOSurfaceUnlock(surf, 0, NULL);
     return hex;
 }
 
@@ -869,11 +868,11 @@ static NSString *iosurfaceWriteNative(NSNumber *handle, NSNumber *offN, id data)
                 @"[iosurfaceWrite error] oob: off=%llu + len=%lu 超出 allocSize=%llu",
                 off, (unsigned long)bytes.length, alloc];
     uint32_t seed = 0;
-    kern_return_t kr = IOSurfaceLock(surf, 0, &seed);
+    kern_return_t kr = IOSurfaceLock(surf, (IOSurfaceLockOptions)0, &seed);
     if (kr != KERN_SUCCESS) return [NSString stringWithFormat:
                 @"[iosurfaceWrite error] IOSurfaceLock kr=%d", (int)kr];
     memcpy((unsigned char *)IOSurfaceGetBaseAddress(surf) + off, bytes.bytes, bytes.length);
-    IOSurfaceUnlock(surf);
+    IOSurfaceUnlock(surf, 0, NULL);
     return [NSString stringWithFormat:@"{\"ok\":true,\"written\":%lu}", (unsigned long)bytes.length];
 }
 
