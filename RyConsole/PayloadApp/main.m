@@ -50,6 +50,14 @@ extern IOSurfaceID IOSurfaceGetID(IOSurfaceRef buffer);
 extern void IOSurfaceSetValue(IOSurfaceRef buffer, CFStringRef key, CFTypeRef value);
 extern CFTypeRef IOSurfaceCopyValue(IOSurfaceRef buffer, CFStringRef key);
 extern IOSurfaceRef IOSurfaceLookup(IOSurfaceID csid);
+// V2.4.27 WS1 追加声明（同前向声明理由：iOS SDK 无 IOSurface umbrella 头，符号由链接期提供）
+extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef buffer);
+extern size_t IOSurfaceGetBytesPerElement(IOSurfaceRef buffer);
+// IOSurfaceLock 的 options 实为 IOSurfaceLockOptions(enum→int)，按 uint32_t 声明 ABI 兼容；
+// 取值用字面量（同文件 :633 理由：不依赖 IOSurface.framework 导出的 kIOSurface* 常量符号）：
+//   1 = kIOSurfaceLockReadOnly  2 = kIOSurfaceLockAvoidSync
+extern kern_return_t IOSurfaceLock(IOSurfaceRef buffer, uint32_t options, uint32_t *seed);
+extern kern_return_t IOSurfaceUnlock(IOSurfaceRef buffer);
 
 // bootstrap_look_up 手动声明（app target 不公开 <servers/bootstrap.h>）
 extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *sp);
@@ -723,6 +731,150 @@ static id iosurfaceLookupNative(NSNumber *cid) {
     NSNumber *h = @(gSurfNextHandle++);
     gSurfRegistry[h] = (__bridge_transfer id)surf;
     return h;
+}
+
+// ============================================================
+//  V2.4.27 WS1（2026-10-23）：IOSurface 后备内存观测通道
+//  背景：iosurfaceProbe 早已能 memset 后备内存（:646），但没把 base 暴露给 JS，
+//        也没有 Lock 语义 / 边界检查的 read/write。本块把已有能力安全暴露。
+//  设计约束（红线）：① 纯增量——不碰 Create/句柄语义，gSurfRegistry 照旧；
+//    ② read/write 内部 Lock→边界检查→访问→Unlock，off+len 越界直接报错，
+//       绝不 OOB（被调函数只访问已映射区间）；③ 约定与现有桥对称：
+//       read 输出 hex（同 memRead :1170）、write 输入三形态（同 memWrite :1186-1212）、
+//       struct/JSON 形态回传、kr 数值回传由 JS 侧 krWhy() 反查（原生调不到 krWhy）。
+// ============================================================
+// memWrite 三形态（hex / "b64:…" / {b64:…}）解析，iosurfaceWrite 复用。
+// 返回 nil 时 *errOut 给人话原因（自解释风格，同 ryPrimErr）。
+static NSData *iosFlexData(id data, NSString **errOut) {
+    if ([data isKindOfClass:[NSDictionary class]]) {
+        NSString *b64 = [(NSDictionary *)data objectForKey:@"b64"];
+        if (![b64 isKindOfClass:[NSString class]]) {
+            *errOut = @"{b64:...} 形态缺 b64 字符串字段";
+            return nil;
+        }
+        return [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+    } else if ([data isKindOfClass:[NSString class]]) {
+        NSString *sv = (NSString *)data;
+        if ([sv hasPrefix:@"b64:"]) {
+            return [[NSData alloc] initWithBase64EncodedString:[sv substringFromIndex:4] options:0];
+        }
+        NSString *clean = [[[sv stringByReplacingOccurrencesOfString:@" " withString:@""]
+                            stringByReplacingOccurrencesOfString:@"\n" withString:@""]
+                           stringByReplacingOccurrencesOfString:@"0x" withString:@""];
+        if (clean.length < 2 || (clean.length % 2) != 0) {
+            *errOut = @"hex data 必须是偶数长度（每字节两个 hex 字符）；真二进制用 \"b64:…\" 或 {b64:\"…\"}";
+            return nil;
+        }
+        NSMutableData *md = [NSMutableData dataWithCapacity:clean.length / 2];
+        for (NSUInteger i = 0; i + 1 < clean.length; i += 2) {
+            unsigned int b = 0;
+            if (![[NSScanner scannerWithString:[clean substringWithRange:NSMakeRange(i, 2)]] scanHexInt:&b]) {
+                *errOut = @"hex data 含非 hex 字符";
+                return nil;
+            }
+            unsigned char c = (unsigned char)b; [md appendBytes:&c length:1];
+        }
+        return md;
+    }
+    *errOut = @"data 必须是 hex 串 / \"b64:…\" / {b64:\"…\"}（二进制一律走 b64）";
+    return nil;
+}
+
+// 取 surface 后备内存几何信息 + 基址（不 Lock；只读访问元数据）
+static NSDictionary *iosurfaceBaseAddressNative(NSNumber *handle) {
+    if (!gSurfRegistry) return @{@"error": @"[iosurfaceBaseAddress error] 本进程还没创建过任何 surface（注册表为空），先 iosurfaceCreate(props)"};
+    IOSurfaceRef surf = (__bridge IOSurfaceRef)(gSurfRegistry[handle]);
+    if (!surf) return @{@"error": [NSString stringWithFormat:
+                        @"[iosurfaceBaseAddress error] unknown handle %@（句柄来自 iosurfaceCreate()/iosurfaceLookup()）", handle]};
+    return @{
+        @"base": @((uint64_t)(uintptr_t)IOSurfaceGetBaseAddress(surf)),
+        @"allocSize": @((uint64_t)IOSurfaceGetAllocSize(surf)),
+        @"rowBytes": @((uint64_t)IOSurfaceGetBytesPerRow(surf)),
+        @"bytesPerElement": @((uint64_t)IOSurfaceGetBytesPerElement(surf)),
+        @"width": @((uint64_t)IOSurfaceGetWidth(surf)),
+        @"height": @((uint64_t)IOSurfaceGetHeight(surf)),
+    };
+}
+
+// Lock surface；options 省略时按 1（ReadOnly）兜底。成功回 {kr:0, seed, base, allocSize, rowBytes}；
+// 失败回 {kr:N}（JS 侧 krWhy 反查）。注意：锁语义按调用方负责成对 unlock。
+static NSDictionary *iosurfaceLockNative(NSNumber *handle, NSNumber *opts) {
+    if (!gSurfRegistry) return @{@"error": @"[iosurfaceLock error] 本进程还没创建过任何 surface（注册表为空），先 iosurfaceCreate(props)"};
+    IOSurfaceRef surf = (__bridge IOSurfaceRef)(gSurfRegistry[handle]);
+    if (!surf) return @{@"error": [NSString stringWithFormat:
+                        @"[iosurfaceLock error] unknown handle %@（句柄来自 iosurfaceCreate()/iosurfaceLookup()）", handle]};
+    uint32_t options = 1; // 默认 kIOSurfaceLockReadOnly
+    if (opts && [opts isKindOfClass:[NSNumber class]]) options = (uint32_t)[opts unsignedIntValue];
+    uint32_t seed = 0;
+    kern_return_t kr = IOSurfaceLock(surf, options, &seed);
+    if (kr != KERN_SUCCESS) return @{@"kr": @((long)kr)};
+    return @{
+        @"kr": @0, @"seed": @(seed),
+        @"base": @((uint64_t)(uintptr_t)IOSurfaceGetBaseAddress(surf)),
+        @"allocSize": @((uint64_t)IOSurfaceGetAllocSize(surf)),
+        @"rowBytes": @((uint64_t)IOSurfaceGetBytesPerRow(surf)),
+    };
+}
+
+static NSDictionary *iosurfaceUnlockNative(NSNumber *handle) {
+    if (!gSurfRegistry) return @{@"error": @"[iosurfaceUnlock error] 本进程还没创建过任何 surface（注册表为空），先 iosurfaceCreate(props)"};
+    IOSurfaceRef surf = (__bridge IOSurfaceRef)(gSurfRegistry[handle]);
+    if (!surf) return @{@"error": [NSString stringWithFormat:
+                        @"[iosurfaceUnlock error] unknown handle %@（句柄来自 iosurfaceCreate()/iosurfaceLookup()）", handle]};
+    kern_return_t kr = IOSurfaceUnlock(surf);
+    return @{@"kr": @((long)kr)};
+}
+
+// 读后备内存：内部 ReadOnly Lock → 边界检查 → hex 输出 → Unlock。
+// 成功返回纯 hex 串（同 memRead）；错误返回 "[iosurfaceRead error] …"（ERRATA §2 判据）。
+static NSString *iosurfaceReadNative(NSNumber *handle, NSNumber *offN, NSNumber *lenN) {
+    if (!gSurfRegistry) return @"[iosurfaceRead error] 本进程还没创建过 any surface（注册表为空），先 iosurfaceCreate(props)";
+    IOSurfaceRef surf = (__bridge IOSurfaceRef)(gSurfRegistry[handle]);
+    if (!surf) return [NSString stringWithFormat:
+                        @"[iosurfaceRead error] unknown handle %@（句柄来自 iosurfaceCreate()/iosurfaceLookup()）", handle];
+    uint64_t off = [offN unsignedLongLongValue];
+    uint64_t len = [lenN unsignedLongLongValue];
+    if (len == 0 || len > 65536) return @"[iosurfaceRead error] len must be 1..65536";
+    uint64_t alloc = (uint64_t)IOSurfaceGetAllocSize(surf);
+    if (off > alloc || len > alloc - off)
+        return [NSString stringWithFormat:
+                @"[iosurfaceRead error] oob: off=%llu + len=%llu 超出 allocSize=%llu", off, len, alloc];
+    uint32_t seed = 0;
+    kern_return_t kr = IOSurfaceLock(surf, 1 /*ReadOnly*/, &seed);
+    if (kr != KERN_SUCCESS) return [NSString stringWithFormat:
+                @"[iosurfaceRead error] IOSurfaceLock kr=%d", (int)kr];
+    NSMutableString *hex = [NSMutableString stringWithCapacity:len * 2];
+    const unsigned char *base = (const unsigned char *)IOSurfaceGetBaseAddress(surf);
+    for (uint64_t i = 0; i < len; i++) [hex appendFormat:@"%02x", base[off + i]];
+    IOSurfaceUnlock(surf);
+    return hex;
+}
+
+// 写后备内存：三形态输入（hex / "b64:…" / {b64:…}，同 memWrite）→ 边界检查 →
+// 默认选项 Lock → memcpy → Unlock。成功返回 {"ok":true,"written":N}；错误自解释串。
+static NSString *iosurfaceWriteNative(NSNumber *handle, NSNumber *offN, id data) {
+    if (!gSurfRegistry) return @"[iosurfaceWrite error] 本进程还没创建过任何 surface（注册表为空），先 iosurfaceCreate(props)";
+    IOSurfaceRef surf = (__bridge IOSurfaceRef)(gSurfRegistry[handle]);
+    if (!surf) return [NSString stringWithFormat:
+                        @"[iosurfaceWrite error] unknown handle %@（句柄来自 iosurfaceCreate()/iosurfaceLookup()）", handle];
+    NSString *err = nil;
+    NSData *bytes = iosFlexData(data, &err);
+    if (!bytes) return [NSString stringWithFormat:@"[iosurfaceWrite error] %@", err];
+    if (bytes.length == 0) return @"[iosurfaceWrite error] data 不能为空";
+    if (bytes.length > 65536) return @"[iosurfaceWrite error] len must be 1..65536";
+    uint64_t off = [offN unsignedLongLongValue];
+    uint64_t alloc = (uint64_t)IOSurfaceGetAllocSize(surf);
+    if (off > alloc || (uint64_t)bytes.length > alloc - off)
+        return [NSString stringWithFormat:
+                @"[iosurfaceWrite error] oob: off=%llu + len=%lu 超出 allocSize=%llu",
+                off, (unsigned long)bytes.length, alloc];
+    uint32_t seed = 0;
+    kern_return_t kr = IOSurfaceLock(surf, 0, &seed);
+    if (kr != KERN_SUCCESS) return [NSString stringWithFormat:
+                @"[iosurfaceWrite error] IOSurfaceLock kr=%d", (int)kr];
+    memcpy((unsigned char *)IOSurfaceGetBaseAddress(surf) + off, bytes.bytes, bytes.length);
+    IOSurfaceUnlock(surf);
+    return [NSString stringWithFormat:@"{\"ok\":true,\"written\":%lu}", (unsigned long)bytes.length];
 }
 
 #pragma mark - FS
@@ -2611,6 +2763,18 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"iosurfaceGetValue"]=^(NSNumber *h, NSString *k){ return iosurfaceGetValueNative(h,k); };
             ctx[@"iosurfaceRelease"]=^(NSNumber *h){ return iosurfaceReleaseNative(h); };
             ctx[@"iosurfaceLookup"]=^(NSNumber *cid){ return iosurfaceLookupNative(cid); };
+            // V2.4.27 WS1: IOSurface 后备内存观测通道（挂现有 gSurfRegistry，句柄语义不变）
+            ctx[@"iosurfaceBaseAddress"]=^(NSNumber *h){ return iosurfaceBaseAddressNative(h); };
+            // opts 用 JSValue 收（V2.4.19 坑：undefined 会被 JSC 转成非零 NSNumber），
+            // 显式判 undefined/null 后才 toNumber，省略 = 默认只读锁
+            ctx[@"iosurfaceLock"]=^(NSNumber *h, JSValue *optsV){
+                NSNumber *opts = nil;
+                if (optsV && ![optsV isUndefined] && ![optsV isNull]) opts = [optsV toNumber];
+                return iosurfaceLockNative(h, opts);
+            };
+            ctx[@"iosurfaceUnlock"]=^(NSNumber *h){ return iosurfaceUnlockNative(h); };
+            ctx[@"iosurfaceRead"]=^(NSNumber *h, NSNumber *off, NSNumber *len){ return iosurfaceReadNative(h, off, len); };
+            ctx[@"iosurfaceWrite"]=^(NSNumber *h, NSNumber *off, id data){ return iosurfaceWriteNative(h, off, data); };
             ctx[@"mkdir"]=^(NSString *n){ return mkdirStr(n); };
             ctx[@"nsxpcProbe"]=^(NSString *svc){ return probeService([svc UTF8String]); };
 
