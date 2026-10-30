@@ -1,0 +1,8 @@
+name: ci-linux-probe
+on:
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo linux-ok && uname -a
