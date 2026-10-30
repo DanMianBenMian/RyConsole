@@ -21,13 +21,14 @@ iOS / iPadOS 安全研究 harness（越狱 / 自签侧载环境）。原生 C �
 ## 免责
 仅供 iOS 安全研究学习，使用者须遵守当地法律与 Apple 许可协议。
 
+
 <!-- MERGED 2026-10-30: RyConsole is now public; RyConsole-Autorun client folded in below -->
-## RyConsoleAutorun（PC 端探针客户端，已并入本仓库）
+## RyConsoleAutorun (PC 端探针客户端, 已并入本仓库)
 
-原  仓库的 PC 端探针客户端已合并到本仓库 ：
+原 `RyConsole-Autorun` 仓库的 PC 端探针客户端已合并到本仓库 `RyConsoleAutorun/`：
 
-- ：连上 iPad、提交 JS 探针、轮询结果。
-- ：示例探针。
-- ：给 AI Agent 用的操作指南 Skill。
+- `RyConsoleAutorun/ryc_autorun.py`：连上 iPad、提交 JS 探针、轮询结果。
+- `RyConsoleAutorun/probe_env.js`：示例探针。
+- `RyConsoleAutorun/skill/`：给 AI Agent 用的操作指南 Skill。
 
-用法见 。仅在你拥有 / 授权的设备上使用。
+用法见 `RyConsoleAutorun/README.md`。仅在你拥有 / 授权的设备上使用。
