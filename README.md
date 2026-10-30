@@ -23,6 +23,8 @@ iOS / iPadOS 安全研究 harness（越狱 / 自签侧载环境）。原生 C �
 
 
 <!-- MERGED 2026-10-30: RyConsole is now public; RyConsole-Autorun client folded in below -->
+> **历史仓库** `https://github.com/DanMianBenMian/RyConsole-Autorun` 的源码与 release 已全部并入本仓库（2026-10-30），旧仓库仅作历史留存。
+
 ## RyConsoleAutorun (PC 端探针客户端, 已并入本仓库)
 
 原 `RyConsole-Autorun` 仓库的 PC 端探针客户端已合并到本仓库 `RyConsoleAutorun/`：
