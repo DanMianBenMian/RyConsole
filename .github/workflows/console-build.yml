@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15   # V2.4.28: 钉死镜像（macos-latest 2026-10-30 调度秒挂，绕开浮动切换）
     steps:
       - uses: actions/checkout@v4
       - name: Install xcodegen
