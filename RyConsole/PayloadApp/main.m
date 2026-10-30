@@ -663,6 +663,11 @@ static NSString *iosurfaceProbeStr(void) {
 // 持久注册表: 让 JS 创建的 surface 跨调用存活, 可对其做 set/get value + release 竞态。
 static NSMutableDictionary<NSNumber*, id> *gSurfRegistry = nil;
 static int gSurfNextHandle = 1;
+// V2.4.28: Lock 令牌表（handle → 栈，元素 [options, seed]）。
+//   IOSurfaceUnlock 的第三参必须回传 Lock 产出的 seed，否则解锁语义不对（锁计数泄漏）。
+//   栈而非单值：IOSurface 的 Lock 是可嵌套的（同一 surface 可多次 Lock）。
+//   生命周期与句柄绑定：release 时一并清掉，避免残留令牌指向已释放 surface。
+static NSMutableDictionary<NSNumber*, NSMutableArray*> *gSurfLockTok = nil;
 
 // 返回：>0 持久句柄；失败返回 "[iosurfaceCreate error] …" 字符串（Bug6：原来只回 -1，看不出是哪种参数错）
 static id iosurfaceCreateNative(NSDictionary *props) {
@@ -719,6 +724,7 @@ static NSString *iosurfaceReleaseNative(NSNumber *handle) {
     if (!gSurfRegistry[handle]) return ryPrimErr(@"iosurfaceRelease", [NSString stringWithFormat:
                         @"unknown handle %@；可能已 release 过（重复 release 是唯一会让句柄消失的情形）", handle]);
     [gSurfRegistry removeObjectForKey:handle]; // ARC 释放 -> CFRelease surface
+    [gSurfLockTok removeObjectForKey:handle];  // V2.4.28: 连同未配对的 Lock 令牌一起清（防残留指向已释放 surface）
     return @"[release] ok";
 }
 static id iosurfaceLookupNative(NSNumber *cid) {
@@ -807,6 +813,11 @@ static NSDictionary *iosurfaceLockNative(NSNumber *handle, NSNumber *opts) {
     uint32_t seed = 0;
     kern_return_t kr = IOSurfaceLock(surf, (IOSurfaceLockOptions)options, &seed);
     if (kr != KERN_SUCCESS) return @{@"kr": @((long)kr)};
+    // V2.4.28: 记录 Lock 令牌（options + seed），供 iosurfaceUnlock 原样回传
+    if (!gSurfLockTok) gSurfLockTok = [NSMutableDictionary dictionary];
+    NSMutableArray *stk = gSurfLockTok[handle];
+    if (!stk) { stk = [NSMutableArray array]; gSurfLockTok[handle] = stk; }
+    [stk addObject:@[@((unsigned)options), @((unsigned)seed)]];
     return @{
         @"kr": @0, @"seed": @(seed),
         @"base": @((uint64_t)(uintptr_t)IOSurfaceGetBaseAddress(surf)),
@@ -815,12 +826,35 @@ static NSDictionary *iosurfaceLockNative(NSNumber *handle, NSNumber *opts) {
     };
 }
 
-static NSDictionary *iosurfaceUnlockNative(NSNumber *handle) {
+// Unlock：seed 语义对齐 IOSurfaceLock。
+//   IOSurfaceLock(ref, opts, &seed) 产出 seed；iOS 侧 IOSurfaceUnlock(ref, opts, seed*) 的
+//   第三参是「回传同一个 seed」的 in 参（SDK 原型见 main.m 顶部注释）。
+//   V2.4.28 修正：① **不再丢弃返回值**——unlock 失败必须可见（否则递归锁计数泄漏、后续 Lock 莫名失败）；
+//   ② 若之前用 iosurfaceLock 拿过锁，令牌表 gSurfLockTok 记着 (options, seed)，
+//      这里自动按同一 options+seed 解锁（不传 seed 也能正确配对）。
+//   显式传 seed 参数则优先用显式值。
+static NSDictionary *iosurfaceUnlockNative(NSNumber *handle, NSNumber *seedN) {
     if (!gSurfRegistry) return @{@"error": @"[iosurfaceUnlock error] 本进程还没创建过任何 surface（注册表为空），先 iosurfaceCreate(props)"};
     IOSurfaceRef surf = (__bridge IOSurfaceRef)(gSurfRegistry[handle]);
     if (!surf) return @{@"error": [NSString stringWithFormat:
                         @"[iosurfaceUnlock error] unknown handle %@（句柄来自 iosurfaceCreate()/iosurfaceLookup()）", handle]};
-    kern_return_t kr = IOSurfaceUnlock(surf, 0, NULL);
+    uint32_t seed = 0;
+    uint32_t *seedPtr = NULL;
+    IOSurfaceLockOptions options = (IOSurfaceLockOptions)0;
+    NSMutableArray *stk = gSurfLockTok[handle];       // 栈：每次 Lock 压入 @[options, seed]
+    NSArray *top = stk.lastObject;                     // 栈顶 = 最近一次未配对的 Lock
+    if (top.count >= 2) {
+        options = (IOSurfaceLockOptions)[top[0] unsignedIntValue];
+        seed = (uint32_t)[top[1] unsignedIntValue];
+        seedPtr = &seed;
+        [stk removeLastObject];                        // 出栈：一次 Lock 对一次 Unlock
+        if (stk.count == 0) [gSurfLockTok removeObjectForKey:handle];
+    }
+    if (seedN && [seedN isKindOfClass:[NSNumber class]]) {   // 显式 seed 优先
+        seed = (uint32_t)[seedN unsignedIntValue];
+        seedPtr = &seed;
+    }
+    kern_return_t kr = IOSurfaceUnlock(surf, options, seedPtr);
     return @{@"kr": @((long)kr)};
 }
 
@@ -841,11 +875,19 @@ static NSString *iosurfaceReadNative(NSNumber *handle, NSNumber *offN, NSNumber 
     uint32_t seed = 0;
     kern_return_t kr = IOSurfaceLock(surf, kIOSurfaceLockReadOnly, &seed);
     if (kr != KERN_SUCCESS) return [NSString stringWithFormat:
-                @"[iosurfaceRead error] IOSurfaceLock kr=%d", (int)kr];
-    NSMutableString *hex = [NSMutableString stringWithCapacity:len * 2];
+                        @"[iosurfaceRead error] IOSurfaceLock kr=%d", (int)kr];
     const unsigned char *base = (const unsigned char *)IOSurfaceGetBaseAddress(surf);
+    if (!base) {   // V2.4.28: base 空指针检查——否则下面 base[off+i] 直接崩（红线：只访问已映射区间）
+        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, &seed);
+        return @"[iosurfaceRead error] IOSurfaceGetBaseAddress 返回 NULL（surface 未后备/几何非法）；未做任何读取";
+    }
+    NSMutableString *hex = [NSMutableString stringWithCapacity:len * 2];
     for (uint64_t i = 0; i < len; i++) [hex appendFormat:@"%02x", base[off + i]];
-    IOSurfaceUnlock(surf, 0, NULL);
+    kern_return_t ukr = IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, &seed);
+    if (ukr != KERN_SUCCESS)   // V2.4.28: unlock 失败必须可见（原来直接丢弃 → 锁计数泄漏不可观测）
+        return [NSString stringWithFormat:
+                @"[iosurfaceRead error] IOSurfaceUnlock kr=%d（读已完成 %llu 字节，但锁可能未释放）",
+                (int)ukr, (unsigned long long)len];
     return hex;
 }
 
@@ -870,9 +912,18 @@ static NSString *iosurfaceWriteNative(NSNumber *handle, NSNumber *offN, id data)
     uint32_t seed = 0;
     kern_return_t kr = IOSurfaceLock(surf, (IOSurfaceLockOptions)0, &seed);
     if (kr != KERN_SUCCESS) return [NSString stringWithFormat:
-                @"[iosurfaceWrite error] IOSurfaceLock kr=%d", (int)kr];
-    memcpy((unsigned char *)IOSurfaceGetBaseAddress(surf) + off, bytes.bytes, bytes.length);
-    IOSurfaceUnlock(surf, 0, NULL);
+                        @"[iosurfaceWrite error] IOSurfaceLock kr=%d", (int)kr];
+    unsigned char *base = (unsigned char *)IOSurfaceGetBaseAddress(surf);
+    if (!base) {   // V2.4.28: base 空指针检查——否则 memcpy(base+off,…) 直接崩（红线：只访问已映射区间）
+        IOSurfaceUnlock(surf, (IOSurfaceLockOptions)0, &seed);
+        return @"[iosurfaceWrite error] IOSurfaceGetBaseAddress 返回 NULL（surface 未后备/几何非法）；未写入任何字节";
+    }
+    memcpy(base + off, bytes.bytes, bytes.length);
+    kern_return_t ukr = IOSurfaceUnlock(surf, (IOSurfaceLockOptions)0, &seed);
+    if (ukr != KERN_SUCCESS)   // V2.4.28: unlock 失败必须可见（原来直接丢弃 → 锁计数泄漏不可观测）
+        return [NSString stringWithFormat:
+                @"[iosurfaceWrite error] IOSurfaceUnlock kr=%d（已写入 %lu 字节，但锁可能未释放）",
+                (int)ukr, (unsigned long)bytes.length];
     return [NSString stringWithFormat:@"{\"ok\":true,\"written\":%lu}", (unsigned long)bytes.length];
 }
 
@@ -2771,7 +2822,11 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
                 if (optsV && ![optsV isUndefined] && ![optsV isNull]) opts = [optsV toNumber];
                 return iosurfaceLockNative(h, opts);
             };
-            ctx[@"iosurfaceUnlock"]=^(NSNumber *h){ return iosurfaceUnlockNative(h); };
+            ctx[@"iosurfaceUnlock"]=^(NSNumber *h, JSValue *seedV){
+                NSNumber *seed = nil;
+                if (seedV && ![seedV isUndefined] && ![seedV isNull]) seed = [seedV toNumber];
+                return iosurfaceUnlockNative(h, seed);
+            };
             ctx[@"iosurfaceRead"]=^(NSNumber *h, NSNumber *off, NSNumber *len){ return iosurfaceReadNative(h, off, len); };
             ctx[@"iosurfaceWrite"]=^(NSNumber *h, NSNumber *off, id data){ return iosurfaceWriteNative(h, off, data); };
             ctx[@"mkdir"]=^(NSString *n){ return mkdirStr(n); };
