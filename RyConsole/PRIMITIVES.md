@@ -408,7 +408,7 @@ print("[bridge_x] 已加载: … (" + BRIDGE_VERSION + ")");
 |---|---|---|
 | `callPtr` | `(addrHex, args?, opts?) → {ok, value, out?, error?, hint?}` | 调用 `dlsymAddr`/`symResolve` 拿到的 C 函数地址 |
 
-**实参打包**（≤8 个；与 objc_msgSend 位槽规则同源）：
+**实参打包**（≤16 个；与 objc_msgSend 位槽规则同源）：
 
 | JS 传入 | 打包为 |
 |---|---|
