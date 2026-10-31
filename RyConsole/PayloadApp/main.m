@@ -409,7 +409,80 @@ static NSDictionary *iokitCallStructNative(long conn, uint32_t selector, NSArray
     } else {
         res[@"outStructSize"] = @(0);
     }
-    if (notes.count) res[@"note"] = [notes componentsJoinedByString:@"；"];
+    if (notes.count) res[@"note"] = [notes componentsJoinedByString:@";"];
+    return res;
+}
+
+// V2.4.29：可控标量输出个数的 IOConnectCallMethod 封装 —— 根治 Bug：旧 iokitCall*/iokitCallPort
+// 把 outCnt 硬编码 16，而内核派发器对 (scalarInputCount, structureInputSize, scalarOutputCount,
+// structureOutputSize) 是【逐个精确相等】比对（非 >=）。绝大多数 IOUserClient 方法的 scalarOut 是
+// 0/1/2/4，固定填 16 使第一道 scalarOutputCount 检查就挂，返回 kIOReturnBadArgument（0xe00002c2）。
+// 这是历史上 WS3 真机 sel 0..15 全 0xe00002c2 的真因，不是内核门禁、也不是 selector 不存在。
+// 本函数 scalarOutCount 是【期望值】（内核回写实际个数到 outCnt）；struct 输出仍用 outStructSize 缓冲。
+// 形态与 iokitCallStruct 一致：{ret, outputs, ok, inCount, outCount, outStruct?, outStructSize, note?}
+static NSDictionary *iokitCallExNative(long conn, uint32_t selector,
+                                       NSArray *scalarInputs, NSData *structInput,
+                                       NSUInteger scalarOutCount, NSUInteger outStructSize) {
+    NSString *bad = ryConnProblem(conn);
+    if (bad) {
+        return @{@"ret":@((long)kIOReturnBadArgument), @"outputs":@[], @"ok":@NO, @"outStructSize":@0,
+                 @"error":ryPrimErr(@"iokitCallEx", bad),
+                 @"hint":@"iokitCallEx(conn, selector, scalarInputs, structB64, scalarOutCount, outSize): scalarOutCount=期望值(≤16)；outSize 合法 1..65536"};
+    }
+    NSMutableArray *notes = [NSMutableArray array];
+    uint64_t in[16] = {0}; uint32_t inCnt = 0; NSUInteger dropped = 0;
+    if (scalarInputs != nil && ![scalarInputs isKindOfClass:[NSArray class]])
+        return @{@"ret":@((long)kIOReturnBadArgument), @"outputs":@[], @"ok":@NO, @"outStructSize":@0,
+                 @"error":ryPrimErr(@"iokitCallEx", @"scalarInputs must be an array of numbers (可省略)")};
+    if ([scalarInputs isKindOfClass:[NSArray class]]) {
+        for (NSUInteger i = 0; i < scalarInputs.count; i++) {
+            id v = scalarInputs[i];
+            if (![v isKindOfClass:[NSNumber class]]) { dropped++; continue; }
+            if (inCnt >= 16) { dropped++; continue; }
+            in[inCnt++] = [v unsignedLongLongValue];
+        }
+    }
+    if (dropped) [notes addObject:[NSString stringWithFormat:@"scalarInputs 有 %lu 项被忽略（非数字 / 超过 16）", (unsigned long)dropped]];
+    const void *inStruct = (structInput && structInput.length) ? structInput.bytes : NULL;
+    size_t inStructSize = structInput ? structInput.length : 0;
+
+    if (scalarOutCount > 16) { scalarOutCount = 16; [notes addObject:@"scalarOutCount 超过 16 → 已截断到 16（内核侧上限）"]; }
+    if (outStructSize > 65536) { outStructSize = 65536; [notes addObject:@"outSize 超过 65536 → 已截断到 65536"]; }
+    if (outStructSize == 0) outStructSize = 4096;   // 纯标量输出（无 struct 输出）时给默认缓冲
+
+    NSMutableData *outStruct = [NSMutableData dataWithLength:outStructSize];
+    uint64_t out[16] = {0};
+    uint32_t outCnt = (uint32_t)scalarOutCount;          // ★ 关键：初值 = 期望值，不再是 16
+    size_t outStructUsed = outStructSize;
+
+    kern_return_t kr = IOConnectCallMethod((io_connect_t)conn, selector,
+        in, inCnt, inStruct, inStructSize,
+        scalarOutCount ? out : NULL, &outCnt,
+        outStruct.mutableBytes, &outStructUsed);
+
+    if (kr == kIOReturnNoSpace && outStructUsed > 0 && outStructUsed <= 65536) {
+        // 内核要求更大的输出 struct 缓冲：按报告大小重试一次
+        outStructSize = outStructUsed;
+        outStruct = [NSMutableData dataWithLength:outStructSize];
+        outStructUsed = outStructSize;
+        kr = IOConnectCallMethod((io_connect_t)conn, selector,
+            in, inCnt, inStruct, inStructSize,
+            scalarOutCount ? out : NULL, &outCnt,
+            outStruct.mutableBytes, &outStructUsed);
+    }
+    NSMutableArray *oa = [NSMutableArray arrayWithCapacity:outCnt];
+    for (uint32_t i = 0; i < outCnt; i++) [oa addObject:@(out[i])];
+    NSMutableDictionary *res = [@{@"ret":@((long)kr), @"outputs":oa, @"ok":@(kr == KERN_SUCCESS),
+                                  @"inCount":@(inCnt), @"outCount":@(outCnt)} mutableCopy];
+    // 仅 kr==kIOReturnSuccess 且确有输出字节时才回填 struct 输出，避免失败时把默认 4096 缓冲误报
+    if (kr == kIOReturnSuccess && outStructUsed > 0 && outStructUsed <= outStructSize) {
+        NSData *real = [NSData dataWithBytes:outStruct.mutableBytes length:outStructUsed];
+        res[@"outStruct"] = [real base64EncodedStringWithOptions:0];
+        res[@"outStructSize"] = @((unsigned long long)outStructUsed);
+    } else {
+        res[@"outStructSize"] = @(0);
+    }
+    if (notes.count) res[@"note"] = [notes componentsJoinedByString:@";"];
     return res;
 }
 
@@ -1579,16 +1652,21 @@ static NSString *callPtrCommon(NSString *addrHex, NSArray *args, NSDictionary *o
     }
     for (NSValue *bv in inbufs) free([bv pointerValue]);
 
+    // V2.4.29：统一补 ret 别名（十进制整数，便于 JS 侧 krWhy(res.ret) / 数值比较，避免只靠 "value" hex 串误读）。
+    // 失败时 r==-1 的有符号即为 -1，与 errno 语义一致；正常返回值/指针地址按有符号回显（用户态地址高位为 0，不会变负）。
+    long long sr = (long long)r;
+    NSString *retField = [NSString stringWithFormat:@",\"ret\":%lld", sr];
     NSString *variadicExtra = @"";
     if (variadic) variadicExtra = @",\"variadic\":true";
     if (r == (uintptr_t)-1) {
-        variadicExtra = [variadicExtra stringByAppendingFormat:@",\"ret\":-1,\"errno\":%d", callErrno];
+        variadicExtra = [variadicExtra stringByAppendingFormat:@",\"errno\":%d", callErrno];
     }
     if (outs.length) {
-        return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\"%@,\"out\":{%@}}",
-                (unsigned long long)r, variadicExtra, outs];
+        return [NSString stringWithFormat:@"{\"ok\":true%@%@,\"value\":\"0x%llx\",\"out\":{%@}}",
+                retField, variadicExtra, (unsigned long long)r, outs];
     }
-    return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"0x%llx\"%@}", (unsigned long long)r, variadicExtra];
+    return [NSString stringWithFormat:@"{\"ok\":true%@%@,\"value\":\"0x%llx\"}",
+            retField, variadicExtra, (unsigned long long)r];
 }
 
 // ★ V2.4.23 回归修复：callPtr 恢复到固定元数寄存器传参路径（variadic=NO）。
@@ -2842,7 +2920,13 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
                 NSUInteger os = [outSize unsignedIntegerValue];
                 return iokitCallStructNative([conn longValue], [sel unsignedIntValue], scalarInputs, sd, os);
             };
-            ctx[@"bytesB64"]=^(NSArray *b){ return bytesToB64(b); };
+            // V2.4.29：可控标量输出个数的 IOConnectCallMethod（修复 outCnt 硬编码 16 缺陷，见 iokitCallExNative）
+            ctx[@"iokitCallEx"]=^(NSNumber *conn, NSNumber *sel, NSArray *scalarInputs, NSString *structB64, NSNumber *sout, NSNumber *osz){
+                NSData *sd = nil;
+                if ([structB64 isKindOfClass:[NSString class]] && structB64.length) sd = [[NSData alloc] initWithBase64EncodedString:structB64 options:0];
+                return iokitCallExNative([conn longValue], [sel unsignedIntValue], scalarInputs, sd,
+                                         [sout unsignedIntegerValue], [osz unsignedIntegerValue]);
+            };
             ctx[@"b64Bytes"]=^(NSString *b64){ return b64ToBytes(b64); };
             ctx[@"iokitMap"]=^(NSNumber *conn, NSNumber *mt){ return iokitMapNative([conn longValue], [mt unsignedIntValue]); };
             ctx[@"iokitClose"]=^(NSNumber *conn){ return @(iokitCloseNative([conn longValue])); };
