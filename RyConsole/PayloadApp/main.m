@@ -1566,13 +1566,13 @@ static NSString *callPtrCommon(NSString *addrHex, NSArray *args, NSDictionary *o
         if (b > 0 && b <= 65536) defaultBuf = b;
     }
 
-    unsigned long long nums[8] = {0};
-    void *slots[8] = {0};
+    unsigned long long nums[16] = {0};
+    void *slots[16] = {0};
     NSMutableArray *inbufs = [NSMutableArray array];      // {buf:...} 分配的缓冲（按出现顺序）
     NSMutableArray *bufIdx = [NSMutableArray array];      // [槽位, 大小] 成对；输出 key 取 i/2 顺序号 → buf0/buf1
     int n = 0;
     for (id v in (args ?: @[])) {
-        if (n >= 8) return @"{\"ok\":false,\"error\":\"[callPtr error] too many args (>8)\"}";
+        if (n >= 16) return @"{\"ok\":false,\"error\":\"[callPtr error] too many args (>16)\"}";
         if (v == nil || [v isKindOfClass:[NSNull class]]) { slots[n] = NULL; }
         else if ([v isKindOfClass:[NSNumber class]]) {
             nums[n] = [v unsignedLongLongValue];
@@ -1621,7 +1621,16 @@ static NSString *callPtrCommon(NSString *addrHex, NSArray *args, NSDictionary *o
             case 5: r = ((uintptr_t(*)(void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4]); break;
             case 6: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5]); break;
             case 7: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6]); break;
-            default: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7]); break;
+            case 8: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7]); break;
+            case 9: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], slots[8]); break;
+            case 10: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], slots[8], slots[9]); break;
+            case 11: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], slots[8], slots[9], slots[10]); break;
+            case 12: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], slots[8], slots[9], slots[10], slots[11]); break;
+            case 13: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], slots[8], slots[9], slots[10], slots[11], slots[12]); break;
+            case 14: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], slots[8], slots[9], slots[10], slots[11], slots[12], slots[13]); break;
+            case 15: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], slots[8], slots[9], slots[10], slots[11], slots[12], slots[13], slots[14]); break;
+            case 16: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], slots[8], slots[9], slots[10], slots[11], slots[12], slots[13], slots[14], slots[15]); break;
+            default: r = ((uintptr_t(*)(void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *))fp)(slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], slots[8], slots[9], slots[10], slots[11], slots[12], slots[13], slots[14], slots[15]); break;
         }
     } @catch (NSException *e) {
         for (NSValue *bv in inbufs) free([bv pointerValue]);
