@@ -61,6 +61,7 @@ krWhy(-536870206)       // "kIOReturnBadArgument (0xe00002c2) — 参数形状�
 | `iokitOpen` | `(cls: string, type: number) → number` | 打开 IOService，返回 conn；**>0 成功**。`-2` 类不存在 / `-3` 类名为空 / `-536870174` NotPermitted / `-9999` 抛异常 |
 | `iokitCall` | `(conn, sel, inputs: number[]) → {ret, outputs, inCount, ok, error?}` | 标量入参调用（≤16 个；非数字项被忽略并在 `note` 点名，不再静默占位） |
 | `iokitCallStruct` | `(conn, sel, scalarInputs, structB64, outSize) → {ret, outputs, outStruct, outStructSize, ok}` | 带 inputStruct/OOL 输出（struct 以 base64）。`outSize` 合法 1..65536，超界会兜底 4096 并在 `note` 说明 |
+| `iokitCallEx` | `(conn, sel, scalarInputs, structB64, scalarOutCount, outSize) → {ret, outputs, outStruct, outStructSize, ok}` | ★V2.4.29 可控标量输出个数的 `IOConnectCallMethod`。**根治旧 `iokitCall*` 把 `outCnt` 硬编码 16 → 内核 `scalarOutputCount` 精确比对失败、绝大多数方法返回 `0xe00002c2` 的缺陷**。`scalarOutCount` 是期望值（内核回写实际个数到 `outCount`），按方法签名填（如 sel 8 的 scIn=1/scOut=1 → 传 1），不再 16 盲发。形态同 `iokitCallStruct` |
 | `iokitMap` | `(conn, mapType) → {ret, ok, addr?, size?, error?, hint?}` | 映射内存。失败**不再只回裸 kr**：给 `error`（是什么）+ `hint`（怎么办） |
 | `iokitClose` | `(conn) → number` | 关闭 |
 | `bytesB64` | `(arr: number[]) → string` | 字节数组 → base64 |
@@ -94,9 +95,9 @@ if (conn > 0) {
 | `iosurfaceRelease` | `(handle) → string` | 释放 |
 | `iosurfaceBaseAddress` | `(handle) → object` | **V2.4.27** 取后备内存 `{base, allocSize, rowBytes, bytesPerElement, width, height}`（不 Lock，只读元数据） |
 | `iosurfaceLock` | `(handle, opts?) → object` | **V2.4.27** Lock；opts 省略=1(ReadOnly)。成功 `{kr:0, seed, base, allocSize, rowBytes}`，失败 `{kr:N}`（krWhy 反查） |
-| `iosurfaceUnlock` | `(handle) → object` | **V2.4.27** Unlock，回 `{kr:N}` |
-| `iosurfaceRead` | `(handle, off, len) → string` | **V2.4.27** 读后备内存，内部 ReadOnly Lock→边界检查→hex→Unlock；输出同 memRead（纯 hex） |
-| `iosurfaceWrite` | `(handle, off, data) → string` | **V2.4.27** 写后备内存，data 三形态（hex / `"b64:…"` / `{b64:"…"}`，同 memWrite）；内部 Lock→memcpy→Unlock；回 `{"ok":true,"written":N}` |
+| `iosurfaceUnlock` | `(handle, seed?) → object` | **V2.4.28** Unlock，回 `{kr:N}`。★V2.4.28 修正：`IOSurfaceUnlock` 第三参必须回传 Lock 那次 seed，原版传 NULL ⇒ 解锁语义错（锁计数泄漏）。现由原生令牌表 `gSurfLockTok`（handle→栈 `[options,seed]`）自动配对，**省略 seed 也能正确解锁**；显式传 seed 则优先用显式值。返回值不再被丢弃（V2.4.27 静默失败无从排查） |
+| `iosurfaceRead` | `(handle, off, len) → string` | **V2.4.27** 读后备内存，内部 ReadOnly Lock→边界检查→hex→Unlock；输出同 memRead（纯 hex）。★V2.4.28：补 `IOSurfaceGetBaseAddress` NULL 检查（原来会空指针读）；Unlock 返回值不再丢弃 |
+| `iosurfaceWrite` | `(handle, off, data) → string` | **V2.4.27** 写后备内存，data 三形态（hex / `"b64:…"` / `{b64:"…"}`，同 memWrite）；内部 Lock→memcpy→Unlock；回 `{"ok":true,"written":N}`。★V2.4.28：补 base NULL 检查（原来会 memcpy 到空指针）+ Unlock 返回值不再丢弃 |
 
 ## 3. XPC / 系统服务 / dyld / 沙盒 / 钥匙串 / 进程 🟡
 
@@ -340,6 +341,15 @@ function kr(code) {                       // 传有符号数或 0x… 都行
 - 新原语必须在 `main.m` 的 `installPrimitives(ctx)` 里注册 —— **属于原生代码，改完要重编 IPA**。
 - 只想加"高层函数"（组合已有原语）→ 写进 `RyConsoleScripts/bridge_*.js`，**不用重编**。
 - 返回 JSON 字符串比返回裸对象更稳（可打印、可落盘、可回传）。
+
+### 探针脚本（`RyConsoleScripts/*.js`，一次性测量脚本）
+随 bundle 打包，**也可 `ryc_bridge.py push` 直接推到设备 Documents**（探针脚本改完不用重编 IPA）。
+
+| 脚本 | 用途 |
+|---|---|
+| `jbV3LayerProbe.js` | ★ **V3 分层测量（WS3，V2.4.28）**。把「sel 全 BadArgument」**分层**：A=`iokitCallStruct`（带体检+struct 16/64/256B 梯度）／B=**`iokitCallPort`（跳体检、标量、必到内核）**／C=`iokitCall`（带体检、标量）。**判据：B 的 kr≠BadArgument ⇒ BadArgument 出在 JS 体检层（根本没到内核）；B 也 BadArgument ⇒ 内核方法语义 or sel index 与 IOExternalMethodDispatch 方法表不对齐**。天然分层信号：体检失败返 `{ret:BadArgument, error:...}`，内核返的 BadArgument **无 error 字段**。每发之间 sleep(600)；结果落盘 `Documents/jbV3LayerProbe.json`。只判定分层，**不宣布任何漏洞** |
+| `jbV3StructProbe.js` | V3 (b) struct/OOL 输入探针（旧版，用带体检的 `iokitCallStruct`）⇒ 必然"全 BadArgument"，**已被 `jbV3LayerProbe.js` 取代** |
+| `syscall_smoke.js` / `callptr_acceptance.js` / `race_probe_m1.js` | syscall 冒烟 / callPtr 契约验收 / M1 并发竞态 |
 
 ### 桥的作业方式（装桥 / 改桥都不用重编，v2.2.5）
 
