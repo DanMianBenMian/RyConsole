@@ -547,6 +547,10 @@ static void rySendAll(int fd, NSData *data) {
             NSDictionary *res = [self executeCode:code timeoutMs:timeoutMs];
             [self.lastResult setObject:@"done" forKey:@"status"];
             [self.lastResult addEntriesFromDictionary:res];
+            // ★ V2.4.33：/eval 同步路径原来漏了 notify —— 状态置 done 后没通知 UI，
+            //   于是「执行中」pill 一直挂着，必须切走页面再回来（select: 里那次 refresh）才正确。
+            //   /submit 异步路径本来就有 notify，这里补齐对称。
+            [self notify];
             rySendAll(cfd, ryHttpResponse(200, [self jsonFrom:res]));
             return;
         }
