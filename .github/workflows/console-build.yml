@@ -3,7 +3,11 @@ on:
   workflow_dispatch:
 jobs:
   build:
-    runs-on: macos-15   # V2.4.28: 钉死镜像（macos-latest 2026-10-30 调度秒挂，绕开浮动切换）
+    # ★ V2.4.33：恢复 macos-26（Xcode 26.6 / iOS 26.5 SDK）
+    #   —— 2.4.28 误钉 macos-15（Xcode 16.4 / iOS 18.5 SDK）导致 UI 从液态玻璃退回 iOS 18 扁平控件。
+    #      2.4.26/2.4.27 用的是 macos-latest（当时解析到 macOS 26，SDK iphoneos26.5）。
+    #   —— 不用 macos-latest：浮动镜像 2026-10-30 起调度秒挂；macos-26 是明确标签。
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Install xcodegen
@@ -17,6 +21,17 @@ jobs:
           xcodebuild -scheme RyConsole -project RyConsole.xcodeproj -configuration Release \
             -derivedDataPath build CODE_SIGN_IDENTITY="" CODE_SIGNING_ALLOWED=NO \
             -sdk iphoneos 2>&1 | tee build.log
+      - name: Report SDK version
+        if: always()
+        run: |
+          echo "### Xcode: $(xcodebuild -version | tr '\n' ' ')"
+          echo "### SDKs:"; xcodebuild -showsdks | grep -i iphoneos || true
+          # 液态玻璃材质需要 iOS 26 SDK：低于 26 会退回 iOS 18 扁平控件
+          if xcodebuild -showsdks | grep -q 'iphoneos26'; then
+            echo "### OK: iOS 26 SDK present -> 液态玻璃材质可用"
+          else
+            echo "### WARN: 没有 iOS 26 SDK -> UI 会退回 iOS 18 扁平控件！"
+          fi
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
