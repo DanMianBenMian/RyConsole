@@ -2,7 +2,7 @@
 
 > 由 `main.m` 的 `installPrimitives(ctx)` 注册，JS 侧**直接当全局函数调用**。
 > 每次执行都是**全新 JSContext**（原语会重新注册），所以跨轮次状态必须落盘（见 §6 文件 IO）。
-> 共 **81 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数）+ 8 个 JS 桥库文件。
+> 共 **95 个原生原语**（实测：`main.m` 里 `ctx[@"…"]=` 的唯一名字数，V2.4.33 复核）+ 8 个 JS 桥库文件。
 >
 > | 批次 | 新增 |
 > |---|---|
@@ -119,6 +119,8 @@ if (conn > 0) {
 | **`xpcRawRelease`** ★ | `(ptr) → {ok,removed}` | V2.4.32：从托管白名单移除指针（只清登记，不释放对象）——防注册表泄漏（上限 256） |
 
 > ★ **V2.4.32 raw 注入（方案 A）**：消息里的 `{"__raw":"0x…"}` 可直接当 `xpc_object_t` 塞进 xpc dict（Fig 握手要带真对象，扁平 dict 装不下）。**仅接受桥侧托管指针**——由 `xpcFig*` 原语产出并自动登记；未登记的指针会被拒（值回 `__raw-not-managed` 字符串），避免野指针被 xpc retain 造成崩溃。
+> ★ **V2.4.33 链式 objc_msgSend 存活表**：`objc_msgSend` / `objc_msgSendSafe` 返回的「真堆对象」现在会被 retain 进全局存活表 `g_objcLiveHandles`，**保活到本轮 eval 结束**（`RYExecStream` 结束时统一 drain）⇒ 拿上一次调用返回的对象当接收者再发消息不再因悬垂而 SIGSEGV。判定「像堆对象」用四道门禁：高位非零（tagged pointer / 内核地址）→ 跳过、未 8 字节对齐 → 跳过、地址过低 → 跳过、`vm_read` 前 16 字节不可读 → 跳过 ⇒ 标量返回值（`count`/`length`/`intValue` 等）不会被误当对象 retain。**tagged pointer 接收者本来就没问题**（非堆对象、不会被释放），`objcHexFromPtr` 也从不 deref。
+> ★ **V2.4.33 UI 两修**：① `AutorunServer` 的 `/eval` 同步路径补 `[self notify]` ⇒ 脚本跑完 UI 的「执行中」pill 立即变「已回传」，不必切页刷新；② 构建镜像从 `macos-15` 改回 **`macos-26`**（Xcode 26.6 / iOS 26.5 SDK）⇒ 系统控件的**液态玻璃材质回归**（2.4.28 起 SDK 掉到 iphoneos18.5 导致 UI 退成 iOS 18 扁平控件）。
 > ★ **服务端错误描述**：V2.4.32 起 `xpcSendMsgFd` 在服务端回 XPC error 时附 `errDesc`（`XPC_ERROR_KEY_DESCRIPTION`）。此前 `xpcToObj` 只把 ERROR 压成 `<error>`，拒因全丢，只能靠猜。
 | **`xpcClose`** ★ | `(conn) → "ok"` | 关连接 |
 | **`machLookUp`** ★ | `(svc) → "0x…"` | `bootstrap_look_up` 拿 mach port（不发消息也能看可达性） |
