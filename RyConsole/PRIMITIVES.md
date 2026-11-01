@@ -110,11 +110,12 @@ if (conn > 0) {
 | **`xpcConn`** ★ | `(svc) → "0x…"／错误串` | **结构化 XPC**：建连接句柄（V2） |
 | **`xpcSendMsg`** ★ | `(conn, dict) → JSON` | 发结构化消息（`{type:"dictionary"|"string"|"uint64"|…}`），回 `{ok,reply}` |
 | **`xpcSendMsgFd`** ★ | `(conn, dict, timeout, fdKeys[]) → {reply, fds:{key:int}, errDesc?}` | 同 `xpcSendMsg`，但回包回调内对 `fdKeys` 逐个 `xpc_dictionary_dup_fd` 抽真实 fd（CVE-2026-112706 跨沙盒读解锁；`xpcToObj` 会把 FD 序列化为占位串，故必须在序列化前抽）。**V2.4.32 起**：服务端回 XPC error 时附 `errDesc`（`XPC_ERROR_KEY_DESCRIPTION` 描述串），`xpcToObj` 本身只给 `<error>` |
+| **`xpcSendObj`** ★ | `(conn, ptr, timeout, fdKeys[]) → {reply, fds:{key:int}, errDesc?}` | **V2.4.32**：把「托管的 raw xpc 对象」当作**整条消息**发出。Fig 握手产物本身就是带 XPC endpoint 的 xpc dict，JSON 表达不出来（`{"__raw":…}` 注入只能填「值」，会多包一层 `{"__raw":<FigMsg>}` 导致形状与服务端期望不符）。只接受托管表内指针，否则回 `not-managed-ptr`；回包同样抽 fd + 带 `errDesc` |
 | **`fdPread`** ★ | `(fd, offset, len≤16MB) → {ok,len,b64}` | 对 `xpcSendMsgFd` 抽到的 fd 做只读 `pread` 分块读，base64 回传（只给读，不写/System） |
 | **`xpcFigCreateMessage`** ★ | `(op) → {ok,ptr,ret}` | V2.4.32：`FigXPCCreateBasicMessage(op,NULL,&out)` 建 Fig 基础消息。**op 必须非 0**（op=0 走错误路径→`*out` 保持 0→后续解引用坏指针→SIGBUS，真机实证）。返回 `ptr` 自动进托管表 |
 | **`xpcFigSetCFURL`** ★ | `(msgPtr, key, path) → {ok}` | V2.4.32：`FigXPCMessageSetCFURL(msg,key,CFURL)` 给托管消息挂 CFURL（`msgPtr` 必须是托管指针，否则 `not-managed-ptr`） |
 | **`xpcFigBeginEstablishing`** ★ | `(msgPtr) → {ok,ret}` | V2.4.32：`FigMemoryOriginBeginEstablishingMemoryRecipientByFillingInXPCMessage1(msg)` —— 内部生成 endpoint+token 并写进 msg 的 `MemoryOriginEndpoint` / `MemoryOriginServerToken`（离线反汇编确认只吃 1 个 msg） |
-| **`xpcFigCreateRecipient`** ★ | `(a0,a1,a2,a3) → {ok}` | V2.4.32：`FigMemoryRecipientCreateWithXPCMessage1AndUpdateXPCMessage2` **4 参透传**（Swift 泛型，语义待真机收敛）。指针类实参必须是托管指针或 0，小整数当标量放行 |
+| **`xpcFigCreateRecipient`** ★ | `(a0,a1,a2,a3) → {ok,ptr,ret}` | V2.4.32：`FigMemoryRecipientCreateWithXPCMessage1AndUpdateXPCMessage2` **4 参透传**（Swift 泛型，语义待真机收敛）。指针类实参必须是托管指针或 0，小整数当标量放行。**msg2 回传**：先按「msg2 走返回寄存器 x0」取返回值，取不到再退回「msg2 走 out 参数（x1 指向 8 字节槽）」——调用方 x1 传 0 时由桥自备 scratch 槽回读；取回的 msg2 自动进托管表，可直接用 `xpcSendObj` 当整条消息发出 |
 | **`xpcRawRelease`** ★ | `(ptr) → {ok,removed}` | V2.4.32：从托管白名单移除指针（只清登记，不释放对象）——防注册表泄漏（上限 256） |
 
 > ★ **V2.4.32 raw 注入（方案 A）**：消息里的 `{"__raw":"0x…"}` 可直接当 `xpc_object_t` 塞进 xpc dict（Fig 握手要带真对象，扁平 dict 装不下）。**仅接受桥侧托管指针**——由 `xpcFig*` 原语产出并自动登记；未登记的指针会被拒（值回 `__raw-not-managed` 字符串），避免野指针被 xpc retain 造成崩溃。
