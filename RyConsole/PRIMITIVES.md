@@ -109,6 +109,8 @@ if (conn > 0) {
 | `nsxpcProbe` | `(svc) → string` | NSXPC 风格探测 |
 | **`xpcConn`** ★ | `(svc) → "0x…"／错误串` | **结构化 XPC**：建连接句柄（V2） |
 | **`xpcSendMsg`** ★ | `(conn, dict) → JSON` | 发结构化消息（`{type:"dictionary"|"string"|"uint64"|…}`），回 `{ok,reply}` |
+| **`xpcSendMsgFd`** ★ | `(conn, dict, timeout, fdKeys[]) → {reply, fds:{key:int}}` | 同 `xpcSendMsg`，但回包回调内对 `fdKeys` 逐个 `xpc_dictionary_dup_fd` 抽真实 fd（CVE-2026-112706 跨沙盒读解锁；`xpcToObj` 会把 FD 序列化为占位串，故必须在序列化前抽） |
+| **`fdPread`** ★ | `(fd, offset, len≤16MB) → {ok,len,b64}` | 对 `xpcSendMsgFd` 抽到的 fd 做只读 `pread` 分块读，base64 回传（只给读，不写/System） |
 | **`xpcClose`** ★ | `(conn) → "ok"` | 关连接 |
 | **`machLookUp`** ★ | `(svc) → "0x…"` | `bootstrap_look_up` 拿 mach port（不发消息也能看可达性） |
 | **`dlopenFW`** ★ | `(path, flag?) → JSON` | `dlopen` 私有框架（如 `/System/Library/PrivateFrameworks/…`） |
