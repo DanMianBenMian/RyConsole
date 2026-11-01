@@ -1630,6 +1630,37 @@ static uintptr_t objcHexToPtr(id v) {
     return 0;
 }
 
+// ============================================================
+//  V2.4.33 对象存活表 —— 修复"链式 objc_msgSend 第二次调用接收者悬垂"崩溃
+//  ★ 根因（真机 SIGSEGV 回溯坐实）：JavaScriptCore 在每次 native block 返回时，会 drain
+//    自己的**内部 autorelease pool**。objc_msgSend 返回的 autoreleased 对象（典型如
+//    arrayWithObject: 造出的 NSArray）在"两次 objc_msgSend 调用之间"被释放；下一次拿它的
+//    hex 当接收者去发消息 → 悬垂指针 → objc_msgSend 读 isa 当场 SIGSEGV。
+//   现象对照：类对象 / tagged pointer 接收者永远正常（类不释放、tagged 非堆对象），
+//            只有"上一调用返回的堆实例"当接收者才崩 → 完全吻合。
+//  ★ 修法：把 objc_msgSend 返回的"真堆对象"retain 进全局存活表，eval 结束（RYExecStream）
+//    统一释放。标量返回值（count/length/intValue…）和 tagged pointer 不 retain。
+//  ★ 安全性：用与 objcDescNative 同源的 vm_read 16 字节可读性门禁判定"像堆对象"，
+//    绝不把标量大整数误当对象 retain（那样会去解引用 isa 反而崩）。
+// ============================================================
+static NSMutableArray *g_objcLiveHandles = nil;
+static inline void objcLiveHandleRetain(uintptr_t p) {
+    if (p == 0) return;
+    if ((p >> 47) != 0) return;            // 高位非零＝tagged pointer / 内核地址 → 非用户态堆对象
+    if ((p & 0x7) != 0) return;            // 未 8 字节对齐 → 不是对象指针
+    if (p < 0x1000ULL) return;             // 过低地址 → 不是对象
+    // vm_read 探前 16 字节是否可读：不可读（标量大整数凑巧落在未映射区）就直接跳过，绝不 retain
+    vm_offset_t probe = 0; mach_msg_type_number_t pc = 0;
+    kern_return_t kr = vm_read(mach_task_self(), (mach_vm_address_t)p, 16, &probe, &pc);
+    if (kr != KERN_SUCCESS) { if (probe) vm_deallocate(mach_task_self(), probe, (vm_size_t)pc); return; }
+    if (probe) vm_deallocate(mach_task_self(), probe, (vm_size_t)pc);
+    if (!g_objcLiveHandles) g_objcLiveHandles = [[NSMutableArray alloc] init];   // 不 autorelease：静态指针不能挂到会释放的对象
+    [g_objcLiveHandles addObject:(__bridge id)(void *)p];   // 强引用：保活到 eval 结束
+}
+static inline void objcLiveHandleDrain(void) {
+    if (g_objcLiveHandles) [g_objcLiveHandles removeAllObjects];  // 释放本轮 eval 所有保活对象
+}
+
 static NSString *objcGetClassNative(NSString *name) {
     if (![name isKindOfClass:[NSString class]] || !name.length) return @"0x0000000000000000";
     return objcHexFromPtr((uintptr_t)objc_getClass([name UTF8String]));
@@ -1716,6 +1747,7 @@ static NSString *objcMsgSendNative(id recvArg, NSString *selName, NSArray *args)
             case 6: ret = ((id(*)(id, SEL, void *, void *, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3], slots[4], slots[5]); break;
             default: ret = ((id(*)(id, SEL, void *, void *, void *, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6]); break;
         }
+        objcLiveHandleRetain((uintptr_t)ret);   // V2.4.33：保活返回的堆对象，防下次调用当接收者时悬垂
         return objcHexFromPtr((uintptr_t)ret);
     } @catch (NSException *e) {
         return [NSString stringWithFormat:@"[objc_msgSend exception] %@", e.reason];
@@ -2115,6 +2147,7 @@ static NSString *objcMsgSendSafeNative(id recvArg, NSString *selName, NSArray *a
             case 6: ret = ((id(*)(id, SEL, void *, void *, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3], slots[4], slots[5]); break;
             default: ret = ((id(*)(id, SEL, void *, void *, void *, void *, void *, void *, void *))objc_msgSend)(recv, sel, slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6]); break;
         }
+        objcLiveHandleRetain((uintptr_t)ret);   // V2.4.33：同 objcMsgSendNative，保活返回的堆对象
         return [NSString stringWithFormat:@"{\"ok\":true,\"value\":\"%@\"}", objcHexFromPtr((uintptr_t)ret)];
     } @catch (NSException *e) {
         return [NSString stringWithFormat:@"{\"ok\":false,\"error\":\"%@\"}", e.reason];
@@ -4079,6 +4112,7 @@ void RYExecStream(NSString *code, void (^onLine)(NSString *line),
                 guardedSig, strsignal(guardedSig), RYGuardLastAddr(), RYGuardLastPrim()];
         if (onLine) onLine(what);
         double ms0 = ([[NSDate date] timeIntervalSince1970] - t0) * 1000.0;
+        objcLiveHandleDrain();   // V2.4.33：崩溃兜底返回前也释放保活对象（防泄漏到下一轮 eval）
         if (onDone) onDone(nil, what, ms0);
         return;
     }
@@ -4118,6 +4152,7 @@ void RYExecStream(NSString *code, void (^onLine)(NSString *line),
 
     double ms = ([[NSDate date] timeIntervalSince1970] - t0) * 1000.0;
     RY_GUARD_DISARM();   // 正常跑完：撤掉检查点（撤了之后崩溃就恢复"真崩"老行为）
+    objcLiveHandleDrain();   // V2.4.33：eval 正常结束 → 释放本轮所有保活对象
     [[RYPermLog shared] endScriptScope];   // V2.4.6 作用域随脚本结束
     if (onDone) onDone(resStr, err, ms);
 }
