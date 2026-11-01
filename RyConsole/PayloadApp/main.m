@@ -1111,16 +1111,18 @@ static uintptr_t objcHexToPtr(id v);
 //   {"__raw":"0x…"} 只能引用**经桥侧原语产出并登记**的指针。否则 JS 能塞任意野指针，
 //   xpc_dictionary_set_value 会对野指针 retain → 内存破坏/崩溃（DoS 自己）。
 //   上限 256，超出拒绝登记（防泄漏）。注意这不是能力面扩张：callPtr 本就能造 xpc 对象。
-static NSMutableSet<NSNumber *> *g_xpcRawReg = nil;
+// ★ 值必须是**强引用**（xpc_object_t 在 ARC 下是 ObjC 强指针）：否则函数一返回，
+//   ARC 就把对象释放掉，托管指针变悬垂 → 注入时 xpc retain 已释放对象 → 崩溃。
+static NSMutableDictionary<NSNumber *, id> *g_xpcRawReg = nil;
 static pthread_mutex_t g_xpcRawLock = PTHREAD_MUTEX_INITIALIZER;
 #define RYC_RAW_MAX 256
 
-static BOOL xpcRawRegister(uintptr_t p) {
-    if (!p) return NO;
+static BOOL xpcRawRegister(uintptr_t p, id keepAlive) {
+    if (!p || !keepAlive) return NO;
     pthread_mutex_lock(&g_xpcRawLock);
-    if (!g_xpcRawReg) g_xpcRawReg = [NSMutableSet set];
+    if (!g_xpcRawReg) g_xpcRawReg = [NSMutableDictionary dictionary];
     if (g_xpcRawReg.count >= RYC_RAW_MAX) { pthread_mutex_unlock(&g_xpcRawLock); return NO; }
-    [g_xpcRawReg addObject:@((unsigned long long)p)];
+    g_xpcRawReg[@((unsigned long long)p)] = keepAlive; // 字典强引用 → 对象保活
     pthread_mutex_unlock(&g_xpcRawLock);
     return YES;
 }
@@ -1128,7 +1130,7 @@ static BOOL xpcRawRegister(uintptr_t p) {
 static BOOL xpcRawIsRegistered(uintptr_t p) {
     if (!p) return NO;
     pthread_mutex_lock(&g_xpcRawLock);
-    BOOL ok = g_xpcRawReg ? [g_xpcRawReg containsObject:@((unsigned long long)p)] : NO;
+    BOOL ok = g_xpcRawReg ? (g_xpcRawReg[@((unsigned long long)p)] != nil) : NO;
     pthread_mutex_unlock(&g_xpcRawLock);
     return ok;
 }
@@ -1137,8 +1139,8 @@ static BOOL xpcRawUnregister(uintptr_t p) {
     if (!p) return NO;
     pthread_mutex_lock(&g_xpcRawLock);
     BOOL had = NO;
-    if (g_xpcRawReg && [g_xpcRawReg containsObject:@((unsigned long long)p)]) {
-        [g_xpcRawReg removeObject:@((unsigned long long)p)];
+    if (g_xpcRawReg && g_xpcRawReg[@((unsigned long long)p)] != nil) {
+        [g_xpcRawReg removeObjectForKey:@((unsigned long long)p)]; // 释放强引用
         had = YES;
     }
     pthread_mutex_unlock(&g_xpcRawLock);
@@ -1162,7 +1164,8 @@ static xpc_object_t xpcFromObj(id obj) {
             uintptr_t rp = objcHexToPtr(rawV);
             if (rp) {
                 if (!xpcRawIsRegistered(rp)) return xpc_string_create("__raw-not-managed");
-                return (xpc_object_t)(void *)rp;
+                // ★ ARC 下 void*→xpc_object_t 必须走 __bridge（xpc_object_t 已是 ObjC 指针类型）
+                return (__bridge xpc_object_t)(void *)rp;
             }
         }
         xpc_object_t d=xpc_dictionary_create(NULL,NULL,0);
@@ -1400,11 +1403,15 @@ static NSDictionary *xpcFigCreateMessageNative(id opV) {
     if (![opV isKindOfClass:[NSNumber class]]) return @{@"err": @"op-required"};
     int32_t op = (int32_t)[(NSNumber *)opV intValue];
     if (op == 0) return @{@"err": @"op-must-be-nonzero"};
-    xpc_object_t out = NULL;
-    int ret = ((int (*)(int32_t, void *, xpc_object_t *))g_figCreateBasic)(op, NULL, &out);
-    if (ret != 0 || !out) return @{@"err": @"create-failed", @"ret": @(ret)};
-    if (!xpcRawRegister((uintptr_t)out)) return @{@"err": @"raw-reg-full"};
-    return @{@"ok": @YES, @"ptr": objcHexFromPtr((uintptr_t)out), @"ret": @(ret)};
+    void *outp = NULL;
+    // ★ 用 void** 承接 out（ABI 与 xpc_object_t* 相同），避免 ARC 下 ObjC 指针强转限制
+    int ret = ((int (*)(int32_t, void *, void **))g_figCreateBasic)(op, NULL, &outp);
+    if (ret != 0 || !outp) return @{@"err": @"create-failed", @"ret": @(ret)};
+    // ★ 所有权移交 ARC（函数返 +1）→ 再存入托管表（字典强引用）保活；
+    //   否则函数一返回对象就被 ARC 释放，托管指针悬垂。
+    id keep = (__bridge_transfer id)outp;
+    if (!xpcRawRegister((uintptr_t)outp, keep)) return @{@"err": @"raw-reg-full"};
+    return @{@"ok": @YES, @"ptr": objcHexFromPtr((uintptr_t)outp), @"ret": @(ret)};
 }
 
 // 给托管消息挂一个 CFURL：FigXPCMessageSetCFURL(msg, key, url)
@@ -1415,11 +1422,14 @@ static NSDictionary *xpcFigSetCFURLNative(id msgV, id keyV, id pathV) {
     if (!p || !xpcRawIsRegistered(p)) return @{@"err": @"not-managed-ptr"};
     if (![keyV isKindOfClass:[NSString class]] || ![(NSString *)keyV length]) return @{@"err": @"key-required"};
     if (![pathV isKindOfClass:[NSString class]] || ![(NSString *)pathV length]) return @{@"err": @"path-required"};
-    const char *ps = [(NSString *)pathV UTF8String];
-    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, ps, (CFIndex)strlen(ps), false);
-    if (!url) return @{@"err": @"cfurl-create-failed"};
-    ((void (*)(xpc_object_t, const char *, CFURLRef))g_figSetCFURL)((xpc_object_t)p, [(NSString *)keyV UTF8String], url);
-    CFRelease(url);
+    NSString *ps = (NSString *)pathV;
+    // 用 NSURL 造 URL 再 __bridge 借给 CFURLRef：ARC 管 NSURL 生命周期，
+    // 避免手动 CFRelease 与 ARC 重复释放（CFURLRef 与 NSURL 是 toll-free bridged）
+    NSURL *nu = ([ps hasPrefix:@"file:"] || [ps containsString:@"://"])
+        ? [NSURL URLWithString:ps] : [NSURL fileURLWithPath:ps];
+    if (!nu) return @{@"err": @"url-create-failed"};
+    CFURLRef url = (__bridge CFURLRef)nu;
+    ((void (*)(uintptr_t, const char *, CFURLRef))g_figSetCFURL)((uintptr_t)p, [(NSString *)keyV UTF8String], url);
     return @{@"ok": @YES};
 }
 
@@ -1430,7 +1440,8 @@ static NSDictionary *xpcFigBeginEstablishingNative(id msgV) {
     if (![msgV isKindOfClass:[NSString class]]) return @{@"err": @"msg-ptr-required"};
     uintptr_t p = objcHexToPtr(msgV);
     if (!p || !xpcRawIsRegistered(p)) return @{@"err": @"not-managed-ptr"};
-    uintptr_t ret = (uintptr_t)((void (*)(xpc_object_t))g_figBeginEstab)((xpc_object_t)p);
+    // ★ 该函数实际返回 endpoint 对象（在 x0），用 uintptr_t 承接避免 ARC 指针强转限制
+    uintptr_t ret = ((uintptr_t (*)(uintptr_t))g_figBeginEstab)((uintptr_t)p);
     return @{@"ok": @YES, @"ret": @((unsigned long long)ret)};
 }
 
@@ -1444,7 +1455,7 @@ static NSDictionary *xpcFigCreateRecipientNative(id a0, id a1, id a2, id a3) {
         if (v[i] >= 0x1000 && !xpcRawIsRegistered(v[i]))
             return @{@"err": @"not-managed-ptr", @"arg": @(i)};
     }
-    ((void (*)(void *, void *, void *, void *))g_figCreateRecip)((void *)v[0], (void *)v[1], (void *)v[2], (void *)v[3]);
+    ((void (*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t))g_figCreateRecip)(v[0], v[1], v[2], v[3]);
     return @{@"ok": @YES};
 }
 
