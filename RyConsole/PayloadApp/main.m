@@ -2798,6 +2798,16 @@ static NSString *rmtStop(void) {
     return [NSString stringWithFormat:@"{\"ok\":true,\"wasConnected\":%@}", was ? @"true" : @"false"];
 }
 
+// V2.4.34：统一切换通道模式，并同步到灵动岛标签。
+// WS 自动降级长轮询后调用，灵动岛标签才会从"WS"纠成"LP"，不再误导。
+static void rmtSetMode(NSString *m) {
+    if (!m || [m isEqualToString:g_rmtMode]) return;
+    g_rmtMode = [m copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ryRemoteLiveActivitySetMode(g_rmtMode.UTF8String);
+    });
+}
+
 static void rmtFailWhileConnecting(NSString *reason, NSInteger gen);
 static void rmtConnectOnce(NSInteger gen);
 static void rmtReceive(void);
@@ -2808,6 +2818,7 @@ static void rmtMakeContext(void);
 static void rmtExecuteJS(NSString *pid, NSString *code);
 static void rmtHandleMessage(NSDictionary *m);
 static void rmtLPPoll(NSInteger gen);
+static void rmtSetMode(NSString *m);          // V2.4.34：切通道模式并同步灵动岛标签
 // 统一消息处理：WS 收包与 LP poll 共用（welcome/push_js）
 static void rmtHandleMessage(NSDictionary *m) {
     if (![m isKindOfClass:[NSDictionary class]]) return;
@@ -2965,7 +2976,10 @@ static void rmtConnectOnce(NSInteger gen) {
     rmtMakeContext();   // 专用 JSContext：print/console 流式回传；全套原语 + 桥库 + engine
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-    cfg.timeoutIntervalForRequest = 20;
+    // ★ V2.4.34：不要再给 WebSocket 会话设 timeoutIntervalForRequest。
+    //   那是"单次请求数据超时"，对长连接而言会在空闲 20s 后把 socket 回收，
+    //   等于逼着每次都触发 didCompleteWithError → 重试耗尽 → 降级长轮询。
+    //   握手超时由 rmtConnectOnce 里的 12s dispatch_after 兜底，此处不设这个值。
     if (!g_rmtWSDelegate) g_rmtWSDelegate = [[RYRemoteWSDelegate alloc] init];
     g_rmtSession = [NSURLSession sessionWithConfiguration:cfg delegate:g_rmtWSDelegate delegateQueue:nil];
     NSURL *url = [NSURL URLWithString:g_rmtURL];
@@ -3032,7 +3046,7 @@ static void rmtLPStart(NSInteger gen) {
     if (g_rmtLPSession) { [g_rmtLPSession invalidateAndCancel]; g_rmtLPSession = nil; }
     if (!g_rmtQueue) g_rmtQueue = dispatch_queue_create("ryc.remote.js", DISPATCH_QUEUE_SERIAL);
     if (!g_rmtCtx) rmtMakeContext();
-    g_rmtMode = @"lp";
+    rmtSetMode(@"lp");          // V2.4.34：降级长轮询后把灵动岛标签从 WS 纠成 LP（rmtSetMode 单点写 g_rmtMode 并推 LA）
     g_rmtState = @"connecting";
     g_rmtLPFails = 0;
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
@@ -3111,7 +3125,7 @@ static NSString *rmtStart(NSString *baseURL, NSString *token) {
     g_rmtURL = [urlStr copy];
     g_rmtLPBase = [baseStr copy];        // 长轮询降级备用（build60）
     g_rmtToken = [token copy];
-    g_rmtMode = @"ws";
+    rmtSetMode(@"ws");          // V2.4.34：拉起灵动岛时即写对初始标签（g_rmtMode 已在 teardown 复位为 ws，这里确保 LA 一致）
     g_rmtAttempt = 0;
     // build64：★ 镜像监听 start: —— 保活 + 实时活动必须在「用户点连接」的入口就拉起，
     // 绝不能等 welcome 网络回调：LP 长轮询要挂 25s，那时 App 可能已划后台冻住 →
