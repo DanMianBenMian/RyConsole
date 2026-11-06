@@ -56,13 +56,13 @@
     [self.view addSubview:self.hostView];
 
     [NSLayoutConstraint activateConstraints:@[
-        [self.seg.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:12],
+        [self.seg.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:10],   // 与资源页对齐（原写死 12）
         [self.seg.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
         [self.seg.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
         [self.hostView.topAnchor constraintEqualToAnchor:self.seg.bottomAnchor constant:12],
         [self.hostView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
         [self.hostView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
-        [self.hostView.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12]
+        [self.hostView.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:0]     // 去掉写死的 12pt 底部边距（原 -12）
     ]];
 
     [self buildDiagView];
