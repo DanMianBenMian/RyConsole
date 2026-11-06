@@ -1040,7 +1040,7 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
 // 这些面板内部按 bounds 从 0 摆放、不吃 safeArea ⇒ 由宿主按安全区给面板留边
 - (void)viewSafeAreaInsetsDidChange {
     [super viewSafeAreaInsetsDidChange];
-    [self setNeedsLayout];
+    [self.view setNeedsLayout];
 }
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
