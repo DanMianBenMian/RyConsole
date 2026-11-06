@@ -72,6 +72,9 @@ static NSData *ryKeepAliveWavData(void) {
 
 @interface RYKeepAlive ()
 @property (nonatomic, assign) BOOL active;
+/// ★ V2.4.34：引用计数。监听(Autorun) 与 远程连接(Remote) 现在可同时跑，
+///   各自 begin/end 互不拆台；只有最后一个持有者 end 时才真正释放保活资源。
+@property (nonatomic, assign) NSInteger activeRefs;
 @property (nonatomic, copy)   NSString *reason;
 @property (nonatomic, strong) AVAudioPlayer *player;
 @property (nonatomic, strong) NSTimer *pulse;
@@ -99,6 +102,7 @@ static NSData *ryKeepAliveWavData(void) {
     self = [super init];
     if (self) {
         _active = NO;
+        _activeRefs = 0;
         _reason = @"";
         _bgTask = UIBackgroundTaskInvalid;
         _hasBgTask = NO;
@@ -123,7 +127,10 @@ static NSData *ryKeepAliveWavData(void) {
         dispatch_async(dispatch_get_main_queue(), ^{ [ws begin:reason]; });
         return;
     }
-    if (self.active) { [self pulseOnce]; return; }
+    // ★ V2.4.34：引用计数 —— 监听 / 远程可同时持有保活，互不拆台
+    self.activeRefs++;
+    if (self.activeRefs > 1) { [self pulseOnce]; return; }   // 已有人在保活，只刷新一次脉冲即可
+    if (self.active)         { [self pulseOnce]; return; }
 
     self.active = YES;
     self.reason = reason ?: @"";
@@ -148,7 +155,12 @@ static NSData *ryKeepAliveWavData(void) {
         dispatch_async(dispatch_get_main_queue(), ^{ [ws end]; });
         return;
     }
-    if (!self.active) return;
+    if (self.activeRefs == 0) return;                 // 没有持有者，忽略重复 end
+    self.activeRefs--;
+    if (self.activeRefs > 0) {                        // 还有别的持有者（监听/远程其一仍在跑）
+        [self pulseOnce];                             // 刷一下确认仍存活即可，绝不拆除
+        return;
+    }
     self.active = NO;
     NSLog(@"[KeepAlive] 释放保活（音频重启 %ld 次）", (long)self.audioRestarts);
 
