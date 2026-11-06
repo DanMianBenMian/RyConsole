@@ -3,7 +3,7 @@
 //  RyConsole —— 远程连接实时活动（灵动岛 / 锁屏「远程连接中」）
 //
 //  与监听用的 RYLiveActivityManager 平行：专管「远程连接（连接 PC）」活动。
-//  二者互斥（监听与远程只能开一个）→ 同一时刻只有一个活动在跑，互不干扰。
+//  二者可同时跑（V2.4.34 起不再互斥），各自管理自己的活动，互不干扰。
 //
 //  为什么用 @_cdecl 而不是 #import "RyConsole-Swift.h"：
 //    主 target 是纯 ObjC，加 Swift 后依赖 Xcode 生成的 `<产品名>-Swift.h`，
@@ -151,6 +151,16 @@ final class RYRemoteLiveActivityManager {
         }
     }
 
+    /// 切换通道模式（"ws" | "lp"），用于 WS 自动降级长轮询后把灵动岛标签纠回来。
+    func setMode(_ m: String) {
+        pushQ.async { [weak self] in
+            guard let self else { return }
+            if self.mode == m { return }
+            self.mode = m
+            self.pushCount()
+        }
+    }
+
     /// 刷新活动内容。
     /// - codes >= 0：收到代码数更新（走合并窗口）
     /// - codes <  0：**只续保鲜期**（保活脉冲用，数字不动）
@@ -225,6 +235,17 @@ public func ryRemoteLiveActivityUpdate(_ codes: Int32, _ lastCode: UnsafePointer
     if #available(iOS 17.0, *) {
         let c = lastCode.map { String(cString: $0) } ?? ""
         RYRemoteLiveActivityManager.shared.update(codes: Int(codes), lastCode: c)
+        return 1
+    }
+    return 0
+}
+
+/// 切换通道模式标签（"ws" | "lp"）。WS 自动降级长轮询后由 ObjC 侧调用，把灵动岛标签从 WS 纠成 LP。
+@_cdecl("ryRemoteLiveActivitySetMode")
+public func ryRemoteLiveActivitySetMode(_ mode: UnsafePointer<CChar>?) -> Int32 {
+    if #available(iOS 17.0, *) {
+        let m = mode.map { String(cString: $0) } ?? "ws"
+        RYRemoteLiveActivityManager.shared.setMode(m)
         return 1
     }
     return 0
