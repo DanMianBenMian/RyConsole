@@ -23,8 +23,8 @@ targets:
         MinimumOSVersion: "16.0"
         # ---- 版本号单一事实源（V2.3.0 起）：UI 左上角 / statusJSON / appInfo 都从 Bundle 读这里 ----
         # ★ 此前 UI 左上角是硬编码 @"v1.1"，Info.plist 里又没有版本键 → 永远显示 v1.1
-        CFBundleShortVersionString: "2.4.33"
-        CFBundleVersion: "73"
+        CFBundleShortVersionString: "2.4.34"
+        CFBundleVersion: "74"
         UIFileSharingEnabled: true
         UISupportsDocumentBrowser: true
         LSSupportsOpeningDocumentsInPlace: true
