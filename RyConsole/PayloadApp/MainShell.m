@@ -1125,7 +1125,7 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
     self.tabs = [[UITabBarController alloc] init];
     self.tabs.viewControllers = @[terminalVC, autorunVC, settingsVC, resourceVC, securityVC];
     self.tabs.delegate = self;
-    self.tabs.tintColor = RY_ACCENT;
+    self.tabs.tabBar.tintColor = RY_ACCENT;
     if (@available(iOS 18.0, *)) {
         // 仅 iPad 切左侧竖排边栏；iPhone 保持系统底部横条（mode 对 iPhone 无影响）
         if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
