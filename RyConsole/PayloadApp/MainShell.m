@@ -51,6 +51,17 @@ static const CGFloat kSidebarW = 168.0f;
 static const CGFloat kSidebarCompactW = 58.0f;   // iPhone/紧凑宽度（<500pt）：纯图标侧栏
 static const CGFloat kPad      = 12.0f;
 
+#pragma mark - 液态玻璃底衬
+
+// iOS 26 SDK 出包即渲染液态玻璃；旧 SDK / iOS<26 自动回退毛玻璃（保证可编译、可降级不崩）
+static UIVisualEffect *RYGlassEffect(void) {
+    if (@available(iOS 26.0, *)) {
+        Class glassCls = NSClassFromString(@"UIGlassEffect");
+        if (glassCls) return (UIVisualEffect *)[[glassCls alloc] init];
+    }
+    return [UIBlurEffect effectWithStyle:UIBlurEffectStyleRegular];
+}
+
 #pragma mark - 小工具
 
 static UIFont *ryMono(CGFloat s) {
@@ -447,19 +458,8 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
         [self appendLog:@"[local] 已断开"];
         return;
     }
-    // build61：互斥 —— 监听与远程只能开一个；开远程前若监听在跑，提示并踢掉监听
-    if (RYAutorunRunning()) {
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"监听与远程只能开一个"
-            message:@"开启远程连接会停止当前「监听」，确定吗？" preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-        [a addAction:[UIAlertAction actionWithTitle:@"确定，断开监听" style:UIAlertActionStyleDestructive
-            handler:^(UIAlertAction *ac) {
-                RYAutorunStop();
-                [self doStartRemote];
-            }]];
-        [RYTopVCForPresent() presentViewController:a animated:YES completion:nil];
-        return;
-    }
+    // V2.4.34：监听与远程不再互斥，可同时跑（保活已改引用计数，二者各持一份互不拆台）。
+    // 若监听已在跑，远程连接照常启动；两者各自独立 stop，互不影响。
     [self doStartRemote];
 }
 
@@ -758,20 +758,7 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
     if ([sd[@"running"] boolValue]) {
         RYAutorunStop();
     } else {
-        // build61：互斥 —— 启动监听会断开远程；若远程已连，提示并踢掉远程
-        if (RYRemoteIsActive()) {
-            UIAlertController *a = [UIAlertController alertControllerWithTitle:@"监听与远程只能开一个"
-                message:@"启动监听会断开当前「远程连接」，确定吗？" preferredStyle:UIAlertControllerStyleAlert];
-            [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-            [a addAction:[UIAlertAction actionWithTitle:@"确定，断开远程" style:UIAlertActionStyleDestructive
-                handler:^(UIAlertAction *ac) {
-                    RYRemoteStop();
-                    RYAutorunStart((int)port, nil, nil);
-                    [self refresh];
-                }]];
-            [RYTopVCForPresent() presentViewController:a animated:YES completion:nil];
-            return;
-        }
+        // V2.4.34：监听与远程不再互斥，可同时跑。监听照常启动；远程若已连也保留，互不影响。
         RYAutorunStart((int)port, nil, nil);
     }
     [self refresh];
@@ -1046,6 +1033,7 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
 @property (nonatomic, strong) UILabel *sideStatus;
 @property (nonatomic, assign) BOOL compact;              // iPhone/紧凑宽度模式
 @property (nonatomic, strong) NSArray *navTitles;        // 侧栏按钮文字（compact 切换时恢复用）
+@property (nonatomic, strong) UIVisualEffectView *glassView;  // 底部栏液态玻璃底衬（iOS26）/ 毛玻璃回退
 // 全部先声明（select: 之前正是因为这个缺失导致 ARC 报错）
 - (void)onNav:(UIButton *)sender;
 - (void)select:(NSInteger)idx;
@@ -1071,11 +1059,17 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
 
     // ---- 底部栏（手机 / iPad 竖屏用；横屏 iPad 用左侧栏）----
     self.bottomBar = [[UIView alloc] init];
-    self.bottomBar.backgroundColor = RY_PANEL;
-    self.bottomBar.layer.borderColor = RY_BORDER.CGColor;
-    self.bottomBar.layer.borderWidth = 0.5f;
+    self.bottomBar.backgroundColor = [UIColor clearColor];
+    self.bottomBar.layer.borderWidth = 0.0f;
     self.bottomBar.hidden = YES;
     [self.view addSubview:self.bottomBar];
+
+    // 液态玻璃底衬：iOS 26 出包即玻璃；旧 SDK / 系统回退毛玻璃
+    self.glassView = [[UIVisualEffectView alloc] initWithEffect:RYGlassEffect()];
+    self.glassView.userInteractionEnabled = NO;
+    self.glassView.layer.masksToBounds = YES;
+    [self.bottomBar addSubview:self.glassView];
+    [self.bottomBar sendSubviewToBack:self.glassView];
 
     UILabel *title = ryLabel(@"RyConsole", 15.0f, RY_TEXT, NO);
     title.font = ryUI(15.0f, UIFontWeightMedium);
@@ -1094,9 +1088,9 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
     NSArray *items = @[@[@"terminal", @"终端"],
                        @[@"antenna.radiowaves.left.and.right", @"Autorun"],
                        @[@"gearshape", @"设置"],
-                       @[@"folder", @"资源管理器"],
-                       @[@"lock.shield", @"权限与安全"]];
-    self.navTitles = @[@"终端", @"Autorun", @"设置", @"资源管理器", @"权限与安全"];
+                       @[@"folder", @"资源"],
+                       @[@"lock.shield", @"安全"]];
+    self.navTitles = @[@"终端", @"Autorun", @"设置", @"资源", @"安全"];
     for (NSInteger i = 0; i < (NSInteger)items.count; i++) {
         CGFloat y = 76.0f + i * 48.0f;
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -1178,11 +1172,31 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
         CGFloat barH = 52.0f;
         CGFloat top = fmaxf(sa.top, 20.0f);
         CGFloat bot = sa.bottom;
-        self.bottomBar.frame = CGRectMake(0.0f, h - barH - bot, w, barH + bot);
-        CGFloat bw = w / (CGFloat)self.navButtons.count;
-        for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++)
-            ((UIButton *)self.navButtons[i]).frame = CGRectMake(i * bw, 0.0f, bw, barH);
-        self.content.frame = CGRectMake(0.0f, top, w, h - top - barH - bot);
+        if (isPhone) {
+            // 手机：正下方、满宽
+            self.bottomBar.frame = CGRectMake(0.0f, h - barH - bot, w, barH + bot);
+            CGFloat bw = w / (CGFloat)self.navButtons.count;
+            for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++)
+                ((UIButton *)self.navButtons[i]).frame = CGRectMake(i * bw, 0.0f, bw, barH);
+            self.glassView.frame = CGRectMake(0.0f, 0.0f, w, barH);
+            self.glassView.layer.cornerRadius = 16.0f;
+            self.glassView.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+            self.content.frame = CGRectMake(0.0f, top, w, h - top - barH - bot);
+        } else {
+            // iPad 竖屏：底部右侧停靠浮岛（非满宽）
+            CGFloat margin = 12.0f;
+            CGFloat dockW = fminf(360.0f, w - 2.0f * margin);
+            self.bottomBar.frame = CGRectMake(w - dockW - margin, h - barH - bot - margin, dockW, barH);
+            CGFloat bw = dockW / (CGFloat)self.navButtons.count;
+            for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++)
+                ((UIButton *)self.navButtons[i]).frame = CGRectMake(i * bw, 0.0f, bw, barH);
+            self.glassView.frame = self.bottomBar.bounds;
+            self.glassView.layer.cornerRadius = 18.0f;
+            self.glassView.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner
+                                               | kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
+            // 浮岛两侧留白，避免遮挡内容
+            self.content.frame = CGRectMake(0.0f, top, w, h - top - barH - bot - 2.0f * margin);
+        }
     } else {
         self.sidebar.hidden = NO;
         self.bottomBar.hidden = YES;
@@ -1254,7 +1268,7 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
         b.backgroundColor = sel ? [UIColor colorWithWhite:1.0f alpha:0.05f] : [UIColor clearColor];
     }
 
-    // 第 4 个面板：资源管理器。**内嵌整页**（不是弹窗），首次进入才创建，省启动开销。
+    // 第 4 个面板：资源（原「资源管理器」）。**内嵌整页**（不是弹窗），首次进入才创建，省启动开销。
     if (idx == 3) {
         if (!self.resourcePane) {
             self.resourcePane = RYMakeResourceManagerPane();
@@ -1267,7 +1281,7 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
         RYResourceManagerRefresh(self.resourcePane);   // 每次进来重扫 Documents（可能刚丢过脚本进来）
     }
 
-    // 第 5 个面板：权限与安全（诊断 / 安全开关 / 日志），同样内嵌整页、首次进入才创建
+    // 第 5 个面板：安全（原「权限与安全」，诊断 / 安全开关 / 日志），同样内嵌整页、首次进入才创建
     if (idx == 4) {
         if (!self.securityPane) {
             self.securityPane = RYMakeSecurityPane();
@@ -1327,8 +1341,9 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
     if (self.bottomMode) {
         CGFloat barH = 52.0f;
         CGFloat top = fmaxf(self.view.safeAreaInsets.top, 20.0f);
+        CGFloat padExtra = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) ? 24.0f : 0.0f;
         self.content.frame = CGRectMake(0.0f, top, self.view.bounds.size.width,
-                                        self.view.bounds.size.height - overlap - top - barH - self.view.safeAreaInsets.bottom);
+                                        self.view.bounds.size.height - overlap - top - barH - self.view.safeAreaInsets.bottom - padExtra);
     } else {
         CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
         CGFloat top = self.compact ? fmaxf(self.view.safeAreaInsets.top, 20.0f) : 0.0f;
@@ -1342,8 +1357,9 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
     if (self.bottomMode) {
         CGFloat barH = 52.0f;
         CGFloat top = fmaxf(self.view.safeAreaInsets.top, 20.0f);
+        CGFloat padExtra = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) ? 24.0f : 0.0f;
         self.content.frame = CGRectMake(0.0f, top, self.view.bounds.size.width,
-                                        self.view.bounds.size.height - top - barH - self.view.safeAreaInsets.bottom);
+                                        self.view.bounds.size.height - top - barH - self.view.safeAreaInsets.bottom - padExtra);
     } else {
         CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
         CGFloat top = self.compact ? fmaxf(self.view.safeAreaInsets.top, 20.0f) : 0.0f;
