@@ -924,6 +924,13 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
         about.numberOfLines = 3;
         about.tag = 9214;
         [self addSubview:about];
+
+        // 版本号（外壳层那个浮标已删，统一放这里看）
+        NSString *sv = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+        NSString *bv = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?";
+        UILabel *ver = ryLabel([NSString stringWithFormat:@"v%@ (%@)", sv, bv], 11.0f, RY_MUTED, YES);
+        ver.tag = 9215;
+        [self addSubview:ver];
     }
     return self;
 }
@@ -950,6 +957,8 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
     [[self viewWithTag:9213] setFrame:CGRectMake(kPad, y, 240.0f, 32.0f)];
     y += 44.0f;
     [[self viewWithTag:9214] setFrame:CGRectMake(kPad, y, w - kPad * 2, 54.0f)];
+    y += 54.0f + 8.0f;
+    [[self viewWithTag:9215] setFrame:CGRectMake(kPad, y, w - kPad * 2, 18.0f)];
 }
 
 - (void)onSave {
@@ -1070,11 +1079,19 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
         [self.child didMoveToParentViewController:self];
     }
 }
-// 子 VC 用 safeAreaLayoutGuide 自行避让 ⇒ 这里只保持铺满，不额外缩（否则会双留白）
+// iPad 侧栏（.tabSidebar）是浮层：子面板里若有 view.leadingAnchor / trailingAnchor 起头的控件
+// 就会压到侧栏底下（资源、安全两页正是如此）。所以这里也按安全区缩一次 —— 缩完之后子 VC 自身的
+// safeAreaInsets 会归零，其 safeAreaLayoutGuide 不再重复留白。
+- (void)viewSafeAreaInsetsDidChange {
+    [super viewSafeAreaInsetsDidChange];
+    [self.view setNeedsLayout];
+}
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     if (self.child.view.superview == self.view) {
-        self.child.view.frame = self.view.bounds;
+        UIEdgeInsets si = self.view.safeAreaInsets;
+        si.top = fmaxf(si.top, 20.0f);
+        self.child.view.frame = UIEdgeInsetsInsetRect(self.view.bounds, si);
     }
 }
 @end
@@ -1084,12 +1101,9 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
 @property (nonatomic, strong) RYAutorunPane *autorunPane;
 @property (nonatomic, strong) RYSettingsPane *settingsPane;
 @property (nonatomic, assign) NSInteger current;
-@property (nonatomic, strong) UILabel *sideStatus;
 @property (nonatomic, strong) UITabBarController *tabs;
-@property (nonatomic, copy) NSString *appVersion;
 // 全部先声明（select: 之前正是因为这个缺失导致 ARC 报错）
 - (void)select:(NSInteger)idx;
-- (void)refreshSideStatus;
 - (void)firstLaunchDisclaimer;
 @end
 
@@ -1157,22 +1171,8 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
     [self.view addSubview:self.tabs.view];
     [self.tabs didMoveToParentViewController:self];
 
-    // ---- 右上角状态/版本浮标（替代原左侧栏底部状态）----
-    self.appVersion = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
-    self.sideStatus = ryLabel(@"", 10.5f, RY_MUTED, YES);
-    self.sideStatus.textAlignment = NSTextAlignmentLeft;
-    self.sideStatus.numberOfLines = 2;
-    self.sideStatus.userInteractionEnabled = NO;
-    [self.view addSubview:self.sideStatus];
-
     // 面板已由各自的宿主 VC 承载（见上），不再需要统一 content 容器。
-
-    RYAutorunObserve(^{ [weakSelf refreshSideStatus]; });
-
-    // build66：1s 轮询刷新侧栏状态 —— 远程状态变化没有 observer，只能轮询（与远程页 pollStatus 同款机制）
-    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
-        [weakSelf refreshSideStatus];
-    }];
+    // 外壳层不再有状态/版本浮标（版本号已移入「设置」页）。
 
     [self select:0];
 
@@ -1186,19 +1186,6 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     self.tabs.view.frame = self.view.bounds;
-    CGFloat h = self.view.bounds.size.height;
-    UIEdgeInsets sa = self.view.safeAreaInsets;
-    BOOL isPad = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad);
-    if (isPad) {
-        // 放进左侧原生边栏区域的底部空档（不浮在内容上；也避开侧栏右上角的收起按钮）
-        self.sideStatus.hidden = NO;
-        CGFloat sw = 210.0f;
-        [self.sideStatus setFrame:CGRectMake(18.0f, h - sa.bottom - 48.0f, sw - 28.0f, 40.0f)];
-    } else {
-        // iPhone 没有侧栏（原设计也不显示状态）
-        self.sideStatus.hidden = YES;
-    }
-    [self.view bringSubviewToFront:self.sideStatus];
 }
 
 // 主 Tab 选中回调（刷新资源/安全/日志等面板）
@@ -1215,30 +1202,6 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
     if (idx == 1) [self.autorunPane refresh];
     if (idx == 3 && self.resourcePane) RYResourceManagerRefresh(self.resourcePane);   // 每次进来重扫 Documents
     if (idx == 4 && self.securityPane) RYSecurityPaneRefresh(self.securityPane);
-}
-
-- (void)refreshSideStatus {
-    NSDictionary *sd = nil;
-    id o = [NSJSONSerialization JSONObjectWithData:[RYAutorunStatus() dataUsingEncoding:NSUTF8StringEncoding]
-                                          options:0 error:NULL];
-    if ([o isKindOfClass:[NSDictionary class]]) sd = (NSDictionary *)o;
-    NSString *txt = nil;
-    UIColor *col = RY_MUTED;
-    if ([sd[@"running"] boolValue]) {
-        txt = [NSString stringWithFormat:@"● 监听中 :%d", [sd[@"port"] intValue]];
-        col = RY_GREEN;
-    } else {
-        // build66：远程连接也点亮状态 —— 远程状态变化无 observer，靠 1s 轮询刷新
-        id ro = [NSJSONSerialization JSONObjectWithData:[RYRemoteStatus() dataUsingEncoding:NSUTF8StringEncoding]
-                                               options:0 error:NULL];
-        NSString *rs = ([ro isKindOfClass:[NSDictionary class]]
-                        ? (NSString *)((NSDictionary *)ro[@"state"] ?: @"idle") : @"idle");
-        if ([rs isEqualToString:@"connected"]) { txt = @"● 远程已连接"; col = RY_GREEN; }
-        else if ([rs isEqualToString:@"connecting"]) { txt = @"● 远程连接中"; col = RY_AMBER; }
-        else { txt = @"● 未启动"; col = RY_MUTED; }
-    }
-    self.sideStatus.text = [NSString stringWithFormat:@"%@\nv%@", txt, self.appVersion ?: @"?"];
-    self.sideStatus.textColor = col;
 }
 
 - (void)onKeyboard:(NSNotification *)n {
