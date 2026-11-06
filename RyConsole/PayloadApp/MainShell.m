@@ -1033,9 +1033,21 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
     self.view.backgroundColor = RY_BG;
     if (self.paneBuilder) {
         self.pane = self.paneBuilder();
-        self.pane.frame = self.view.bounds;
         self.pane.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [self.view addSubview:self.pane];
+    }
+}
+// 这些面板内部按 bounds 从 0 摆放、不吃 safeArea ⇒ 由宿主按安全区给面板留边
+- (void)viewSafeAreaInsetsDidChange {
+    [super viewSafeAreaInsetsDidChange];
+    [self setNeedsLayout];
+}
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (self.pane) {
+        UIEdgeInsets si = self.view.safeAreaInsets;
+        si.top = fmaxf(si.top, 20.0f);   // 与原外壳一致的顶部最小留白
+        self.pane.frame = UIEdgeInsetsInsetRect(self.view.bounds, si);
     }
 }
 @end
@@ -1056,6 +1068,13 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
         self.child.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [self.view addSubview:self.child.view];
         [self.child didMoveToParentViewController:self];
+    }
+}
+// 子 VC 用 safeAreaLayoutGuide 自行避让 ⇒ 这里只保持铺满，不额外缩（否则会双留白）
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (self.child.view.superview == self.view) {
+        self.child.view.frame = self.view.bounds;
     }
 }
 @end
@@ -1141,7 +1160,8 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
     // ---- 右上角状态/版本浮标（替代原左侧栏底部状态）----
     self.appVersion = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
     self.sideStatus = ryLabel(@"", 10.5f, RY_MUTED, YES);
-    self.sideStatus.textAlignment = NSTextAlignmentRight;
+    self.sideStatus.textAlignment = NSTextAlignmentLeft;
+    self.sideStatus.numberOfLines = 2;
     self.sideStatus.userInteractionEnabled = NO;
     [self.view addSubview:self.sideStatus];
 
@@ -1166,11 +1186,18 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     self.tabs.view.frame = self.view.bounds;
-    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
     UIEdgeInsets sa = self.view.safeAreaInsets;
-    CGFloat top = fmaxf(sa.top, 20.0f);
-    // 右上角状态/版本浮标
-    [self.sideStatus setFrame:CGRectMake(w - 16.0f - 240.0f, top, 240.0f, 16.0f)];
+    BOOL isPad = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad);
+    if (isPad) {
+        // 放进左侧原生边栏区域的底部空档（不浮在内容上；也避开侧栏右上角的收起按钮）
+        self.sideStatus.hidden = NO;
+        CGFloat sw = 210.0f;
+        [self.sideStatus setFrame:CGRectMake(18.0f, h - sa.bottom - 48.0f, sw - 28.0f, 40.0f)];
+    } else {
+        // iPhone 没有侧栏（原设计也不显示状态）
+        self.sideStatus.hidden = YES;
+    }
     [self.view bringSubviewToFront:self.sideStatus];
 }
 
@@ -1210,7 +1237,7 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
         else if ([rs isEqualToString:@"connecting"]) { txt = @"● 远程连接中"; col = RY_AMBER; }
         else { txt = @"● 未启动"; col = RY_MUTED; }
     }
-    self.sideStatus.text = [NSString stringWithFormat:@"%@  ·  v%@", txt, self.appVersion ?: @"?"];
+    self.sideStatus.text = [NSString stringWithFormat:@"%@\nv%@", txt, self.appVersion ?: @"?"];
     self.sideStatus.textColor = col;
 }
 
