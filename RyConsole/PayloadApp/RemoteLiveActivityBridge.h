@@ -28,6 +28,9 @@ int32_t ryRemoteLiveActivityStart(const char *server, const char *mode);
 /// 刷新收到代码数 / 最近代码预览（lastCode 可为 NULL）
 int32_t ryRemoteLiveActivityUpdate(int32_t codes, const char *lastCode);
 
+/// 切换通道模式标签（"ws" | "lp"）。WS 自动降级长轮询后调用，把灵动岛标签从 WS 纠成 LP。
+int32_t ryRemoteLiveActivitySetMode(const char *mode);
+
 /// 结束并立刻移除
 int32_t ryRemoteLiveActivityStop(void);
 
