@@ -1022,25 +1022,56 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
 
 #pragma mark - 外壳
 
-@interface RYShellVC ()
-@property (nonatomic, strong) UIView *sidebar;
-@property (nonatomic, strong) UIView *content;
-@property (nonatomic, strong) NSMutableArray *navButtons;
+// 把现有 UIView 面板包成宿主 VC（UITabBarController 需要 VC；面板在首次显示时才构建）
+@interface RYPaneHostVC : UIViewController
+@property (nonatomic, copy) UIView *(^paneBuilder)(void);
+@property (nonatomic, strong) UIView *pane;
+@end
+@implementation RYPaneHostVC
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = RY_BG;
+    if (self.paneBuilder) {
+        self.pane = self.paneBuilder();
+        self.pane.frame = self.view.bounds;
+        self.pane.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [self.view addSubview:self.pane];
+    }
+}
+@end
+
+// 把「返回 UIViewController 的工厂」包成宿主 VC（资源 / 安全两个懒加载整页面板）
+@interface RYVCHostVC : UIViewController
+@property (nonatomic, copy) UIViewController *(^vcBuilder)(void);
+@property (nonatomic, strong) UIViewController *child;
+@end
+@implementation RYVCHostVC
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = RY_BG;
+    if (self.vcBuilder) {
+        self.child = self.vcBuilder();
+        [self addChildViewController:self.child];
+        self.child.view.frame = self.view.bounds;
+        self.child.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [self.view addSubview:self.child.view];
+        [self.child didMoveToParentViewController:self];
+    }
+}
+@end
+
+@interface RYShellVC () <UITabBarControllerDelegate>
 @property (nonatomic, strong) RYTerminalPane *terminalPane;
 @property (nonatomic, strong) RYAutorunPane *autorunPane;
 @property (nonatomic, strong) RYSettingsPane *settingsPane;
 @property (nonatomic, assign) NSInteger current;
 @property (nonatomic, strong) UILabel *sideStatus;
-@property (nonatomic, assign) BOOL compact;              // iPhone/紧凑宽度模式
-@property (nonatomic, strong) NSArray *navTitles;        // 侧栏按钮文字（compact 切换时恢复用）
-@property (nonatomic, strong) UIVisualEffectView *glassView;  // 底部栏液态玻璃底衬（iOS26）/ 毛玻璃回退
+@property (nonatomic, strong) UITabBarController *tabs;
+@property (nonatomic, copy) NSString *appVersion;
 // 全部先声明（select: 之前正是因为这个缺失导致 ARC 报错）
-- (void)onNav:(UIButton *)sender;
 - (void)select:(NSInteger)idx;
-- (void)layoutIndicator;
 - (void)refreshSideStatus;
 - (void)firstLaunchDisclaimer;
-- (void)configureNavForBottom:(BOOL)bottom;
 @end
 
 @implementation RYShellVC
@@ -1048,95 +1079,74 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = RY_BG;
-    self.navButtons = [NSMutableArray array];
-
-    // ---- 侧栏 ----
-    self.sidebar = [[UIView alloc] init];
-    self.sidebar.backgroundColor = RY_PANEL;
-    self.sidebar.layer.borderColor = RY_BORDER.CGColor;
-    self.sidebar.layer.borderWidth = 0.5f;
-    [self.view addSubview:self.sidebar];
-
-    // ---- 底部栏（手机 / iPad 竖屏用；横屏 iPad 用左侧栏）----
-    self.bottomBar = [[UIView alloc] init];
-    self.bottomBar.backgroundColor = [UIColor clearColor];
-    self.bottomBar.layer.borderWidth = 0.0f;
-    self.bottomBar.hidden = YES;
-    [self.view addSubview:self.bottomBar];
-
-    // 液态玻璃底衬：iOS 26 出包即玻璃；旧 SDK / 系统回退毛玻璃
-    self.glassView = [[UIVisualEffectView alloc] initWithEffect:RYGlassEffect()];
-    self.glassView.userInteractionEnabled = NO;
-    self.glassView.layer.masksToBounds = YES;
-    [self.bottomBar addSubview:self.glassView];
-    [self.bottomBar sendSubviewToBack:self.glassView];
-
-    UILabel *title = ryLabel(@"RyConsole", 15.0f, RY_TEXT, NO);
-    title.font = ryUI(15.0f, UIFontWeightMedium);
-    title.tag = 8090;
-    title.frame = CGRectMake(16.0f, 22.0f, kSidebarW - 32.0f, 18.0f);
-    [self.sidebar addSubview:title];
-
-    // ★ 版本号改从 Bundle 读（单一事实源 = project.yml 的 CFBundleShortVersionString）。
-    //   旧版这里硬编码 @"v1.1"，导致升到 V2.2.x 左上角仍显示 v1.1（用户 2026-09-19 实测报的）。
-    NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
-    UILabel *sub = ryLabel([NSString stringWithFormat:@"v%@ · 研究控制台", appVer], 10.5f, RY_MUTED, YES);
-    sub.tag = 8091;
-    sub.frame = CGRectMake(16.0f, 42.0f, kSidebarW - 32.0f, 14.0f);
-    [self.sidebar addSubview:sub];
-
-    NSArray *items = @[@[@"terminal", @"终端"],
-                       @[@"antenna.radiowaves.left.and.right", @"Autorun"],
-                       @[@"gearshape", @"设置"],
-                       @[@"folder", @"资源"],
-                       @[@"lock.shield", @"安全"]];
-    self.navTitles = @[@"终端", @"Autorun", @"设置", @"资源", @"安全"];
-    for (NSInteger i = 0; i < (NSInteger)items.count; i++) {
-        CGFloat y = 76.0f + i * 48.0f;
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(0.0f, y, kSidebarW, 44.0f);
-        b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-        b.titleLabel.font = ryUI(13.5f, UIFontWeightMedium);
-        b.tag = 8000 + i;
-        UIImage *img = [UIImage systemImageNamed:items[i][0]];
-        if (img) [b setImage:img forState:UIControlStateNormal];
-        [b setTitle:[@"  " stringByAppendingString:items[i][1]] forState:UIControlStateNormal];
-        [b setTitleColor:RY_MUTED forState:UIControlStateNormal];
-        b.tintColor = RY_MUTED;
-        b.contentEdgeInsets = UIEdgeInsetsMake(0.0f, 16.0f, 0.0f, 0.0f);   // 左边距（老 SDK 兼容写法）
-        [b addTarget:self action:@selector(onNav:) forControlEvents:UIControlEventTouchUpInside];
-        [self.sidebar addSubview:b];
-        [self.navButtons addObject:b];
-    }
-
-    // 选中指示条
-    UIView *bar = [[UIView alloc] init];
-    bar.tag = 8100;
-    bar.backgroundColor = RY_ACCENT;
-    bar.layer.cornerRadius = 1.0f;
-    [self.sidebar addSubview:bar];
-
-    self.sideStatus = ryLabel(@"● 未启动", 10.5f, RY_MUTED, YES);
-    self.sideStatus.numberOfLines = 2;
-    self.sideStatus.tag = 8101;
-    [self.sidebar addSubview:self.sideStatus];
-
-    // ---- 内容区 ----
-    self.content = [[UIView alloc] init];
-    self.content.backgroundColor = RY_BG;
-    self.content.clipsToBounds = YES;
-    [self.view addSubview:self.content];
-
-    self.terminalPane = [[RYTerminalPane alloc] init];
-    self.autorunPane = [[RYAutorunPane alloc] init];
-    self.settingsPane = [[RYSettingsPane alloc] init];
-    for (UIView *p in @[self.terminalPane, self.autorunPane, self.settingsPane]) {
-        p.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        p.hidden = YES;
-        [self.content addSubview:p];
-    }
-
     __weak RYShellVC *weakSelf = self;
+
+    // ---- 面板实例（UIView；由宿主 VC 首次显示时挂载）----
+    self.terminalPane = [[RYTerminalPane alloc] init];
+    self.autorunPane  = [[RYAutorunPane alloc] init];
+    self.settingsPane = [[RYSettingsPane alloc] init];
+
+    // ---- 主 Tab：原生 UITabBarController ----
+    //   iPhone：系统自动「底部横向 Tab Bar」（iOS 26 液态玻璃，无需自定义 appearance）
+    //   iPad  ：mode = .tabSidebar → 「左侧竖排原生边栏」
+    RYPaneHostVC *terminalVC = [[RYPaneHostVC alloc] init];
+    terminalVC.paneBuilder = ^UIView *{ return weakSelf.terminalPane; };
+    terminalVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"终端"
+                                                          image:[UIImage systemImageNamed:@"terminal"] tag:0];
+
+    RYPaneHostVC *autorunVC = [[RYPaneHostVC alloc] init];
+    autorunVC.paneBuilder = ^UIView *{ return weakSelf.autorunPane; };
+    autorunVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Autorun"
+                                                         image:[UIImage systemImageNamed:@"antenna.radiowaves.left.and.right"] tag:1];
+
+    RYPaneHostVC *settingsVC = [[RYPaneHostVC alloc] init];
+    settingsVC.paneBuilder = ^UIView *{ return weakSelf.settingsPane; };
+    settingsVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"设置"
+                                                          image:[UIImage systemImageNamed:@"gearshape"] tag:2];
+
+    RYVCHostVC *resourceVC = [[RYVCHostVC alloc] init];
+    resourceVC.vcBuilder = ^UIViewController *{
+        UIViewController *vc = RYMakeResourceManagerPane();
+        weakSelf.resourcePane = vc;
+        return vc;
+    };
+    resourceVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"资源"
+                                                          image:[UIImage systemImageNamed:@"folder"] tag:3];
+
+    RYVCHostVC *securityVC = [[RYVCHostVC alloc] init];
+    securityVC.vcBuilder = ^UIViewController *{
+        UIViewController *vc = RYMakeSecurityPane();
+        weakSelf.securityPane = vc;
+        return vc;
+    };
+    securityVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"安全"
+                                                          image:[UIImage systemImageNamed:@"lock.shield"] tag:4];
+
+    self.tabs = [[UITabBarController alloc] init];
+    self.tabs.viewControllers = @[terminalVC, autorunVC, settingsVC, resourceVC, securityVC];
+    self.tabs.delegate = self;
+    self.tabs.tintColor = RY_ACCENT;
+    if (@available(iOS 18.0, *)) {
+        // 仅 iPad 切左侧竖排边栏；iPhone 保持系统底部横条（mode 对 iPhone 无影响）
+        if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+            self.tabs.mode = UITabBarControllerModeTabSidebar;
+        }
+    }
+    [self addChildViewController:self.tabs];
+    self.tabs.view.frame = self.view.bounds;
+    self.tabs.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:self.tabs.view];
+    [self.tabs didMoveToParentViewController:self];
+
+    // ---- 右上角状态/版本浮标（替代原左侧栏底部状态）----
+    self.appVersion = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+    self.sideStatus = ryLabel(@"", 10.5f, RY_MUTED, YES);
+    self.sideStatus.textAlignment = NSTextAlignmentRight;
+    self.sideStatus.userInteractionEnabled = NO;
+    [self.view addSubview:self.sideStatus];
+
+    // 面板已由各自的宿主 VC 承载（见上），不再需要统一 content 容器。
+
     RYAutorunObserve(^{ [weakSelf refreshSideStatus]; });
 
     // build66：1s 轮询刷新侧栏状态 —— 远程状态变化没有 observer，只能轮询（与远程页 pollStatus 同款机制）
@@ -1155,152 +1165,29 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
+    self.tabs.view.frame = self.view.bounds;
     CGFloat w = self.view.bounds.size.width;
-    CGFloat h = self.view.bounds.size.height;
     UIEdgeInsets sa = self.view.safeAreaInsets;
-    BOOL isPhone = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPhone);
-    BOOL isPad = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad);
-    // 手机 / iPad 竖屏 → 底部栏；iPad 横屏 → 左侧栏
-    BOOL bottomTab = isPhone || (isPad && w < h);
-    if (bottomTab != self.bottomMode) {
-        self.bottomMode = bottomTab;
-        [self configureNavForBottom:bottomTab];
-    }
-    if (bottomTab) {
-        self.sidebar.hidden = YES;
-        self.bottomBar.hidden = NO;
-        CGFloat barH = 52.0f;
-        CGFloat top = fmaxf(sa.top, 20.0f);
-        CGFloat bot = sa.bottom;
-        if (isPhone) {
-            // 手机：正下方、满宽
-            self.bottomBar.frame = CGRectMake(0.0f, h - barH - bot, w, barH + bot);
-            CGFloat bw = w / (CGFloat)self.navButtons.count;
-            for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++)
-                ((UIButton *)self.navButtons[i]).frame = CGRectMake(i * bw, 0.0f, bw, barH);
-            self.glassView.frame = CGRectMake(0.0f, 0.0f, w, barH);
-            self.glassView.layer.cornerRadius = 16.0f;
-            self.glassView.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
-            self.content.frame = CGRectMake(0.0f, top, w, h - top - barH - bot);
-        } else {
-            // iPad 竖屏：底部右侧停靠浮岛（非满宽）
-            CGFloat margin = 12.0f;
-            CGFloat dockW = fminf(360.0f, w - 2.0f * margin);
-            self.bottomBar.frame = CGRectMake(w - dockW - margin, h - barH - bot - margin, dockW, barH);
-            CGFloat bw = dockW / (CGFloat)self.navButtons.count;
-            for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++)
-                ((UIButton *)self.navButtons[i]).frame = CGRectMake(i * bw, 0.0f, bw, barH);
-            self.glassView.frame = self.bottomBar.bounds;
-            self.glassView.layer.cornerRadius = 18.0f;
-            self.glassView.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner
-                                               | kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
-            // 浮岛两侧留白，避免遮挡内容
-            self.content.frame = CGRectMake(0.0f, top, w, h - top - barH - bot - 2.0f * margin);
-        }
-    } else {
-        self.sidebar.hidden = NO;
-        self.bottomBar.hidden = YES;
-        self.compact = (w < 500.0f);
-        CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
-        self.sidebar.frame = CGRectMake(0.0f, 0.0f, sw, h);
-        [self.sideStatus setFrame:CGRectMake(16.0f, h - 56.0f, kSidebarW - 32.0f, 40.0f)];
-        if (self.compact) {
-            CGFloat top = fmaxf(sa.top, 20.0f);
-            CGFloat bot = fmaxf(sa.bottom, 8.0f);
-            self.content.frame = CGRectMake(sw, top, w - sw, h - top - bot);
-        } else {
-            self.content.frame = CGRectMake(sw, 0.0f, w - sw, h);
-        }
-    }
-    for (UIView *p in @[self.terminalPane, self.autorunPane, self.settingsPane]) {
-        p.frame = self.content.bounds;
-    }
-    self.resourcePane.view.frame = self.content.bounds;   // 第 4 面板（懒加载，可能为 nil）
-    [self layoutIndicator];
+    CGFloat top = fmaxf(sa.top, 20.0f);
+    // 右上角状态/版本浮标
+    [self.sideStatus setFrame:CGRectMake(w - 16.0f - 240.0f, top, 240.0f, 16.0f)];
+    [self.view bringSubviewToFront:self.sideStatus];
 }
 
-// 侧栏 ↔ 底部栏切换：手机/iPad竖屏底部栏，iPad横屏左侧栏
-- (void)configureNavForBottom:(BOOL)bottom {
-    self.bottomMode = bottom;
-    UIView *host = bottom ? self.bottomBar : self.sidebar;
-    [[self.sidebar viewWithTag:8090] setHidden:bottom];
-    [[self.sidebar viewWithTag:8091] setHidden:bottom];
-    [self.sideStatus setHidden:bottom];
-    NSInteger n = (NSInteger)self.navButtons.count;
-    for (NSInteger i = 0; i < n; i++) {
-        UIButton *b = self.navButtons[i];
-        if (b.superview != host) [host addSubview:b];
-        if (bottom) {
-            b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
-            b.contentEdgeInsets = UIEdgeInsetsZero;
-            b.titleLabel.font = ryUI(11.0f, UIFontWeightMedium);
-            [b setTitle:self.navTitles[i] forState:UIControlStateNormal];
-        } else {
-            b.frame = CGRectMake(0.0f, 76.0f + i * 48.0f, kSidebarW, 44.0f);
-            b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-            b.contentEdgeInsets = UIEdgeInsetsMake(0.0f, 16.0f, 0.0f, 0.0f);
-            b.titleLabel.font = ryUI(13.5f, UIFontWeightMedium);
-            [b setTitle:[@"  " stringByAppendingString:self.navTitles[i]] forState:UIControlStateNormal];
-        }
-    }
-}
-
-- (void)layoutIndicator {
-    UIView *bar = [self.sidebar viewWithTag:8100];
-    bar.hidden = self.bottomMode;
-    if (self.bottomMode) return;
-    CGFloat y = 76.0f + self.current * 48.0f;
-    bar.frame = CGRectMake(0.0f, y + 6.0f, 3.0f, 32.0f);
-}
-
-- (void)onNav:(UIButton *)sender {
-    [self select:sender.tag - 8000];
+// 主 Tab 选中回调（刷新资源/安全/日志等面板）
+- (void)tabBarController:(UITabBarController *)tabBarController didSelectViewController:(UIViewController *)viewController {
+    NSInteger idx = [tabBarController.viewControllers indexOfObject:viewController];
+    if (idx != NSNotFound) [self select:idx];
 }
 
 - (void)select:(NSInteger)idx {
     if (idx < 0 || idx > 4) idx = 0;
     self.current = idx;
-    for (NSInteger i = 0; i < (NSInteger)self.navButtons.count; i++) {
-        UIButton *b = self.navButtons[i];
-        BOOL sel = (i == idx);
-        [b setTitleColor:(sel ? RY_ACCENT : RY_MUTED) forState:UIControlStateNormal];
-        b.tintColor = sel ? RY_ACCENT : RY_MUTED;
-        b.backgroundColor = sel ? [UIColor colorWithWhite:1.0f alpha:0.05f] : [UIColor clearColor];
-    }
 
-    // 第 4 个面板：资源（原「资源管理器」）。**内嵌整页**（不是弹窗），首次进入才创建，省启动开销。
-    if (idx == 3) {
-        if (!self.resourcePane) {
-            self.resourcePane = RYMakeResourceManagerPane();
-            [self addChildViewController:self.resourcePane];
-            self.resourcePane.view.frame = self.content.bounds;
-            self.resourcePane.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            [self.content addSubview:self.resourcePane.view];
-            [self.resourcePane didMoveToParentViewController:self];
-        }
-        RYResourceManagerRefresh(self.resourcePane);   // 每次进来重扫 Documents（可能刚丢过脚本进来）
-    }
-
-    // 第 5 个面板：安全（原「权限与安全」，诊断 / 安全开关 / 日志），同样内嵌整页、首次进入才创建
-    if (idx == 4) {
-        if (!self.securityPane) {
-            self.securityPane = RYMakeSecurityPane();
-            [self addChildViewController:self.securityPane];
-            self.securityPane.view.frame = self.content.bounds;
-            self.securityPane.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            [self.content addSubview:self.securityPane.view];
-            [self.securityPane didMoveToParentViewController:self];
-        }
-        RYSecurityPaneRefresh(self.securityPane);
-    }
-
-    self.terminalPane.hidden = (idx != 0);
-    self.autorunPane.hidden = (idx != 1);
-    self.settingsPane.hidden = (idx != 2);
-    self.resourcePane.view.hidden = (idx != 3);
-    self.securityPane.view.hidden = (idx != 4);
-    [self layoutIndicator];
+    // 资源 / 安全面板由宿主 VC 懒加载创建；切到时按需刷新
     if (idx == 1) [self.autorunPane refresh];
+    if (idx == 3 && self.resourcePane) RYResourceManagerRefresh(self.resourcePane);   // 每次进来重扫 Documents
+    if (idx == 4 && self.securityPane) RYSecurityPaneRefresh(self.securityPane);
 }
 
 - (void)refreshSideStatus {
@@ -1308,66 +1195,31 @@ extern NSString *RYRemoteDrainLogs(void);   // build66：远程核心事件日�
     id o = [NSJSONSerialization JSONObjectWithData:[RYAutorunStatus() dataUsingEncoding:NSUTF8StringEncoding]
                                           options:0 error:NULL];
     if ([o isKindOfClass:[NSDictionary class]]) sd = (NSDictionary *)o;
-    BOOL running = [sd[@"running"] boolValue];
-    if (running) {
-        self.sideStatus.text = [NSString stringWithFormat:@"● 监听中 :%d", [sd[@"port"] intValue]];
-        self.sideStatus.textColor = RY_GREEN;
-        return;
-    }
-    // build66：远程连接也点亮侧栏状态 —— 此前只看监听，远程连着仍显示「未启动」（用户 2026-09-29 报的）
-    //   远程状态变化不触发 RYAutorunObserve，由 RYShellVC 的 1s 轮询定时器驱动本方法刷新。
-    id ro = [NSJSONSerialization JSONObjectWithData:[RYRemoteStatus() dataUsingEncoding:NSUTF8StringEncoding]
-                                           options:0 error:NULL];
-    NSString *rs = ([ro isKindOfClass:[NSDictionary class]]
-                    ? (NSString *)((NSDictionary *)ro[@"state"] ?: @"idle") : @"idle");
-    if ([rs isEqualToString:@"connected"]) {
-        self.sideStatus.text = @"● 远程已连接";
-        self.sideStatus.textColor = RY_GREEN;
-    } else if ([rs isEqualToString:@"connecting"]) {
-        self.sideStatus.text = @"● 远程连接中";
-        self.sideStatus.textColor = RY_AMBER;
+    NSString *txt = nil;
+    UIColor *col = RY_MUTED;
+    if ([sd[@"running"] boolValue]) {
+        txt = [NSString stringWithFormat:@"● 监听中 :%d", [sd[@"port"] intValue]];
+        col = RY_GREEN;
     } else {
-        self.sideStatus.text = @"● 未启动";
-        self.sideStatus.textColor = RY_MUTED;
+        // build66：远程连接也点亮状态 —— 远程状态变化无 observer，靠 1s 轮询刷新
+        id ro = [NSJSONSerialization JSONObjectWithData:[RYRemoteStatus() dataUsingEncoding:NSUTF8StringEncoding]
+                                               options:0 error:NULL];
+        NSString *rs = ([ro isKindOfClass:[NSDictionary class]]
+                        ? (NSString *)((NSDictionary *)ro[@"state"] ?: @"idle") : @"idle");
+        if ([rs isEqualToString:@"connected"]) { txt = @"● 远程已连接"; col = RY_GREEN; }
+        else if ([rs isEqualToString:@"connecting"]) { txt = @"● 远程连接中"; col = RY_AMBER; }
+        else { txt = @"● 未启动"; col = RY_MUTED; }
     }
+    self.sideStatus.text = [NSString stringWithFormat:@"%@  ·  v%@", txt, self.appVersion ?: @"?"];
+    self.sideStatus.textColor = col;
 }
 
 - (void)onKeyboard:(NSNotification *)n {
-    NSDictionary *info = n.userInfo;
-    CGRect end = [info[UIKeyboardFrameEndUserInfoKey] CGRectValue];
-    CGRect inSelf = [self.view convertRect:end fromView:nil];
-    CGFloat overlap = self.view.bounds.size.height - inSelf.origin.y;
-    if (overlap < 0.0f) overlap = 0.0f;
-    if (self.bottomMode) {
-        CGFloat barH = 52.0f;
-        CGFloat top = fmaxf(self.view.safeAreaInsets.top, 20.0f);
-        CGFloat padExtra = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) ? 24.0f : 0.0f;
-        self.content.frame = CGRectMake(0.0f, top, self.view.bounds.size.width,
-                                        self.view.bounds.size.height - overlap - top - barH - self.view.safeAreaInsets.bottom - padExtra);
-    } else {
-        CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
-        CGFloat top = self.compact ? fmaxf(self.view.safeAreaInsets.top, 20.0f) : 0.0f;
-        self.content.frame = CGRectMake(sw, top,
-                                        self.view.bounds.size.width - sw,
-                                        self.view.bounds.size.height - overlap - top);
-    }
+    // UITabBarController 自带键盘避让，这里无需手动改本层 frame。
 }
 
 - (void)onKeyboardHide:(NSNotification *)n {
-    if (self.bottomMode) {
-        CGFloat barH = 52.0f;
-        CGFloat top = fmaxf(self.view.safeAreaInsets.top, 20.0f);
-        CGFloat padExtra = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) ? 24.0f : 0.0f;
-        self.content.frame = CGRectMake(0.0f, top, self.view.bounds.size.width,
-                                        self.view.bounds.size.height - top - barH - self.view.safeAreaInsets.bottom - padExtra);
-    } else {
-        CGFloat sw = self.compact ? kSidebarCompactW : kSidebarW;
-        CGFloat top = self.compact ? fmaxf(self.view.safeAreaInsets.top, 20.0f) : 0.0f;
-        CGFloat bot = self.compact ? fmaxf(self.view.safeAreaInsets.bottom, 8.0f) : 0.0f;
-        self.content.frame = CGRectMake(sw, top,
-                                        self.view.bounds.size.width - sw,
-                                        self.view.bounds.size.height - top - bot);
-    }
+    // 同上。
 }
 
 - (void)viewDidAppear:(BOOL)animated {
