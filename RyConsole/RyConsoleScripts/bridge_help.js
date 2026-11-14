@@ -289,12 +289,39 @@ function _hpMatch(e, f) {
   return e.name.toLowerCase().indexOf(f) >= 0 || e.cat.toLowerCase().indexOf(f) >= 0;
 }
 
+// V2.4.35：自动发现已注册但 PRIM_DOC 无文档的桥函数（根治"iokitCallEx 在用却 primHelp 查不到"的误判）
+var _HELP_BUILTINS = {console:1,print:1,parseInt:1,parseFloat:1,isNaN:1,isFinite:1,
+  eval:1,decodeURI:1,decodeURIComponent:1,encodeURI:1,encodeURIComponent:1,escape:1,unescape:1,
+  String:1,Number:1,Boolean:1,Object:1,Array:1,Function:1,Date:1,RegExp:1,Error:1,JSON:1,
+  Math:1,Map:1,Set:1,WeakMap:1,WeakSet:1,Promise:1,Symbol:1,Proxy:1,Reflect:1,Intl:1,BigInt:1,
+  globalThis:1,Infinity:1,NaN:1,undefined:1,setTimeout:1,clearTimeout:1,setInterval:1,clearInterval:1};
+function _hpAutoPrims() {
+  var o = [];
+  try {
+    var g = (typeof globalThis !== "undefined") ? globalThis : this;
+    var names = Object.getOwnPropertyNames(g);
+    for (var i = 0; i < names.length; i++) {
+      var k = names[i];
+      if (_HELP_BUILTINS[k]) continue;
+      if (k.indexOf("__ry_") === 0 || k.indexOf("_hp") === 0 || k.indexOf("_HELP") === 0) continue;
+      try { if (typeof g[k] === "function") o.push(k); } catch (e) {}
+    }
+  } catch (e) {}
+  return o;
+}
+
 function primHelp(filter) {
   var hits = PRIM_DOC.filter(function (e) { return _hpMatch(e, filter); });
-  if (!hits.length)
+  var documented = {};
+  PRIM_DOC.forEach(function (e) { documented[e.name] = 1; });
+  var f = filter ? String(filter).toLowerCase() : "";
+  var auto = _hpAutoPrims().filter(function (k) {
+    return !documented[k] && (!f || String(k).toLowerCase().indexOf(f) >= 0);
+  }).sort();
+  if (!hits.length && !auto.length)
     return "[primHelp] 没有匹配 \"" + filter + "\" 的原语。试试 primHelp()（全部）或 primHelp(\"iokit\")。";
-  if (hits.length === 1) return _hpDetail(hits[0]);
-  var out = "[primHelp] " + (filter ? ("匹配 \"" + filter + "\" 的 ") : "") + hits.length + " 个原语：\n";
+  if (hits.length === 1 && !auto.length) return _hpDetail(hits[0]);
+  var out = "[primHelp] " + (filter ? ("匹配 \"" + filter + "\" 的 ") : "") + (hits.length + auto.length) + " 个原语（" + hits.length + " 有文档，另 " + auto.length + " 仅注册）：\n";
   var cat = "";
   hits.forEach(function (e) {
     if (e.cat !== cat) { cat = e.cat; out += "\n── " + cat + " ──\n"; }
@@ -302,6 +329,10 @@ function primHelp(filter) {
     out += "  " + mark + "  " + e.sig + "\n";
     if (e.ret) out += "            → " + e.ret + "\n";
   });
+  if (auto.length) {
+    out += "\n── 已注册·无文档（可 typeof 验证 / 直接调用） ──\n";
+    auto.forEach(function (k) { out += "  · " + k + "\n"; });
+  }
   out += "\n提示：primHelp(\"<名字片段>\") 看单个的完整说明；primErrors() 看错误约定；primMissing() 看还欠自解释的桥。";
   return out;
 }
